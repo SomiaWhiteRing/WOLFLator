@@ -86,7 +86,10 @@ class PipelineTests(unittest.TestCase):
                 api_base_url="https://user:password@example.com/v1/secret-token?token=hidden",
                 api_model="test-model",
             )
-            pipeline = FailingPipeline(manifest_path, settings, "secret-token", root / "cache")
+            app_log = []
+            pipeline = FailingPipeline(
+                manifest_path, settings, "secret-token", root / "cache", log=app_log.append
+            )
             with self.assertRaisesRegex(RuntimeError, "simulated"):
                 pipeline.run()
             current = load_manifest(manifest_path)
@@ -95,10 +98,18 @@ class PipelineTests(unittest.TestCase):
             logs = list((Path(manifest_path).parent / "versions" / current.active_version / "artifacts" / "logs").glob("*.log"))
             self.assertEqual(1, len(logs))
             pipeline.log("credential=secret-token")
+            pipeline.detail(
+                "tool echoed https://user:password@example.com/v1/secret-token?token=hidden"
+            )
             log_text = logs[0].read_text(encoding="utf-8-sig")
             self.assertIn("simulated failure", log_text)
-            self.assertIn("credential=[REDACTED_API_KEY]", log_text)
-            self.assertIn("api_url=https://example.com/v1/[REDACTED_API_KEY]", log_text)
+            self.assertIn("credential=[REDACTED]", log_text)
+            self.assertIn("[DETAIL] stage.exception stage=glossary", log_text)
+            self.assertIn("Traceback", log_text)
+            self.assertIn("manifest.save.complete", log_text)
+            self.assertIn("tool echoed https://example.com/v1/[REDACTED]", log_text)
+            self.assertFalse(any("Traceback" in line for line in app_log))
+            self.assertIn("api_url=https://example.com/v1/[REDACTED]", log_text)
             self.assertNotIn("secret-token", log_text)
             self.assertNotIn("password", log_text)
             self.assertNotIn("token=hidden", log_text)

@@ -102,7 +102,7 @@ class PipelineThread(QThread):
             self.result_ready.emit(result)
         except Exception:
             detail = traceback.format_exc()
-            self.pipeline.log(detail)
+            self.pipeline.detail("pipeline.thread.exception\n" + detail)
             self.failed.emit(detail)
 
 

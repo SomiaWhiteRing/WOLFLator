@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -100,8 +101,10 @@ def run_process(
     timeout: int = 3600,
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
+    diagnostic_log: Callable[[str], None] | None = None,
     env: dict[str, str] | None = None,
 ) -> ToolResult:
+    detail = diagnostic_log or log
     safe_command = " ".join(f'"{arg}"' if " " in arg else arg for arg in command)
     if log:
         log(f"> {safe_command}")
@@ -117,36 +120,75 @@ def run_process(
         errors="replace",
         env=env,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        bufsize=1,
     )
-    stdout = stderr = ""
+    if detail:
+        detail(
+            f"process.start pid={process.pid} cwd={Path(cwd).resolve() if cwd else Path.cwd()} "
+            f"timeout={timeout}s command={safe_command}"
+        )
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+    def read_stream(name: str, stream) -> None:
+        try:
+            for line in stream:
+                output_queue.put((name, line.rstrip("\r\n")))
+        finally:
+            output_queue.put((name, None))
+
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    finished_streams: set[str] = set()
     try:
-        while True:
+        while process.poll() is None or len(finished_streams) < len(readers):
             if cancel_event and cancel_event.is_set():
+                if detail:
+                    detail(f"process.cancel pid={process.pid} elapsed={time.monotonic() - started:.3f}s")
                 _kill_process_tree(process)
                 raise CancelledError("任务已取消。")
             elapsed = time.monotonic() - started
             if elapsed > timeout:
+                if detail:
+                    detail(f"process.timeout pid={process.pid} elapsed={elapsed:.3f}s limit={timeout}s")
                 _kill_process_tree(process)
                 raise TimeoutError(f"外部工具运行超过 {timeout} 秒。")
             try:
-                stdout, stderr = process.communicate(timeout=0.2)
-                break
-            except subprocess.TimeoutExpired:
+                name, line = output_queue.get(timeout=0.2)
+            except queue.Empty:
                 continue
+            if line is None:
+                finished_streams.add(name)
+                continue
+            captured[name].append(line)
+            if detail:
+                detail(f"process.{name} pid={process.pid} {line}")
     finally:
         if process.poll() is None:
             _kill_process_tree(process)
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=1)
         for stream in (process.stdout, process.stderr):
             if stream and not stream.closed:
                 stream.close()
+    stdout = "\n".join(captured["stdout"])
+    stderr = "\n".join(captured["stderr"])
     result = ToolResult(command, process.returncode or 0, stdout, stderr, time.monotonic() - started)
-    for output in (stdout, stderr):
-        if log and output.strip():
-            for line in output.strip().splitlines():
-                log(line)
+    if detail:
+        detail(
+            f"process.exit pid={process.pid} code={result.return_code} duration={result.duration_seconds:.3f}s "
+            f"stdout_lines={len(captured['stdout'])} stderr_lines={len(captured['stderr'])}"
+        )
     if result.return_code != 0:
-        detail = (stderr or stdout).strip()[-2000:]
-        raise RuntimeError(f"外部工具退出码 {result.return_code}: {detail}")
+        error_detail = (stderr or stdout).strip()[-2000:]
+        raise RuntimeError(f"外部工具退出码 {result.return_code}: {error_detail}")
+    if log:
+        log(f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
     return result
 
 
@@ -175,6 +217,7 @@ class UberWolfRunner:
         *,
         cancel_event: threading.Event | None = None,
         log: Callable[[str], None] | None = None,
+        diagnostic_log: Callable[[str], None] | None = None,
     ) -> ToolResult | None:
         root = Path(game_root)
         if (root / "Data" / "BasicData" / "Game.dat").is_file() and not next(root.rglob("*.wolf"), None):
@@ -192,6 +235,7 @@ class UberWolfRunner:
             cwd=self.executable.parent,
             cancel_event=cancel_event,
             log=log,
+            diagnostic_log=diagnostic_log,
         )
         if not (root / "Data" / "BasicData" / "Game.dat").is_file():
             raise RuntimeError("UberWolf 返回成功，但没有生成 Data/BasicData/Game.dat。")
@@ -258,6 +302,7 @@ class OfficialToolRunner:
         language_index: int | None = None,
         cancel_event: threading.Event | None = None,
         log: Callable[[str], None] | None = None,
+        diagnostic_log: Callable[[str], None] | None = None,
     ) -> ToolResult:
         root = Path(game_root).resolve()
         write_official_game_config(root)
@@ -274,6 +319,7 @@ class OfficialToolRunner:
             cwd=self.executable.parent,
             cancel_event=cancel_event,
             log=log,
+            diagnostic_log=diagnostic_log,
         )
 
     def extract(self, game_root: str | Path, **kwargs) -> Path:

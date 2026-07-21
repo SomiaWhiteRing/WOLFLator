@@ -5,11 +5,14 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import threading
+import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from ainiee import (
     generate_glossary,
@@ -128,6 +131,20 @@ class Pipeline:
         self.api_key = api_key
         self.cache_root = Path(cache_root)
         self._log_sink = log or (lambda _message: None)
+        self._log_lock = threading.Lock()
+        parsed_api_url = urlsplit(settings.api_base_url)
+        self._safe_api_url = urlunsplit(
+            (parsed_api_url.scheme, parsed_api_url.netloc.rsplit("@", 1)[-1], parsed_api_url.path, "", "")
+        )
+        self._sensitive_values = {
+            value
+            for value in (
+                api_key,
+                parsed_api_url.password or "",
+                *(value for _name, value in parse_qsl(parsed_api_url.query, keep_blank_values=False)),
+            )
+            if value
+        }
         self.log_path: Path | None = None
         self.progress = progress or (lambda _current, _total, _stage: None)
         self.cancel_event = threading.Event()
@@ -155,7 +172,13 @@ class Pipeline:
 
     def save(self) -> None:
         self.manifest.updated_at = utc_now()
-        _atomic_json(self.manifest_path, self.manifest.to_dict())
+        self.detail(f"manifest.save.start path={self.manifest_path}")
+        try:
+            _atomic_json(self.manifest_path, self.manifest.to_dict())
+        except Exception:
+            self.detail("manifest.save.failed\n" + traceback.format_exc())
+            raise
+        self.detail("manifest.save.complete")
 
     def set_log_sink(self, sink: Callable[[str], None]) -> None:
         self._log_sink = sink
@@ -165,9 +188,6 @@ class Pipeline:
         timestamp = datetime.now().astimezone()
         name = f"{timestamp.strftime('%Y%m%d-%H%M%S-%f')[:-3]}-{operation}.log"
         path = log_dir / name
-        parsed_url = urlsplit(self.settings.api_base_url)
-        safe_netloc = parsed_url.netloc.rsplit("@", 1)[-1]
-        safe_url = urlunsplit((parsed_url.scheme, safe_netloc, parsed_url.path, "", ""))
         header = "\n".join(
             (
                 "WOLFLator run log",
@@ -175,16 +195,20 @@ class Pipeline:
                 f"project={self.manifest.project_id}",
                 f"version={self.manifest.active_version}",
                 f"operation={operation}",
-                f"api_url={safe_url}",
+                f"api_url={self._safe_api_url}",
                 f"api_model={self.settings.api_model}",
                 f"wolf_tool={self.settings.wolf_tool_path}",
                 f"ainiee_source={self.settings.ainiee_source}",
                 f"ascii_runner_dir={self.settings.ascii_runner_dir}",
+                f"cache_root={self.cache_root}",
+                f"process_id={os.getpid()}",
+                f"python={sys.version.replace(chr(10), ' ')}",
+                "log_format=2",
                 "",
             )
         )
-        if self.api_key:
-            header = header.replace(self.api_key, "[REDACTED_API_KEY]")
+        for secret in self._sensitive_values:
+            header = header.replace(secret, "[REDACTED]")
         try:
             # ponytail: per-run logs are retained indefinitely; add age/size cleanup if volume becomes material.
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -195,20 +219,34 @@ class Pipeline:
         self.log_path = path
         self.log(f"日志文件: {path}")
 
-    def log(self, message: str) -> None:
+    def _write_log_file(self, message: str, level: str) -> str:
         text = str(message).rstrip("\r\n")
-        if self.api_key:
-            text = text.replace(self.api_key, "[REDACTED_API_KEY]")
-        if self.log_path is not None:
-            timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
-            try:
-                with self.log_path.open("a", encoding="utf-8") as stream:
-                    stream.write(f"{timestamp} {text}\n")
-            except OSError as exc:
-                failed_path = self.log_path
-                self.log_path = None
-                self._log_sink(f"外部日志写入失败 ({failed_path}): {exc}")
+        if self.settings.api_base_url:
+            text = text.replace(self.settings.api_base_url, self._safe_api_url)
+        for secret in self._sensitive_values:
+            text = text.replace(secret, "[REDACTED]")
+        try:
+            timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f%z")
+            lines = text.splitlines() or [""]
+            with self._log_lock:
+                path = self.log_path
+                if path is None:
+                    return text
+                with path.open("a", encoding="utf-8") as stream:
+                    for line in lines:
+                        stream.write(f"{timestamp} [{level}] {line}\n")
+        except OSError as exc:
+            failed_path = path
+            self.log_path = None
+            self._log_sink(f"外部日志写入失败 ({failed_path}): {exc}")
+        return text
+
+    def log(self, message: str) -> None:
+        text = self._write_log_file(message, "INFO")
         self._log_sink(text)
+
+    def detail(self, message: str) -> None:
+        self._write_log_file(message, "DETAIL")
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -300,6 +338,7 @@ class Pipeline:
         record.finished_at = ""
         record.input_hash = input_hash
         record.error = ""
+        self.detail(f"stage.state stage={stage.value} status=running input_hash={input_hash}")
         self.save()
 
     def _mark_done(self, stage: Stage, artifacts: dict[str, str]) -> None:
@@ -308,6 +347,10 @@ class Pipeline:
         record.finished_at = utc_now()
         record.artifacts = artifacts
         record.error = ""
+        self.detail(
+            f"stage.state stage={stage.value} status=completed artifacts="
+            + json.dumps(artifacts, ensure_ascii=False, sort_keys=True)
+        )
         self.save()
 
     def _mark_failed(self, stage: Stage, error: Exception) -> None:
@@ -315,6 +358,10 @@ class Pipeline:
         record.status = StageStatus.CANCELLED if isinstance(error, CancelledError) else StageStatus.FAILED
         record.finished_at = utc_now()
         record.error = str(error)
+        self.detail(
+            f"stage.state stage={stage.value} status={record.status.value} "
+            f"error_type={type(error).__name__} error={error}"
+        )
         self.save()
 
     def _reset_downstream(self, stage: Stage) -> None:
@@ -364,6 +411,7 @@ class Pipeline:
         if hash_directory(self.source_dir) != source_hash:
             raise RuntimeError("原始游戏副本哈希校验失败。")
         self.manifest.version.source_hash = source_hash
+        self.detail(f"copy.complete source={original} source_hash={source_hash}")
         return {"source": str(self.source_dir), "work": str(self.work_dir)}
 
     def _unpack(self) -> dict[str, str]:
@@ -372,7 +420,9 @@ class Pipeline:
             self.work_dir,
             cancel_event=self.cancel_event,
             log=self.log,
+            diagnostic_log=self.detail,
         )
+        self.detail(f"unpack.complete data={self.work_dir / 'Data'}")
         return {"data": str(self.work_dir / "Data"), "uberwolf": str(executable)}
 
     def _extract(self) -> dict[str, str]:
@@ -390,6 +440,7 @@ class Pipeline:
                 self.work_dir,
                 cancel_event=self.cancel_event,
                 log=self.log,
+                diagnostic_log=self.detail,
             )
             current_items = read_translation_items(workbook)
             current_items, conflicts = reconcile_incremental(read_translation_items(previous_full), current_items)
@@ -400,12 +451,20 @@ class Pipeline:
                 self.work_dir,
                 cancel_event=self.cancel_event,
                 log=self.log,
+                diagnostic_log=self.detail,
             )
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         extracted = self.artifacts_dir / "source.xlsx"
         shutil.copy2(workbook, extracted)
         items = read_translation_items(extracted)
         items_path = dump_items(self.artifacts_dir / "items-extracted.json", items)
+        categories: dict[str, int] = {}
+        for item in items:
+            categories[item.category.value] = categories.get(item.category.value, 0) + 1
+        self.detail(
+            f"extract.complete workbook={extracted} rows={len(items)} categories="
+            + json.dumps(categories, ensure_ascii=False, sort_keys=True)
+        )
         artifacts = {"workbook": str(extracted), "items": str(items_path)}
         if conflicts:
             conflicts_path = self.artifacts_dir / "incremental-conflicts.json"
@@ -425,6 +484,7 @@ class Pipeline:
             self.api_key,
             cancel_event=self.cancel_event,
             log=self.log,
+            diagnostic_log=self.detail,
         )
         return {"glossary": str(glossary_path), "term_count": str(len(rules["prompt_dictionary_data"]))}
 
@@ -434,6 +494,9 @@ class Pipeline:
         paratranz = to_paratranz(items)
         input_path = self.artifacts_dir / "ainiee-input.json"
         _atomic_json(input_path, paratranz)
+        self.detail(
+            f"translate.input extracted_rows={len(items)} translatable_rows={len(paratranz)} input={input_path}"
+        )
         runtime = require_managed_runtime(
             self.settings.ainiee_source,
             self.cache_root / "runtime" / "ainiee",
@@ -449,11 +512,17 @@ class Pipeline:
             self.api_key,
             cancel_event=self.cancel_event,
             log=self.log,
+            diagnostic_log=self.detail,
         )
         raw_path = self.artifacts_dir / "ainiee-output.json"
         _atomic_json(raw_path, raw)
         merged = merge_ainiee_output(items, raw)
         items_path = dump_items(self.artifacts_dir / "items-translated.json", merged)
+        translated_count = sum(bool(item.translation) for item in merged)
+        self.detail(
+            f"translate.complete raw_rows={len(raw)} merged_rows={len(merged)} "
+            f"translated_rows={translated_count} output={raw_path}"
+        )
         return {"ainiee_input": str(input_path), "ainiee_output": str(raw_path), "items": str(items_path)}
 
     def _validate(self) -> dict[str, str]:
@@ -464,12 +533,20 @@ class Pipeline:
         if len(reread) != len(items):
             raise RuntimeError("完整工作簿回读行数不一致。")
         missing = [item for item in reread if item.category.value != "copy" and not item.translation]
+        self.detail(
+            f"validate.result expected_rows={len(items)} workbook_rows={len(reread)} missing={len(missing)} "
+            f"workbook={full}"
+        )
         if missing:
             raise RuntimeError(f"完整工作簿仍有 {len(missing)} 条空译文。")
         return {"full_workbook": str(full), "items": self.manifest.version.stage(Stage.TRANSLATE).artifacts["items"]}
 
     def _import(self) -> dict[str, str]:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
+        self.detail(
+            "import.start scope="
+            + json.dumps(self.manifest.import_scope.__dict__, ensure_ascii=False, sort_keys=True)
+        )
         scoped = write_scoped_workbook(
             full,
             self.artifacts_dir / "import-scoped.xlsx",
@@ -483,6 +560,7 @@ class Pipeline:
             self.work_dir,
             cancel_event=self.cancel_event,
             log=self.log,
+            diagnostic_log=self.detail,
         )
         return {"scoped_workbook": str(scoped), "translated_game": str(translated)}
 
@@ -507,6 +585,7 @@ class Pipeline:
                 os.replace(previous, self.release_dir)
             raise
         self._check_source_unchanged()
+        self.detail(f"release.complete path={self.release_dir}")
         return {"release": str(self.release_dir)}
 
     def _execute(self, stage: Stage) -> dict[str, str]:
@@ -534,18 +613,25 @@ class Pipeline:
             record = self.manifest.version.stage(stage)
             self.progress(index - 1, len(STAGE_ORDER), stage)
             if record.status is StageStatus.COMPLETED:
+                self.detail(f"stage.skip stage={stage.value} reason=already_completed")
                 continue
             input_hash = self._stage_input_hash(stage)
             self._mark_running(stage, input_hash)
             self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 开始")
+            started = time.monotonic()
             try:
                 artifacts = self._execute(stage)
                 self._mark_done(stage, artifacts)
             except Exception as exc:
+                self.detail(
+                    f"stage.exception stage={stage.value} elapsed={time.monotonic() - started:.3f}s\n"
+                    + traceback.format_exc()
+                )
                 self._mark_failed(stage, exc)
                 self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}")
                 raise
             self.progress(index, len(STAGE_ORDER), stage)
+            self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
             self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"
 
@@ -560,16 +646,22 @@ class Pipeline:
         self._mark_running(stage, input_hash)
         self.progress(0, 0, stage)
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 开始")
+        started = time.monotonic()
         try:
             artifacts = self._execute(stage)
             self._mark_done(stage, artifacts)
         except Exception as exc:
+            self.detail(
+                f"stage.exception stage={stage.value} elapsed={time.monotonic() - started:.3f}s\n"
+                + traceback.format_exc()
+            )
             self._mark_failed(stage, exc)
             self.log(
                 f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}"
             )
             raise
         self.progress(1, 1, stage)
+        self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"
 

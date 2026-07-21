@@ -1,9 +1,11 @@
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -170,6 +172,45 @@ class ProcessTests(unittest.TestCase):
         with self.assertRaises(CancelledError):
             run_process([sys.executable, "-c", "import time; time.sleep(5)"], cancel_event=event)
 
+    def test_diagnostic_log_streams_process_output_without_flooding_app_log(self):
+        app_log = []
+        diagnostic_log = []
+        first_line = threading.Event()
+        finished = threading.Event()
+
+        def detail(message):
+            diagnostic_log.append(message)
+            if "process.stdout" in message and "first-line" in message:
+                first_line.set()
+
+        def run():
+            try:
+                run_process(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        "import sys,time; print('first-line', flush=True); "
+                        "print('stderr-line', file=sys.stderr, flush=True); time.sleep(3)",
+                    ],
+                    timeout=10,
+                    log=app_log.append,
+                    diagnostic_log=detail,
+                )
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(first_line.wait(2.5))
+        self.assertFalse(finished.is_set())
+        worker.join(5)
+        self.assertTrue(any("process.start" in line for line in diagnostic_log))
+        self.assertTrue(any("process.stderr" in line and "stderr-line" in line for line in diagnostic_log))
+        self.assertTrue(any("process.exit" in line for line in diagnostic_log))
+        self.assertNotIn("first-line", app_log)
+        self.assertNotIn("stderr-line", app_log)
+
 
 class AiNieeTests(unittest.TestCase):
     def make_runtime(self, root: Path) -> Path:
@@ -223,11 +264,19 @@ class AiNieeTests(unittest.TestCase):
     def test_deepseek_request_matches_managed_ainiee_profile(self):
         response = mock.MagicMock()
         response.read.return_value = json.dumps(
-            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            }
         ).encode("utf-8")
+        response.status = 200
         response.__enter__.return_value = response
+        diagnostics = []
         client = ainiee.OpenAICompatibleClient(
-            "https://api.deepseek.com/v1/chat/completions", "secret", "deepseek-chat"
+            "https://api.deepseek.com/v1/chat/completions",
+            "secret",
+            "deepseek-chat",
+            diagnostic_log=diagnostics.append,
         )
         with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
             self.assertEqual(
@@ -240,6 +289,55 @@ class AiNieeTests(unittest.TestCase):
         self.assertNotIn("max_tokens", body)
         self.assertEqual({"type": "disabled"}, body["thinking"])
         self.assertEqual(["system", "user"], [message["role"] for message in body["messages"]])
+        joined = "\n".join(diagnostics)
+        self.assertIn("api.request id=1", joined)
+        self.assertIn("api.response id=1 status=200", joined)
+        self.assertIn("finish_reason=stop", joined)
+        self.assertIn('"prompt_tokens": 10', joined)
+        self.assertNotIn("secret", joined)
+
+    def test_http_api_error_is_written_to_diagnostic_log(self):
+        diagnostics = []
+        client = ainiee.OpenAICompatibleClient(
+            "https://example.com/v1", "secret", "model", diagnostic_log=diagnostics.append
+        )
+        error = urllib.error.HTTPError(
+            client.url,
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(b'{"error":"rate limited"}'),
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(ainiee.ApiError, "429"):
+                client.chat("hello")
+        joined = "\n".join(diagnostics)
+        self.assertIn("api.error id=1 kind=http status=429", joined)
+        self.assertIn("rate limited", joined)
+        self.assertNotIn("secret", joined)
+
+    def test_glossary_json_failure_records_each_retry_and_chunk_identity(self):
+        client = mock.Mock()
+        client.chat.return_value = '[{"src":"broken"}'
+        diagnostics = []
+        with mock.patch.object(ainiee.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "Expecting"):
+                ainiee._request_chunk(
+                    client,
+                    "prompt",
+                    "line one\nline two",
+                    cancel_event=None,
+                    diagnostic_log=diagnostics.append,
+                    request_label="角色分析:1/2",
+                )
+        joined = "\n".join(diagnostics)
+        self.assertEqual(3, joined.count("glossary.request label=角色分析:1/2"))
+        self.assertEqual(3, joined.count("glossary.error label=角色分析:1/2"))
+        self.assertIn("chunk_sha256=", joined)
+        self.assertIn("glossary.invalid_json label=角色分析:1/2", joined)
+        self.assertIn('response_tail=[{"src":"broken"}', joined)
+        self.assertIn("glossary.retry label=角色分析:1/2 delay=1s", joined)
+        self.assertIn("glossary.retry label=角色分析:1/2 delay=2s", joined)
 
     def test_zero_exit_without_artifact_is_failure_and_profile_is_cleaned(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,6 +355,40 @@ class AiNieeTests(unittest.TestCase):
                         runtime, input_path, root / "output", dict(ainiee.RULE_DEFAULTS), "project", settings, "secret"
                     )
             self.assertFalse((runtime / "Resource" / "profiles" / "WOLFLator_session.json").exists())
+
+    def test_translation_failure_includes_ainiee_session_log_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = self.make_runtime(root / "runtime")
+            input_path = root / "input.json"
+            input_path.write_text("[]", encoding="utf-8")
+            output = root / "output"
+            diagnostics = []
+
+            def fail_process(*_args, **_kwargs):
+                logs = output / "logs"
+                logs.mkdir(parents=True)
+                (logs / "session.log").write_text("API 429 rate limited\nretry exhausted", encoding="utf-8")
+                raise RuntimeError("translation failed")
+
+            settings = AppSettings(api_base_url="https://example.com/v1", api_model="model")
+            with mock.patch.object(ainiee, "run_process", side_effect=fail_process), mock.patch.object(
+                ainiee, "locate_uv", return_value=Path(sys.executable)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "translation failed"):
+                    ainiee.run_translation(
+                        runtime,
+                        input_path,
+                        output,
+                        dict(ainiee.RULE_DEFAULTS),
+                        "project",
+                        settings,
+                        "secret",
+                        diagnostic_log=diagnostics.append,
+                    )
+            joined = "\n".join(diagnostics)
+            self.assertIn("ainiee.session_log.tail", joined)
+            self.assertIn("API 429 rate limited", joined)
 
 
 if __name__ == "__main__":

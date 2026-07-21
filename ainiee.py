@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import count
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -436,7 +437,38 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "user_thread_counts": max(1, settings.api_threads),
         "request_timeout": max(10, settings.api_timeout),
         "enable_api_failover": False,
+        "enable_session_logging": True,
+        "show_detailed_logs": True,
     }
+
+
+def _report_ainiee_logs(
+    output: Path,
+    diagnostic_log: Callable[[str], None] | None,
+    *,
+    include_tail: bool,
+) -> None:
+    if not diagnostic_log:
+        return
+    files = sorted(
+        (path for path in (output / "logs").glob("*") if path.is_file()),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    diagnostic_log(
+        f"ainiee.session_logs count={len(files)} paths="
+        + json.dumps([str(path) for path in files], ensure_ascii=False)
+    )
+    if not include_tail or not files:
+        return
+    latest = files[-1]
+    try:
+        text = latest.read_text(encoding="utf-8", errors="replace")[-65_536:]
+    except OSError as exc:
+        diagnostic_log(f"ainiee.session_log.read_failed path={latest} error={exc}")
+        return
+    diagnostic_log(f"ainiee.session_log.tail path={latest} chars={len(text)}")
+    for line in text.splitlines()[-200:]:
+        diagnostic_log(f"ainiee.session {line}")
 
 
 def run_translation(
@@ -450,6 +482,7 @@ def run_translation(
     *,
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
+    diagnostic_log: Callable[[str], None] | None = None,
 ) -> list[dict[str, object]]:
     root = validate_ainiee_source(runtime)
     cleanup_session_profiles(root)
@@ -463,40 +496,59 @@ def run_translation(
     _atomic_json(rules_profiles / f"{rules_name}.json", rules)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    try:
-        run_process(
-            [
-                str(locate_uv()),
-                "run",
-                "ainiee_cli.py",
-                "translate",
-                str(Path(input_json).resolve()),
-                "-o",
-                str(output.resolve()),
-                "-p",
-                SESSION_PROFILE,
-                "--rules-profile",
-                rules_name,
-                "-s",
-                "Japanese",
-                "-t",
-                "Chinese",
-                "--type",
-                "Paratranz",
-                "--yes",
-            ],
-            cwd=root,
-            timeout=24 * 3600,
-            cancel_event=cancel_event,
-            log=log,
+    if diagnostic_log:
+        diagnostic_log(
+            f"ainiee.translate.start runtime={root} input={Path(input_json).resolve()} "
+            f"input_bytes={Path(input_json).stat().st_size} output={output.resolve()} "
+            f"profile={SESSION_PROFILE} rules_profile={rules_name}"
         )
+    try:
+        try:
+            run_process(
+                [
+                    str(locate_uv()),
+                    "run",
+                    "ainiee_cli.py",
+                    "translate",
+                    str(Path(input_json).resolve()),
+                    "-o",
+                    str(output.resolve()),
+                    "-p",
+                    SESSION_PROFILE,
+                    "--rules-profile",
+                    rules_name,
+                    "-s",
+                    "Japanese",
+                    "-t",
+                    "Chinese",
+                    "--type",
+                    "Paratranz",
+                    "--yes",
+                ],
+                cwd=root,
+                timeout=24 * 3600,
+                cancel_event=cancel_event,
+                log=log,
+                diagnostic_log=diagnostic_log,
+            )
+        except Exception:
+            _report_ainiee_logs(output, diagnostic_log, include_tail=True)
+            raise
+        _report_ainiee_logs(output, diagnostic_log, include_tail=False)
         expected_name = f"{Path(input_json).stem}_translated.json"
         candidates = list(output.rglob(expected_name))
+        if diagnostic_log:
+            diagnostic_log(
+                f"ainiee.translate.outputs expected={expected_name} candidates={len(candidates)} "
+                f"paths={json.dumps([str(path) for path in candidates], ensure_ascii=False)}"
+            )
         if not candidates:
             raise RuntimeError(f"AiNiee 返回成功，但没有生成 {expected_name}。")
         data = json.loads(max(candidates, key=lambda p: p.stat().st_mtime_ns).read_text(encoding="utf-8-sig"))
         if not isinstance(data, list):
             raise ValueError("AiNiee 输出不是 Paratranz 数组。")
+        if diagnostic_log:
+            diagnostic_log(f"ainiee.translate.complete rows={len(data)}")
         return data
     finally:
         profile_path.unlink(missing_ok=True)
@@ -509,7 +561,14 @@ class ApiError(RuntimeError):
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 120):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: int = 120,
+        diagnostic_log: Callable[[str], None] | None = None,
+    ):
         base = base_url.strip().rstrip("/")
         if not base.startswith(("https://", "http://")):
             raise ValueError("API 基础地址必须以 http:// 或 https:// 开头。")
@@ -521,6 +580,13 @@ class OpenAICompatibleClient:
         self.api_key = api_key
         self.model = model
         self.timeout = max(10, timeout)
+        self.diagnostic_log = diagnostic_log
+        self._request_ids = count(1)
+
+    def _diagnostic_url(self) -> str:
+        parsed = urllib.parse.urlsplit(self.url)
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
     def chat(
         self,
@@ -529,6 +595,8 @@ class OpenAICompatibleClient:
         max_tokens: int | None = 4096,
         system_prompt: str = "",
     ) -> str:
+        request_id = next(self._request_ids)
+        started = time.monotonic()
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -554,14 +622,42 @@ class OpenAICompatibleClient:
             },
             method="POST",
         )
+        if self.diagnostic_log:
+            self.diagnostic_log(
+                f"api.request id={request_id} url={self._diagnostic_url()} model={self.model} "
+                f"timeout={self.timeout}s prompt_chars={len(prompt)} system_chars={len(system_prompt)} "
+                f"payload_bytes={len(payload)} max_tokens={max_tokens}"
+            )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
+                raw = response.read()
+                status = response.status if isinstance(getattr(response, "status", None), int) else 200
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[-2000:]
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=http status={exc.code} "
+                    f"duration={time.monotonic() - started:.3f}s body={detail}"
+                )
             raise ApiError(f"API HTTP {exc.code}: {detail}", exc.code) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=connection error_type={type(exc).__name__} "
+                    f"duration={time.monotonic() - started:.3f}s error={exc}"
+                )
             raise ApiError(f"API 连接失败: {exc}") from exc
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            preview = raw.decode("utf-8", errors="replace")[-2000:]
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=response_json status={status} "
+                    f"duration={time.monotonic() - started:.3f}s response_bytes={len(raw)} "
+                    f"error={exc} body={preview}"
+                )
+            raise ApiError(f"API 返回的 JSON 无法解析: {exc}") from exc
         try:
             choice = result["choices"][0]
             content = choice["message"].get("content") or ""
@@ -570,10 +666,22 @@ class OpenAICompatibleClient:
             content = str(content)
             if "</think>" in content:
                 content = content.split("</think>", 1)[1]
+            if self.diagnostic_log:
+                usage = result.get("usage", {}) if isinstance(result, dict) else {}
+                self.diagnostic_log(
+                    f"api.response id={request_id} status={status} duration={time.monotonic() - started:.3f}s "
+                    f"response_bytes={len(raw)} finish_reason={choice.get('finish_reason')} "
+                    f"content_chars={len(content)} usage={json.dumps(usage, ensure_ascii=False, sort_keys=True)}"
+                )
             if not content.strip() and choice.get("finish_reason") == "length":
                 raise ApiError("模型在推理阶段达到输出上限，没有返回最终正文。")
             return content
         except (KeyError, IndexError, TypeError) as exc:
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=response_shape status={status} "
+                    f"duration={time.monotonic() - started:.3f}s error={exc}"
+                )
             raise ApiError(f"API 返回格式不兼容: {str(result)[:1000]}") from exc
 
 
@@ -630,25 +738,59 @@ def _request_chunk(
     *,
     cancel_event: threading.Event | None,
     split_depth: int = 0,
+    diagnostic_log: Callable[[str], None] | None = None,
+    request_label: str = "",
 ) -> list[dict[str, object]]:
     _check_cancel(cancel_event)
     last_error: Exception | None = None
     for attempt in range(3):
+        response_text = ""
+        if diagnostic_log:
+            diagnostic_log(
+                f"glossary.request label={request_label} attempt={attempt + 1}/3 split_depth={split_depth} "
+                f"chunk_chars={len(chunk)} chunk_lines={chunk.count(chr(10)) + 1} "
+                f"chunk_sha256={hashlib.sha256(chunk.encode('utf-8')).hexdigest()[:16]}"
+            )
         try:
-            return _json_list(client.chat(prompt_prefix + "\n\n原文语料：\n" + chunk))
+            response_text = client.chat(prompt_prefix + "\n\n原文语料：\n" + chunk)
+            result = _json_list(response_text)
+            if diagnostic_log:
+                diagnostic_log(f"glossary.response label={request_label} rows={len(result)}")
+            return result
         except (ApiError, ValueError) as exc:
             last_error = exc
             message = str(exc).lower()
+            if diagnostic_log:
+                diagnostic_log(
+                    f"glossary.error label={request_label} attempt={attempt + 1}/3 "
+                    f"error_type={type(exc).__name__} error={exc}"
+                )
+                if isinstance(exc, ValueError) and response_text:
+                    diagnostic_log(
+                        f"glossary.invalid_json label={request_label} response_chars={len(response_text)} "
+                        f"response_tail={response_text[-4000:]}"
+                    )
             context_error = any(word in message for word in ("context", "too many tokens", "maximum", "请求过长"))
             if context_error and split_depth < 5 and "\n" in chunk:
                 lines = chunk.splitlines()
                 midpoint = len(lines) // 2
+                if diagnostic_log:
+                    diagnostic_log(
+                        f"glossary.split label={request_label} split_depth={split_depth} "
+                        f"left_lines={midpoint} right_lines={len(lines) - midpoint}"
+                    )
                 return _request_chunk(
-                    client, prompt_prefix, "\n".join(lines[:midpoint]), cancel_event=cancel_event, split_depth=split_depth + 1
+                    client, prompt_prefix, "\n".join(lines[:midpoint]), cancel_event=cancel_event,
+                    split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
+                    request_label=request_label + ".left",
                 ) + _request_chunk(
-                    client, prompt_prefix, "\n".join(lines[midpoint:]), cancel_event=cancel_event, split_depth=split_depth + 1
+                    client, prompt_prefix, "\n".join(lines[midpoint:]), cancel_event=cancel_event,
+                    split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
+                    request_label=request_label + ".right",
                 )
             if attempt < 2:
+                if diagnostic_log:
+                    diagnostic_log(f"glossary.retry label={request_label} delay={2**attempt}s")
                 time.sleep(2**attempt)
     raise RuntimeError(str(last_error or "术语请求失败"))
 
@@ -660,12 +802,21 @@ def _parallel_stage(
     workers: int,
     cancel_event: threading.Event | None,
     log: Callable[[str], None] | None,
+    diagnostic_log: Callable[[str], None] | None,
     label: str,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(chunks)))) as executor:
         futures = {
-            executor.submit(_request_chunk, client, prompt, chunk, cancel_event=cancel_event): index
+            executor.submit(
+                _request_chunk,
+                client,
+                prompt,
+                chunk,
+                cancel_event=cancel_event,
+                diagnostic_log=diagnostic_log,
+                request_label=f"{label}:{index}/{len(chunks)}",
+            ): index
             for index, chunk in enumerate(chunks, 1)
         }
         for future in as_completed(futures):
@@ -704,6 +855,7 @@ def generate_glossary(
     *,
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
+    diagnostic_log: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     lines = [
         f"[{item.type} | {item.info}] {item.original}"
@@ -714,13 +866,24 @@ def generate_glossary(
         raise ValueError("工作簿中没有可分析文本。")
     corpus = "\n".join(lines)
     chunks = _chunks(lines)
-    client = OpenAICompatibleClient(settings.api_base_url, api_key, settings.api_model, settings.api_timeout)
+    if diagnostic_log:
+        diagnostic_log(
+            f"glossary.start source_rows={len(lines)} corpus_chars={len(corpus)} chunks={len(chunks)} "
+            f"workers={settings.api_threads} model={settings.api_model}"
+        )
+    client = OpenAICompatibleClient(
+        settings.api_base_url,
+        api_key,
+        settings.api_model,
+        settings.api_timeout,
+        diagnostic_log,
+    )
     character_prompt = """分析日文游戏语料中的人物。只输出 JSON 数组，每项包含：
 original_name, translated_name, aliases(字符串数组), gender, age, personality,
 speech_style, pronouns, speech_quirks, additional_info。
 只收录语料中确实出现的人物；译名使用简体中文；无法判断的字段用空字符串。"""
     characters = _parallel_stage(
-        client, character_prompt, chunks, settings.api_threads, cancel_event, log, "角色分析"
+        client, character_prompt, chunks, settings.api_threads, cancel_event, log, diagnostic_log, "角色分析"
     )
     normalized_characters: list[dict[str, object]] = []
     character_fields = (
@@ -741,7 +904,9 @@ speech_style, pronouns, speech_quirks, additional_info。
 只输出 JSON 数组，每项包含 src, dst, info。src 必须是语料原文，dst 使用简体中文。
 不要重复人物；候选词应至少在完整语料中出现两次。
 人物参考：{reference}"""
-    entities = _parallel_stage(client, entity_prompt, chunks, settings.api_threads, cancel_event, log, "实体分析")
+    entities = _parallel_stage(
+        client, entity_prompt, chunks, settings.api_threads, cancel_event, log, diagnostic_log, "实体分析"
+    )
     normalized_entities = []
     for row in entities:
         src = str(row.get("src", "")).strip()
@@ -767,6 +932,11 @@ speech_style, pronouns, speech_quirks, additional_info。
     rules["characterization_data"] = merged_characters
     rules["prompt_dictionary_data"] = _merge_by_key(old_terms, character_terms + normalized_entities, "src")
     _atomic_json(path, rules)
+    if diagnostic_log:
+        diagnostic_log(
+            f"glossary.complete path={path.resolve()} characters={len(merged_characters)} "
+            f"terms={len(rules['prompt_dictionary_data'])}"
+        )
     if log:
         log(f"术语生成完成：人物 {len(merged_characters)}，术语 {len(rules['prompt_dictionary_data'])}。")
     return rules
