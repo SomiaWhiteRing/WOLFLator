@@ -83,7 +83,7 @@ class PipelineTests(unittest.TestCase):
             game = make_game(root / "game")
             manifest_path = create_project(root / "projects", game)
             settings = AppSettings(
-                api_base_url="https://user:password@example.com/v1?token=hidden",
+                api_base_url="https://user:password@example.com/v1/secret-token?token=hidden",
                 api_model="test-model",
             )
             pipeline = FailingPipeline(manifest_path, settings, "secret-token", root / "cache")
@@ -98,7 +98,7 @@ class PipelineTests(unittest.TestCase):
             log_text = logs[0].read_text(encoding="utf-8-sig")
             self.assertIn("simulated failure", log_text)
             self.assertIn("credential=[REDACTED_API_KEY]", log_text)
-            self.assertIn("api_url=https://example.com/v1", log_text)
+            self.assertIn("api_url=https://example.com/v1/[REDACTED_API_KEY]", log_text)
             self.assertNotIn("secret-token", log_text)
             self.assertNotIn("password", log_text)
             self.assertNotIn("token=hidden", log_text)

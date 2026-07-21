@@ -183,6 +183,8 @@ class Pipeline:
                 "",
             )
         )
+        if self.api_key:
+            header = header.replace(self.api_key, "[REDACTED_API_KEY]")
         try:
             # ponytail: per-run logs are retained indefinitely; add age/size cleanup if volume becomes material.
             log_dir.mkdir(parents=True, exist_ok=True)
