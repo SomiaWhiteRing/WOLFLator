@@ -1,0 +1,16 @@
+[project]
+name = "wolflator"
+version = "0.1.0"
+description = "A one-window WOLF RPG translation workflow for Windows"
+requires-python = ">=3.11,<3.15"
+license = { text = "MIT" }
+dependencies = [
+    "PySide6-Essentials>=6.8,<7",
+    "openpyxl>=3.1,<4",
+]
+
+[project.gui-scripts]
+wolflator = "app:main"
+
+[tool.pyright]
+pythonVersion = "3.11"

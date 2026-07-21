@@ -1,0 +1,2 @@
+PySide6-Essentials>=6.8,<7
+openpyxl>=3.1,<4

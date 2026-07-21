@@ -1,0 +1,13 @@
+{
+  "uberwolf": {
+    "version": "0.6.3",
+    "url": "https://github.com/Sinflower/UberWolf/releases/download/v0.6.3/UberWolfCli.exe",
+    "sha256": "fffbe66caf10699865010217aeabe3a3684ec9320ffe461268f1c9509fda8917"
+  },
+  "uv": {
+    "version": "0.10.9",
+    "url": "https://github.com/astral-sh/uv/releases/download/0.10.9/uv-x86_64-pc-windows-msvc.zip",
+    "sha256": "f58dc40896000229db7c52b8bdd931394040ef2ad59abd1eda841f6d70b13d7a",
+    "exe_sha256": "06af7e6262fbde2f782ee2035f3943f1e8ecf107fb1cb15eb735dc0cd9b85dc6"
+  }
+}
