@@ -12,5 +12,8 @@ dependencies = [
 [project.gui-scripts]
 wolflator = "app:main"
 
+[project.scripts]
+wolflator-cli = "cli:main"
+
 [tool.pyright]
 pythonVersion = "3.11"

@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from models import AppSettings, RunMode, Stage, StageStatus
+from models import AppSettings, ImportScope, RunMode, Stage, StageStatus
 from pipeline import Pipeline, create_project, load_manifest
 
 
@@ -124,10 +124,11 @@ class PipelineTests(unittest.TestCase):
             manifest_path = create_project(root / "projects", game)
             first = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
             self.assertEqual("completed", first.run())
-            manifest = load_manifest(manifest_path)
-            manifest.import_scope.external = True
-            import json
-            Path(manifest_path).write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+            first.set_import_scope(ImportScope(external=True))
+            changed = load_manifest(manifest_path)
+            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.VALIDATE).status)
+            self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.IMPORT).status)
+            self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.RELEASE).status)
             executed = []
             second = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
             second.executed = executed

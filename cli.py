@@ -1,0 +1,333 @@
+from __future__ import annotations
+
+import argparse
+import json
+import signal
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Sequence
+
+from PySide6.QtCore import QCoreApplication
+
+from ainiee import (
+    install_supported_ainiee,
+    locate_ainiee_source,
+    prepare_managed_runtime,
+    test_api,
+)
+from models import STAGE_ORDER, AppSettings, ImportScope, Stage
+from pipeline import Pipeline, add_version, create_project, load_manifest
+from settings import SettingsStore, local_data_dir, validate_settings
+from wolf_tools import CancelledError
+
+
+def _stage(value: str) -> Stage:
+    try:
+        return Stage(value.lower())
+    except ValueError as exc:
+        choices = ", ".join(stage.value for stage in STAGE_ORDER)
+        raise argparse.ArgumentTypeError(f"未知阶段 {value!r}，可选值：{choices}") from exc
+
+
+def _settings_store(args: argparse.Namespace) -> SettingsStore:
+    return SettingsStore(args.settings)
+
+
+def _load_settings(args: argparse.Namespace) -> tuple[SettingsStore, AppSettings]:
+    store = _settings_store(args)
+    return store, store.load()
+
+
+def _api_key(settings: AppSettings) -> str:
+    if not settings.api_base_url.strip() or not settings.api_model.strip():
+        raise RuntimeError("请在设置中填写 API 基础地址和模型。")
+    key = SettingsStore.api_key(settings)
+    if not key:
+        raise RuntimeError("请在设置中填写 API 密钥。")
+    return key
+
+
+def _check_settings(settings: AppSettings) -> str:
+    errors = validate_settings(settings)
+    if errors:
+        raise RuntimeError("设置未完成：\n" + "\n".join(f"- {error}" for error in errors))
+    return _api_key(settings)
+
+
+def _print_progress(current: int, total: int, stage: Stage) -> None:
+    print(f"progress stage={stage.value} {current}/{total}", flush=True)
+
+
+def _print_log(message: str) -> None:
+    print(f"log {message}", flush=True)
+
+
+def _pipeline(args: argparse.Namespace, *, full_run: bool = False, require_api: bool = False) -> Pipeline:
+    store, settings = _load_settings(args)
+    api_key = _check_settings(settings) if full_run else (_api_key(settings) if require_api else "")
+    return Pipeline(
+        args.manifest,
+        settings,
+        api_key,
+        local_data_dir(),
+        log=_print_log,
+        progress=_print_progress,
+    )
+
+
+def _status(args: argparse.Namespace) -> int:
+    manifest = load_manifest(args.manifest)
+    version = manifest.version
+    records = {
+        stage.value: {
+            "status": version.stage(stage).status.value,
+            "error": version.stage(stage).error,
+            "artifacts": version.stage(stage).artifacts,
+        }
+        for stage in STAGE_ORDER
+    }
+    result = {
+        "project": manifest.project_id,
+        "name": manifest.name,
+        "manifest": str(Path(args.manifest).resolve()),
+        "active_version": manifest.active_version,
+        "run_mode": manifest.run_mode.value,
+        "stages": records,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"项目：{manifest.name} ({manifest.project_id})")
+        print(f"版本：{manifest.active_version}")
+        for stage in STAGE_ORDER:
+            record = version.stage(stage)
+            suffix = f"：{record.error}" if record.error else ""
+            print(f"{stage.value:10} {record.status.value}{suffix}")
+    return 0
+
+
+def _settings_check(args: argparse.Namespace) -> int:
+    _, settings = _load_settings(args)
+    errors = validate_settings(settings, require_api=not args.no_api)
+    result = {"valid": not errors, "errors": errors}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if errors:
+            print("设置无效：", file=sys.stderr)
+            for error in errors:
+                print(f"- {error}", file=sys.stderr)
+        else:
+            print("设置有效。")
+    return 0 if not errors else 2
+
+
+def _api_test(args: argparse.Namespace) -> int:
+    _, settings = _load_settings(args)
+    key = _api_key(settings)
+    response = test_api(settings, key)
+    print(response)
+    return 0
+
+
+def _progress_download(received: int, total: int) -> None:
+    now = time.monotonic()
+    previous = getattr(_progress_download, "last", 0.0)
+    if total and (received == total or now - previous >= 0.5):
+        _progress_download.last = now
+        print(f"download {received}/{total}", flush=True)
+
+
+def _prepare_ainiee(args: argparse.Namespace) -> int:
+    store, settings = _load_settings(args)
+    if args.source:
+        source = locate_ainiee_source(args.source)
+    else:
+        source = install_supported_ainiee(
+            local_data_dir() / "packages" / "ainiee",
+            repair=args.repair,
+            progress=_progress_download,
+            log=_print_log,
+        )
+    runtime = prepare_managed_runtime(
+        source,
+        local_data_dir() / "runtime" / "ainiee",
+        force_sync=args.repair,
+        log=_print_log,
+    )
+    settings.ainiee_source = str(source)
+    store.save(settings)
+    print(f"source={source}")
+    print(f"runtime={runtime}")
+    print("AiNiee 运行时已就绪。")
+    return 0
+
+
+def _create_project(args: argparse.Namespace) -> int:
+    store, settings = _load_settings(args)
+    projects_root = args.projects_root or settings.projects_root
+    path = create_project(projects_root, args.game, args.name or "")
+    settings.last_project = str(path)
+    store.save(settings)
+    print(path)
+    return 0
+
+
+def _add_version(args: argparse.Namespace) -> int:
+    manifest = add_version(args.manifest, args.game)
+    print(f"active_version={manifest.active_version}")
+    return 0
+
+
+def _run(args: argparse.Namespace) -> int:
+    stage = args.stage
+    pipeline = _pipeline(
+        args,
+        full_run=stage is None,
+        require_api=stage in {Stage.GLOSSARY, Stage.TRANSLATE},
+    )
+    interrupted = False
+
+    def cancel(_signum, _frame) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            print("正在取消当前阶段...", file=sys.stderr, flush=True)
+            pipeline.cancel()
+        raise CancelledError("任务已取消。")
+
+    previous_handler = signal.signal(signal.SIGINT, cancel)
+    try:
+        result = pipeline.run_stage(stage) if stage is not None else pipeline.run()
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+    print(f"result={result}")
+    release = pipeline.last_release()
+    if release:
+        print(f"release={release}")
+    return 0
+
+
+def _skip(args: argparse.Namespace) -> int:
+    pipeline = _pipeline(args)
+    pipeline.skip_stage(args.stage)
+    print(f"skipped={args.stage.value}")
+    return 0
+
+
+def _retry(args: argparse.Namespace) -> int:
+    pipeline = _pipeline(args)
+    pipeline.retry_failed()
+    print("failed stages reset")
+    return 0
+
+
+def _scope(args: argparse.Namespace) -> int:
+    pipeline = _pipeline(args)
+    current = pipeline.manifest.import_scope
+    values = {
+        name: getattr(args, name) if getattr(args, name) is not None else getattr(current, name)
+        for name in ("display", "external", "optional_name", "halfwidth", "filename")
+    }
+    pipeline.set_import_scope(ImportScope(**values))
+    print(json.dumps(values, ensure_ascii=False))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wolflator-cli",
+        description="WOLFLator 无界面流水线入口。默认读取当前用户的持久化设置。",
+    )
+    parser.add_argument("--settings", help="自定义 settings.ini 路径")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    settings = subparsers.add_parser("settings-check", help="检查工具、目录、API 和许可证配置")
+    settings.add_argument("--no-api", action="store_true", help="只检查工具配置，不要求 API 密钥")
+    settings.add_argument("--json", action="store_true", help="使用 JSON 输出")
+
+    subparsers.add_parser("api-test", help="使用持久化 API 配置发送一次测试请求")
+
+    ainiee = subparsers.add_parser("ainiee-prepare", help="安装或选择 AiNiee，并准备隔离依赖运行时")
+    ainiee.add_argument("--source", help="已有 AiNiee GUI、安装目录或源码目录")
+    ainiee.add_argument("--repair", action="store_true", help="强制重新同步 uv 依赖")
+
+    create = subparsers.add_parser("project-create", help="从 WOLF 游戏目录创建项目")
+    create.add_argument("game", help="包含 Game.exe 和 Data.wolf/Data 的游戏目录")
+    create.add_argument("--name", help="项目显示名称")
+    create.add_argument("--projects-root", help="覆盖持久化项目目录")
+
+    version = subparsers.add_parser("project-add-version", help="向项目添加源版本")
+    version.add_argument("manifest", help="project.json")
+    version.add_argument("game", help="新版本游戏目录")
+
+    status = subparsers.add_parser("status", help="查看活动版本和八个阶段状态")
+    status.add_argument("manifest", help="project.json")
+    status.add_argument("--json", action="store_true", help="使用 JSON 输出")
+
+    run = subparsers.add_parser("run", help="运行一键流程，或只运行一个阶段")
+    run.add_argument("manifest", help="project.json")
+    run.add_argument("--stage", type=_stage, help="只运行一个阶段，例如 translate")
+
+    skip = subparsers.add_parser("skip", help="手动跳过一个阶段")
+    skip.add_argument("manifest", help="project.json")
+    skip.add_argument("stage", type=_stage)
+
+    retry = subparsers.add_parser("retry", help="重置失败/取消阶段及其后续阶段")
+    retry.add_argument("manifest", help="project.json")
+
+    scope = subparsers.add_parser("scope", help="查看或修改导入范围")
+    scope.add_argument("manifest", help="project.json")
+    for name in ("display", "external", "optional_name", "halfwidth", "filename"):
+        scope.add_argument(
+            f"--{name.replace('_', '-')}",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+        )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    QCoreApplication.setApplicationName("WOLFLator")
+    QCoreApplication.setOrganizationName("WOLFLator")
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "settings-check":
+            return _settings_check(args)
+        if args.command == "api-test":
+            return _api_test(args)
+        if args.command == "ainiee-prepare":
+            return _prepare_ainiee(args)
+        if args.command == "project-create":
+            return _create_project(args)
+        if args.command == "project-add-version":
+            return _add_version(args)
+        if args.command == "status":
+            return _status(args)
+        if args.command == "run":
+            return _run(args)
+        if args.command == "skip":
+            return _skip(args)
+        if args.command == "retry":
+            return _retry(args)
+        if args.command == "scope":
+            return _scope(args)
+    except CancelledError:
+        print("已取消。", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        print("已取消。", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    parser.error(f"未知命令：{args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,14 +12,14 @@ from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from ainiee import (
-    create_managed_runtime,
     generate_glossary,
+    require_managed_runtime,
     run_translation,
-    sync_runtime,
 )
 from models import (
     STAGE_ORDER,
     AppSettings,
+    ImportScope,
     ProjectManifest,
     RunMode,
     Stage,
@@ -215,6 +215,16 @@ class Pipeline:
 
     def set_run_mode(self, mode: RunMode) -> None:
         self.manifest.run_mode = mode
+        self.save()
+
+    def set_import_scope(self, scope: ImportScope) -> None:
+        if self.manifest.import_scope == scope:
+            return
+        self.manifest.import_scope = scope
+        for stage in (Stage.IMPORT, Stage.RELEASE):
+            record = self.manifest.version.stage(stage)
+            record.status = StageStatus.PENDING
+            record.error = ""
         self.save()
 
     def _safe_remove(self, path: Path) -> None:
@@ -424,11 +434,10 @@ class Pipeline:
         paratranz = to_paratranz(items)
         input_path = self.artifacts_dir / "ainiee-input.json"
         _atomic_json(input_path, paratranz)
-        runtime = create_managed_runtime(
+        runtime = require_managed_runtime(
             self.settings.ainiee_source,
             self.cache_root / "runtime" / "ainiee",
         )
-        sync_runtime(runtime, cancel_event=self.cancel_event, log=self.log)
         glossary = json.loads((self.project_dir / "glossary.json").read_text(encoding="utf-8"))
         raw = run_translation(
             runtime,

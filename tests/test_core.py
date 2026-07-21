@@ -191,6 +191,24 @@ class AiNieeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "越界路径"):
                 ainiee._safe_extract(archive, root / "out")
 
+    def test_dependencies_are_prepared_before_runtime_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_runtime(root / "source")
+
+            def fake_sync(command, *, cwd, **_kwargs):
+                (Path(cwd) / ".venv").mkdir()
+                return ToolResult(command, 0)
+
+            with mock.patch.object(ainiee, "run_process", side_effect=fake_sync) as run:
+                runtime = ainiee.prepare_managed_runtime(source, root / "runtimes")
+                self.assertEqual(runtime, ainiee.require_managed_runtime(source, root / "runtimes"))
+                self.assertEqual(1, run.call_count)
+
+            (runtime / ".uv-sync").unlink()
+            with self.assertRaisesRegex(RuntimeError, "请打开设置"):
+                ainiee.require_managed_runtime(source, root / "runtimes")
+
     def test_api_test_leaves_room_for_reasoning_tokens(self):
         settings = AppSettings(api_base_url="https://example.com/v1", api_model="reasoning-model")
         with mock.patch.object(ainiee.OpenAICompatibleClient, "chat", return_value="ok") as chat:

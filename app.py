@@ -46,6 +46,7 @@ from ainiee import (
     AINIEE_VERSION,
     install_supported_ainiee,
     locate_ainiee_source,
+    prepare_managed_runtime,
     test_api,
 )
 from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus
@@ -111,17 +112,29 @@ class InstallThread(QThread):
     installed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, packages_root: Path, repair: bool):
+    def __init__(self, packages_root: Path, runtime_root: Path, repair: bool, source: str = ""):
         super().__init__()
         self.packages_root = packages_root
+        self.runtime_root = runtime_root
         self.repair = repair
+        self.source = source
 
     def run(self) -> None:
         try:
-            path = install_supported_ainiee(
-                self.packages_root,
-                repair=self.repair,
-                progress=self.progress_changed.emit,
+            if self.source:
+                path = locate_ainiee_source(self.source)
+            else:
+                path = install_supported_ainiee(
+                    self.packages_root,
+                    repair=self.repair,
+                    progress=self.progress_changed.emit,
+                    log=self.log_line.emit,
+                )
+            self.log_line.emit("正在安装 AiNiee 依赖，首次准备可能需要较长时间...")
+            prepare_managed_runtime(
+                path,
+                self.runtime_root,
+                force_sync=self.repair,
                 log=self.log_line.emit,
             )
             self.installed.emit(str(path))
@@ -186,11 +199,11 @@ class SettingsDialog(QDialog):
         ainiee_layout.setContentsMargins(0, 0, 0, 0)
         ainiee_layout.setSpacing(8)
         ainiee_layout.addWidget(self.ainiee_path, 1)
-        select_ainiee = QPushButton("选择目录")
-        select_ainiee.clicked.connect(self._choose_ainiee)
+        self.select_ainiee_button = QPushButton("选择目录")
+        self.select_ainiee_button.clicked.connect(self._choose_ainiee)
         self.install_button = QPushButton(f"安装 {AINIEE_VERSION}")
         self.install_button.clicked.connect(lambda: self._install_ainiee(False))
-        ainiee_layout.addWidget(select_ainiee)
+        ainiee_layout.addWidget(self.select_ainiee_button)
         ainiee_layout.addWidget(self.install_button)
         form.addRow("AiNiee-Next", ainiee_widget)
 
@@ -198,13 +211,13 @@ class SettingsDialog(QDialog):
         manage_layout = QHBoxLayout(management)
         manage_layout.setContentsMargins(0, 0, 0, 0)
         manage_layout.setSpacing(8)
-        repair = QPushButton("修复")
-        repair.clicked.connect(lambda: self._install_ainiee(True))
+        self.repair_button = QPushButton("修复")
+        self.repair_button.clicked.connect(lambda: self._install_ainiee(True))
         open_button = QPushButton("打开目录")
         open_button.clicked.connect(self._open_ainiee)
         remove = QPushButton("移除托管版本")
         remove.clicked.connect(self._remove_ainiee)
-        manage_layout.addWidget(repair)
+        manage_layout.addWidget(self.repair_button)
         manage_layout.addWidget(open_button)
         manage_layout.addWidget(remove)
         manage_layout.addStretch(1)
@@ -264,6 +277,7 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
+        self.save_button = buttons.button(QDialogButtonBox.Save)
         layout.addWidget(buttons)
 
     def _choose_wolf(self) -> None:
@@ -276,8 +290,8 @@ class SettingsDialog(QDialog):
         if not path:
             return
         try:
-            self.ainiee_path.setText(str(locate_ainiee_source(path)))
-            self.activity.setText("AiNiee 兼容性检查通过")
+            source = str(locate_ainiee_source(path))
+            self._start_ainiee_setup(False, source)
         except Exception as exc:
             QMessageBox.critical(self, "AiNiee 不兼容", str(exc))
 
@@ -292,13 +306,24 @@ class SettingsDialog(QDialog):
             self.ascii_dir.setText(path)
 
     def _install_ainiee(self, repair: bool) -> None:
+        self._start_ainiee_setup(repair)
+
+    def _start_ainiee_setup(self, repair: bool, source: str = "") -> None:
         if self.install_thread and self.install_thread.isRunning():
             return
         self.install_button.setEnabled(False)
+        self.select_ainiee_button.setEnabled(False)
+        self.repair_button.setEnabled(False)
+        self.save_button.setEnabled(False)
         self.install_progress.setRange(0, 0)
         self.install_progress.show()
-        self.activity.setText("正在准备 AiNiee...")
-        self.install_thread = InstallThread(local_data_dir() / "packages" / "ainiee", repair)
+        self.activity.setText("正在准备 AiNiee 源码与运行依赖...")
+        self.install_thread = InstallThread(
+            local_data_dir() / "packages" / "ainiee",
+            local_data_dir() / "runtime" / "ainiee",
+            repair,
+            source,
+        )
         self.install_thread.progress_changed.connect(self._install_progress_changed)
         self.install_thread.log_line.connect(self.activity.setText)
         self.install_thread.installed.connect(self._ainiee_installed)
@@ -317,11 +342,17 @@ class SettingsDialog(QDialog):
         self.activity.setText(f"AiNiee 已就绪：{path}")
         self.install_progress.hide()
         self.install_button.setEnabled(True)
+        self.select_ainiee_button.setEnabled(True)
+        self.repair_button.setEnabled(True)
+        self.save_button.setEnabled(True)
 
     def _ainiee_install_failed(self, detail: str) -> None:
         self.activity.setText("AiNiee 安装失败")
         self.install_progress.hide()
         self.install_button.setEnabled(True)
+        self.select_ainiee_button.setEnabled(True)
+        self.repair_button.setEnabled(True)
+        self.save_button.setEnabled(True)
         QMessageBox.critical(self, "安装失败", detail[-4000:])
 
     def _open_ainiee(self) -> None:
@@ -903,20 +934,16 @@ class MainWindow(QMainWindow):
                 self.scope_checks["filename"].blockSignals(True)
                 self.scope_checks["filename"].setChecked(False)
                 self.scope_checks["filename"].blockSignals(False)
-        manifest = load_manifest(self.current_manifest_path)
         new_scope = ImportScope(**{name: check.isChecked() for name, check in self.scope_checks.items()})
-        if manifest.import_scope != new_scope:
-            for stage in (Stage.IMPORT, Stage.RELEASE):
-                record = manifest.version.stage(stage)
-                record.status = StageStatus.PENDING
-                record.error = ""
-        manifest.import_scope = new_scope
-        temporary = self.current_manifest_path.with_name("project.json.tmp")
-        temporary.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, self.current_manifest_path)
+        pipeline = Pipeline(
+            self.current_manifest_path,
+            self.settings,
+            "",
+            local_data_dir(),
+        )
+        pipeline.set_import_scope(new_scope)
         if self.pipeline:
-            self.pipeline.manifest.import_scope = manifest.import_scope
-            self.pipeline.save()
+            self.pipeline.manifest = pipeline.manifest
 
     def _load_glossary(self) -> None:
         self.terms_table.setRowCount(0)

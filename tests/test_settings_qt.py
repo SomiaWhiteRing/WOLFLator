@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from app import MainWindow, SettingsDialog
+from app import InstallThread, MainWindow, SettingsDialog
 from models import AppSettings, RunMode, Stage, StageStatus
 from pipeline import create_project, load_manifest
 from settings import SettingsStore, protect_secret, unprotect_secret
@@ -34,6 +34,24 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(item.wolf_tool_path, dialog.wolf_path.text())
             self.assertEqual(item.ainiee_source, dialog.ainiee_path.text())
             dialog.close()
+
+    def test_install_thread_prepares_dependencies_before_reporting_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            with patch("app.install_supported_ainiee", return_value=source) as install, patch(
+                "app.prepare_managed_runtime"
+            ) as prepare:
+                thread = InstallThread(root / "packages", root / "runtime", False)
+                thread.run()
+            install.assert_called_once()
+            prepare.assert_called_once_with(
+                source,
+                root / "runtime",
+                force_sync=False,
+                log=thread.log_line.emit,
+            )
 
     def test_first_run_dialog_waits_until_window_can_be_shown(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,101 @@
+import io
+import json
+import signal
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+import cli
+from PySide6.QtCore import QCoreApplication
+from models import AppSettings
+from pipeline import create_project
+from wolf_tools import CancelledError
+
+
+def make_game(root: Path) -> Path:
+    root.mkdir()
+    (root / "Game.exe").write_bytes(b"game")
+    (root / "Data.wolf").write_bytes(b"data")
+    return root
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_uses_the_same_qt_identity_as_the_gui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.ini"
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                cli.main(["--settings", str(settings_path), "settings-check"])
+            self.assertEqual("WOLFLator", QCoreApplication.applicationName())
+            self.assertEqual("WOLFLator", QCoreApplication.organizationName())
+
+    def test_status_json_is_machine_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = create_project(root / "projects", make_game(root / "game"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, cli.main(["status", str(manifest), "--json"]))
+            result = json.loads(output.getvalue())
+            self.assertEqual("game", result["project"])
+            self.assertEqual("pending", result["stages"]["copy"]["status"])
+
+    def test_project_create_uses_persisted_projects_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings_path = root / "settings.ini"
+            store = cli.SettingsStore(settings_path)
+            store.save(AppSettings(projects_root=str(root / "projects")))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    0,
+                    cli.main(["--settings", str(settings_path), "project-create", str(make_game(root / "game"))]),
+                )
+            manifest = Path(output.getvalue().strip())
+            self.assertTrue(manifest.is_file())
+
+    def test_scope_updates_the_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = create_project(root / "projects", make_game(root / "game"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, cli.main(["scope", str(manifest), "--external"]))
+            self.assertTrue(cli.load_manifest(manifest).import_scope.external)
+
+    def test_ctrl_c_cancels_pipeline_and_returns_130(self):
+        class FakePipeline:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def run(self):
+                signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+                raise CancelledError("cancelled")
+
+        pipeline = FakePipeline()
+        errors = io.StringIO()
+        with patch.object(cli, "_pipeline", return_value=pipeline), redirect_stderr(errors):
+            self.assertEqual(130, cli.main(["run", "project.json"]))
+        self.assertTrue(pipeline.cancelled)
+        self.assertIn("已取消", errors.getvalue())
+
+    def test_run_reports_missing_runtime_without_starting_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "project.json"
+            output = io.StringIO()
+            errors = io.StringIO()
+            with patch.object(cli, "_pipeline", side_effect=RuntimeError("runtime missing")), redirect_stdout(
+                output
+            ), redirect_stderr(errors):
+                self.assertEqual(1, cli.main(["run", str(manifest)]))
+            self.assertIn("runtime missing", errors.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

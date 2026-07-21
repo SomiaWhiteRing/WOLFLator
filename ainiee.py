@@ -306,6 +306,12 @@ def create_managed_runtime(source: str | Path, runtime_root: str | Path) -> Path
     return validate_ainiee_source(final)
 
 
+def _managed_runtime_path(source: str | Path, runtime_root: str | Path) -> tuple[Path, str]:
+    source_root = locate_ainiee_source(source)
+    fingerprint = _runtime_fingerprint(source_root)
+    return Path(runtime_root) / fingerprint, fingerprint
+
+
 def locate_uv() -> Path:
     override = os.environ.get("WOLFLATOR_UV", "")
     candidates = [Path(override)] if override else []
@@ -325,13 +331,14 @@ def locate_uv() -> Path:
 def sync_runtime(
     runtime: str | Path,
     *,
+    force: bool = False,
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
 ) -> None:
     root = validate_ainiee_source(runtime)
     lock_hash = sha256_file(root / "uv.lock")
     marker = root / ".uv-sync"
-    if marker.is_file() and marker.read_text(encoding="ascii", errors="ignore") == lock_hash and (root / ".venv").is_dir():
+    if not force and marker.is_file() and marker.read_text(encoding="ascii", errors="ignore") == lock_hash and (root / ".venv").is_dir():
         return
     run_process(
         [str(locate_uv()), "sync", "--frozen"],
@@ -341,6 +348,40 @@ def sync_runtime(
         log=log,
     )
     marker.write_text(lock_hash, encoding="ascii")
+
+
+def prepare_managed_runtime(
+    source: str | Path,
+    runtime_root: str | Path,
+    *,
+    force_sync: bool = False,
+    cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
+) -> Path:
+    runtime = create_managed_runtime(source, runtime_root)
+    sync_runtime(runtime, force=force_sync, cancel_event=cancel_event, log=log)
+    return runtime
+
+
+def require_managed_runtime(source: str | Path, runtime_root: str | Path) -> Path:
+    runtime, fingerprint = _managed_runtime_path(source, runtime_root)
+    try:
+        validate_ainiee_source(runtime)
+        metadata = json.loads((runtime / ".wolflator-runtime.json").read_text(encoding="utf-8"))
+        synced_lock = (runtime / ".uv-sync").read_text(encoding="ascii", errors="ignore")
+        ready = (
+            metadata.get("fingerprint") == fingerprint
+            and (runtime / ".venv").is_dir()
+            and synced_lock == sha256_file(runtime / "uv.lock")
+        )
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        ready = False
+    if not ready:
+        raise RuntimeError(
+            "AiNiee 运行环境尚未准备好。请打开设置，重新选择 AiNiee 目录，"
+            "或点击“安装/修复”，并等待依赖安装完成。"
+        )
+    return runtime
 
 
 def _rules_name(project_id: str) -> str:
