@@ -30,7 +30,7 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 
 - 自行取得的 WOLF Translation Support Tool for FreeGames EXE；同目录必须有 `LibXL.dll`。
 - 已安装/解压的 AiNiee-Next，或在设置窗口点击“安装 V2.7.5”。
-- 两套 OpenAI 兼容 API 配置：术语生成，以及交给 AiNiee 使用的翻译配置。两者可使用不同的地址、模型、密钥、并发和超时。
+- 两套 OpenAI 兼容 API 配置：术语生成，以及交给 AiNiee 使用的翻译配置。两者可使用不同的地址、模型、密钥、并发和超时；术语生成还可单独设置每块最大输入字符数和最大输出 Token。
 - 项目目录和纯 ASCII 的 UberWolf 执行目录。
 
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。

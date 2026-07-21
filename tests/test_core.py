@@ -1,9 +1,11 @@
+import http.server
 import io
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import zipfile
@@ -413,6 +415,31 @@ class AiNieeTests(unittest.TestCase):
         self.assertNotIn("glossary.retry label=角色分析:1/1", "\n".join(diagnostics))
         self.assertTrue(all(call.kwargs["max_tokens"] == 65_535 for call in client.chat.call_args_list))
 
+    def test_glossary_chunks_use_configured_character_limit(self):
+        self.assertEqual(
+            ["12345\n12345", "12345"],
+            ainiee._chunks(["12345", "12345", "12345"], max_chars=11, overlap=0),
+        )
+        items = [
+            ainiee.TranslationItem(key=str(index), original="文" * 30, type="Event", info="Message")
+            for index in range(3)
+        ]
+        settings = AppSettings(
+            glossary_api_base_url="https://example.com/v1",
+            glossary_api_model="model",
+            glossary_chunk_chars=50,
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            ainiee, "_parallel_stage", return_value=[]
+        ), mock.patch.object(ainiee, "_chunks", return_value=["chunk"]) as chunks:
+            ainiee.generate_glossary(
+                items,
+                Path(directory) / "glossary.json",
+                settings,
+                "secret",
+            )
+        self.assertEqual(50, chunks.call_args.kwargs["max_chars"])
+
     def test_deepseek_request_matches_managed_ainiee_profile(self):
         response = mock.MagicMock()
         response.read.return_value = json.dumps(
@@ -468,6 +495,51 @@ class AiNieeTests(unittest.TestCase):
         self.assertIn("rate limited", joined)
         self.assertNotIn("secret", joined)
 
+    def test_api_timeout_covers_the_complete_response(self):
+        body = json.dumps(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        ).encode("utf-8")
+
+        class SlowHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for part in (body[:1], body[1:2], body[2:]):
+                        self.wfile.write(part)
+                        self.wfile.flush()
+                        time.sleep(0.15)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        diagnostics = []
+        client = ainiee.OpenAICompatibleClient(
+            f"http://127.0.0.1:{server.server_port}/v1",
+            "secret",
+            "model",
+            diagnostic_log=diagnostics.append,
+        )
+        client.timeout = 0.2
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(ainiee.ApiError, "总时限"):
+                client.chat("hello")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("kind=timeout", "\n".join(diagnostics))
+
     def test_glossary_json_failure_records_each_retry_and_chunk_identity(self):
         client = mock.Mock()
         client.chat.return_value = '[{"src":"broken"}'
@@ -491,6 +563,66 @@ class AiNieeTests(unittest.TestCase):
         self.assertIn("glossary.retry label=角色分析:1/2 delay=1s", joined)
         self.assertIn("glossary.retry label=角色分析:1/2 delay=2s", joined)
 
+    def test_glossary_repairs_only_invalid_json_escapes(self):
+        client = mock.Mock()
+        client.chat.return_value = (
+            r'[{"speech_quirks":"red \c[2], icon \i[3]",'
+            r'"path":"C:\\Games","line":"a\nb","unicode":"\u65e5"}]'
+        )
+        diagnostics = []
+        rows = ainiee._request_chunk(
+            client,
+            "prompt",
+            "chunk",
+            cancel_event=None,
+            diagnostic_log=diagnostics.append,
+            request_label="角色分析:4/20",
+        )
+        self.assertEqual(r"red \c[2], icon \i[3]", rows[0]["speech_quirks"])
+        self.assertEqual(r"C:\Games", rows[0]["path"])
+        self.assertEqual("a\nb", rows[0]["line"])
+        self.assertEqual("日", rows[0]["unicode"])
+        self.assertEqual(1, client.chat.call_count)
+        self.assertIn("glossary.json_escape_repaired label=角色分析:4/20 repairs=2", "\n".join(diagnostics))
+
+        broken, repairs = ainiee._repair_invalid_json_escapes(r'[{"src":"\c[2]" "dst":"红"}]')
+        self.assertEqual(1, repairs)
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(broken)
+
+    def test_glossary_first_failure_cancels_queued_chunks(self):
+        client = mock.Mock()
+        client.chat.return_value = '[{"src":"broken"}'
+        diagnostics = []
+        with mock.patch.object(ainiee.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "Expecting"):
+                ainiee._parallel_stage(
+                    client,
+                    "prompt",
+                    ["bad", "must not start", "also must not start"],
+                    workers=1,
+                    cancel_event=None,
+                    log=None,
+                    diagnostic_log=diagnostics.append,
+                    label="角色分析",
+                    max_tokens=None,
+                )
+        self.assertEqual(3, client.chat.call_count)
+        self.assertFalse(any("角色分析:2/3" in line for line in diagnostics))
+
+        aborted = threading.Event()
+        aborted.set()
+        client.reset_mock()
+        with self.assertRaises(CancelledError):
+            ainiee._request_chunk(
+                client,
+                "prompt",
+                "chunk",
+                cancel_event=None,
+                abort_event=aborted,
+            )
+        client.chat.assert_not_called()
+
     def test_zero_exit_without_artifact_is_failure_and_profile_is_cleaned(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -499,13 +631,17 @@ class AiNieeTests(unittest.TestCase):
             input_path.write_text("[]", encoding="utf-8")
             settings = AppSettings(api_base_url="https://example.com/v1", api_model="model")
             fake_result = ToolResult([], 0)
-            with mock.patch.object(ainiee, "run_process", return_value=fake_result), mock.patch.object(
+            with mock.patch.object(ainiee, "run_process", return_value=fake_result) as run, mock.patch.object(
                 ainiee, "locate_uv", return_value=Path(sys.executable)
             ):
                 with self.assertRaisesRegex(RuntimeError, "没有生成"):
                     ainiee.run_translation(
                         runtime, input_path, root / "output", dict(ainiee.RULE_DEFAULTS), "project", settings, "secret"
                     )
+            self.assertEqual(
+                ["run", "--frozen", "--no-sync", "ainiee_cli.py"],
+                run.call_args.args[0][1:5],
+            )
             self.assertFalse((runtime / "Resource" / "profiles" / "WOLFLator_session.json").exists())
 
     def test_translation_failure_includes_ainiee_session_log_tail(self):

@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import count
 from pathlib import Path
 from typing import Callable, Iterable
@@ -508,6 +508,8 @@ def run_translation(
                 [
                     str(locate_uv()),
                     "run",
+                    "--frozen",
+                    "--no-sync",
                     "ainiee_cli.py",
                     "translate",
                     str(Path(input_json).resolve()),
@@ -560,6 +562,38 @@ class ApiError(RuntimeError):
         self.status = status
 
 
+def _read_response_body(response, deadline: float) -> bytes:
+    def set_remaining_timeout(remaining: float) -> None:
+        fp = getattr(response, "fp", None)
+        raw = getattr(fp, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if callable(getattr(sock, "settimeout", None)):
+            # ponytail: CPython urllib has no public socket hook; replace the transport if other runtimes are supported.
+            sock.settimeout(max(0.001, remaining))
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("API request deadline exceeded")
+        return value
+
+    read1 = getattr(response, "read1", None)
+    if not callable(getattr(type(response), "read1", None)):
+        set_remaining_timeout(remaining())
+        data = response.read()
+        remaining()
+        return data
+
+    chunks: list[bytes] = []
+    while True:
+        set_remaining_timeout(remaining())
+        chunk = read1(64 * 1024)
+        remaining()
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 class OpenAICompatibleClient:
     def __init__(
         self,
@@ -597,6 +631,7 @@ class OpenAICompatibleClient:
     ) -> str:
         request_id = next(self._request_ids)
         started = time.monotonic()
+        deadline = started + self.timeout
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -629,18 +664,46 @@ class OpenAICompatibleClient:
                 f"payload_bytes={len(payload)} max_tokens={max_tokens}"
             )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("API request deadline exceeded")
+            with urllib.request.urlopen(request, timeout=remaining) as response:
+                raw = _read_response_body(response, deadline)
                 status = response.status if isinstance(getattr(response, "status", None), int) else 200
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[-2000:]
+            try:
+                detail_raw = _read_response_body(exc.fp or exc, deadline)
+            except TimeoutError:
+                detail_raw = b""
+            detail = detail_raw.decode("utf-8", errors="replace")[-2000:]
             if self.diagnostic_log:
                 self.diagnostic_log(
                     f"api.error id={request_id} kind=http status={exc.code} "
                     f"duration={time.monotonic() - started:.3f}s body={detail}"
                 )
             raise ApiError(f"API HTTP {exc.code}: {detail}", exc.code) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except TimeoutError as exc:
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=timeout limit={self.timeout}s "
+                    f"duration={time.monotonic() - started:.3f}s error={exc}"
+                )
+            raise ApiError(f"API 请求超过总时限（{self.timeout} 秒）。") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                if self.diagnostic_log:
+                    self.diagnostic_log(
+                        f"api.error id={request_id} kind=timeout limit={self.timeout}s "
+                        f"duration={time.monotonic() - started:.3f}s error={exc}"
+                    )
+                raise ApiError(f"API 请求超过总时限（{self.timeout} 秒）。") from exc
+            if self.diagnostic_log:
+                self.diagnostic_log(
+                    f"api.error id={request_id} kind=connection error_type={type(exc).__name__} "
+                    f"duration={time.monotonic() - started:.3f}s error={exc}"
+                )
+            raise ApiError(f"API 连接失败: {exc}") from exc
+        except OSError as exc:
             if self.diagnostic_log:
                 self.diagnostic_log(
                     f"api.error id={request_id} kind=connection error_type={type(exc).__name__} "
@@ -700,14 +763,19 @@ def test_api(settings: AppSettings, api_key: str, *, glossary: bool = False) -> 
     return response.strip()
 
 
-def _chunks(lines: list[str], max_chars: int = 80_000, overlap: int = 10) -> list[str]:
+def _chunks(lines: list[str], max_chars: int = 500_000, overlap: int = 10) -> list[str]:
+    if max_chars < 1:
+        raise ValueError("术语输入分块字符数必须大于 0。")
     chunks: list[str] = []
     start = 0
     while start < len(lines):
         end = start
         size = 0
-        while end < len(lines) and (size + len(lines[end]) <= max_chars or end == start):
-            size += len(lines[end]) + 1
+        while end < len(lines):
+            candidate_size = size + (1 if end > start else 0) + len(lines[end])
+            if end > start and candidate_size > max_chars:
+                break
+            size = candidate_size
             end += 1
         chunks.append("\n".join(lines[start:end]))
         if end >= len(lines):
@@ -734,20 +802,66 @@ def _json_list(text: str) -> list[dict[str, object]]:
     return [row for row in data if isinstance(row, dict)]
 
 
+def _repair_invalid_json_escapes(text: str) -> tuple[str, int]:
+    output: list[str] = []
+    in_string = False
+    repairs = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if not in_string:
+            output.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == '"':
+            output.append(char)
+            in_string = False
+            index += 1
+            continue
+        if char != "\\":
+            output.append(char)
+            index += 1
+            continue
+        if index + 1 < len(text):
+            escaped = text[index + 1]
+            if escaped in '"\\/bfnrt':
+                output.append(text[index:index + 2])
+                index += 2
+                continue
+            if (
+                escaped == "u"
+                and index + 6 <= len(text)
+                and all(char in "0123456789abcdefABCDEF" for char in text[index + 2:index + 6])
+            ):
+                output.append(text[index:index + 6])
+                index += 6
+                continue
+        output.append("\\\\")
+        repairs += 1
+        index += 1
+    return "".join(output), repairs
+
+
 def _request_chunk(
     client: OpenAICompatibleClient,
     prompt_prefix: str,
     chunk: str,
     *,
     cancel_event: threading.Event | None,
+    abort_event: threading.Event | None = None,
     max_tokens: int | None = None,
     split_depth: int = 0,
     diagnostic_log: Callable[[str], None] | None = None,
     request_label: str = "",
 ) -> list[dict[str, object]]:
     _check_cancel(cancel_event)
+    _check_cancel(abort_event)
     last_error: Exception | None = None
     for attempt in range(3):
+        _check_cancel(cancel_event)
+        _check_cancel(abort_event)
         response_text = ""
         if diagnostic_log:
             diagnostic_log(
@@ -760,7 +874,20 @@ def _request_chunk(
                 prompt_prefix + "\n\n原文语料：\n" + chunk,
                 max_tokens=max_tokens,
             )
-            result = _json_list(response_text)
+            _check_cancel(cancel_event)
+            _check_cancel(abort_event)
+            try:
+                result = _json_list(response_text)
+            except json.JSONDecodeError:
+                repaired_text, repair_count = _repair_invalid_json_escapes(response_text)
+                if not repair_count:
+                    raise
+                result = _json_list(repaired_text)
+                if diagnostic_log:
+                    diagnostic_log(
+                        f"glossary.json_escape_repaired label={request_label} repairs={repair_count} "
+                        f"response_sha256={hashlib.sha256(response_text.encode('utf-8')).hexdigest()[:16]}"
+                    )
             if diagnostic_log:
                 diagnostic_log(f"glossary.response label={request_label} rows={len(result)}")
             return result
@@ -782,6 +909,8 @@ def _request_chunk(
                 for word in ("context", "too many tokens", "maximum", "请求过长", "输出达到上限")
             )
             if context_error and split_depth < 5 and "\n" in chunk:
+                _check_cancel(cancel_event)
+                _check_cancel(abort_event)
                 lines = chunk.splitlines()
                 midpoint = len(lines) // 2
                 if diagnostic_log:
@@ -791,19 +920,25 @@ def _request_chunk(
                     )
                 return _request_chunk(
                     client, prompt_prefix, "\n".join(lines[:midpoint]), cancel_event=cancel_event,
+                    abort_event=abort_event,
                     max_tokens=max_tokens,
                     split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
                     request_label=request_label + ".left",
                 ) + _request_chunk(
                     client, prompt_prefix, "\n".join(lines[midpoint:]), cancel_event=cancel_event,
+                    abort_event=abort_event,
                     max_tokens=max_tokens,
                     split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
                     request_label=request_label + ".right",
                 )
             if attempt < 2:
+                _check_cancel(cancel_event)
+                _check_cancel(abort_event)
                 if diagnostic_log:
                     diagnostic_log(f"glossary.retry label={request_label} delay={2**attempt}s")
                 time.sleep(2**attempt)
+                _check_cancel(cancel_event)
+                _check_cancel(abort_event)
     raise RuntimeError(str(last_error or "术语请求失败"))
 
 
@@ -819,27 +954,55 @@ def _parallel_stage(
     max_tokens: int | None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(chunks)))) as executor:
-        futures = {
-            executor.submit(
-                _request_chunk,
-                client,
-                prompt,
-                chunk,
-                cancel_event=cancel_event,
-                max_tokens=max_tokens,
-                diagnostic_log=diagnostic_log,
-                request_label=f"{label}:{index}/{len(chunks)}",
-            ): index
-            for index, chunk in enumerate(chunks, 1)
-        }
-        for future in as_completed(futures):
+    abort_event = threading.Event()
+    worker_count = max(1, min(workers, len(chunks)))
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    pending_chunks = iter(enumerate(chunks, 1))
+    futures: dict[object, int] = {}
+
+    def submit_next() -> bool:
+        try:
+            index, chunk = next(pending_chunks)
+        except StopIteration:
+            return False
+        future = executor.submit(
+            _request_chunk,
+            client,
+            prompt,
+            chunk,
+            cancel_event=cancel_event,
+            abort_event=abort_event,
+            max_tokens=max_tokens,
+            diagnostic_log=diagnostic_log,
+            request_label=f"{label}:{index}/{len(chunks)}",
+        )
+        futures[future] = index
+        return True
+
+    try:
+        for _ in range(worker_count):
+            submit_next()
+        while futures:
             _check_cancel(cancel_event)
-            index = futures[future]
-            result = future.result()
-            rows.extend(result)
-            if log:
-                log(f"{label}分块 {index}/{len(chunks)} 完成，得到 {len(result)} 条候选。")
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                if future.exception() is not None:
+                    future.result()
+            for future in done:
+                index = futures.pop(future)
+                result = future.result()
+                rows.extend(result)
+                if log:
+                    log(f"{label}分块 {index}/{len(chunks)} 完成，得到 {len(result)} 条候选。")
+            for _ in done:
+                submit_next()
+    except BaseException:
+        abort_event.set()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
     return rows
 
 
@@ -879,13 +1042,13 @@ def generate_glossary(
     if not lines:
         raise ValueError("工作簿中没有可分析文本。")
     corpus = "\n".join(lines)
-    chunks = _chunks(lines)
+    chunks = _chunks(lines, max_chars=settings.glossary_chunk_chars)
     max_tokens = settings.glossary_api_max_tokens or None
     if diagnostic_log:
         diagnostic_log(
             f"glossary.start source_rows={len(lines)} corpus_chars={len(corpus)} chunks={len(chunks)} "
             f"workers={settings.glossary_api_threads} model={settings.glossary_api_model} "
-            f"max_tokens={max_tokens}"
+            f"chunk_chars={settings.glossary_chunk_chars} max_tokens={max_tokens}"
         )
     client = OpenAICompatibleClient(
         settings.glossary_api_base_url,

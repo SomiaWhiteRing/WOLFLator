@@ -80,7 +80,8 @@ class AppSettings:
     glossary_api_key_blob: str = ""
     glossary_api_timeout: int = 120
     glossary_api_threads: int = 3
-    glossary_api_max_tokens: int = 0
+    glossary_chunk_chars: int = 500_000
+    glossary_api_max_tokens: int = 393_216
     license_accepted: bool = False
     last_project: str = ""
 

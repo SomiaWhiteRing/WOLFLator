@@ -335,6 +335,7 @@ class Pipeline:
                     "model": self.settings.glossary_api_model,
                     "threads": self.settings.glossary_api_threads,
                     "timeout": self.settings.glossary_api_timeout,
+                    "chunk_chars": self.settings.glossary_chunk_chars,
                     "max_tokens": self.settings.glossary_api_max_tokens,
                     "translation_scope": self.manifest.translation_scope.__dict__,
                 }

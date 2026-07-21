@@ -266,6 +266,13 @@ class SettingsDialog(QDialog):
         glossary_limits_layout.addStretch(1)
         glossary_form.addRow("请求", glossary_limits)
 
+        self.glossary_chunk_chars = QSpinBox()
+        self.glossary_chunk_chars.setRange(1, 10_000_000)
+        self.glossary_chunk_chars.setSuffix(" 字符")
+        self.glossary_chunk_chars.setGroupSeparatorShown(True)
+        self.glossary_chunk_chars.setValue(self.settings.glossary_chunk_chars)
+        glossary_form.addRow("每块最大输入", self.glossary_chunk_chars)
+
         glossary_output = QWidget()
         glossary_output_layout = QHBoxLayout(glossary_output)
         glossary_output_layout.setContentsMargins(0, 0, 0, 0)
@@ -462,6 +469,7 @@ class SettingsDialog(QDialog):
         item.glossary_api_model = self.glossary_api_model.text().strip()
         item.glossary_api_threads = self.glossary_api_threads.value()
         item.glossary_api_timeout = self.glossary_api_timeout.value()
+        item.glossary_chunk_chars = self.glossary_chunk_chars.value()
         item.glossary_api_max_tokens = self.glossary_api_max_tokens.value()
         item.projects_root = self.projects_root.text().strip()
         item.ascii_runner_dir = self.ascii_dir.text().strip()

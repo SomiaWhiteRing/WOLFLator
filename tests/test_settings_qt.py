@@ -50,7 +50,8 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual("legacy-secret", store.glossary_api_key(item))
             self.assertEqual(75, item.glossary_api_timeout)
             self.assertEqual(3, item.glossary_api_threads)
-            self.assertEqual(0, item.glossary_api_max_tokens)
+            self.assertEqual(500_000, item.glossary_chunk_chars)
+            self.assertEqual(393_216, item.glossary_api_max_tokens)
 
     def test_dialog_loads_separate_api_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -62,6 +63,7 @@ class SettingsQtTests(unittest.TestCase):
                 glossary_api_base_url="https://glossary.example/v1",
                 glossary_api_model="glossary-model",
                 glossary_api_threads=2,
+                glossary_chunk_chars=456_789,
                 glossary_api_max_tokens=65_535,
             )
             store.save(item)
@@ -71,6 +73,7 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual("https://glossary.example/v1", dialog.glossary_api_url.text())
             self.assertEqual(12, dialog.api_threads.value())
             self.assertEqual(2, dialog.glossary_api_threads.value())
+            self.assertEqual(456_789, dialog.glossary_chunk_chars.value())
             self.assertEqual(65_535, dialog.glossary_api_max_tokens.value())
             dialog.close()
 
