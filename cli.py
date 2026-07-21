@@ -49,11 +49,20 @@ def _api_key(settings: AppSettings) -> str:
     return key
 
 
-def _check_settings(settings: AppSettings) -> str:
+def _glossary_api_key(settings: AppSettings) -> str:
+    if not settings.glossary_api_base_url.strip() or not settings.glossary_api_model.strip():
+        raise RuntimeError("请在设置中填写术语生成 API 基础地址和模型。")
+    key = SettingsStore.glossary_api_key(settings)
+    if not key:
+        raise RuntimeError("请在设置中填写术语生成 API 密钥。")
+    return key
+
+
+def _check_settings(settings: AppSettings) -> tuple[str, str]:
     errors = validate_settings(settings)
     if errors:
         raise RuntimeError("设置未完成：\n" + "\n".join(f"- {error}" for error in errors))
-    return _api_key(settings)
+    return _api_key(settings), _glossary_api_key(settings)
 
 
 def _print_progress(current: int, total: int, stage: Stage) -> None:
@@ -64,14 +73,27 @@ def _print_log(message: str) -> None:
     print(f"log {message}", flush=True)
 
 
-def _pipeline(args: argparse.Namespace, *, full_run: bool = False, require_api: bool = False) -> Pipeline:
+def _pipeline(
+    args: argparse.Namespace,
+    *,
+    full_run: bool = False,
+    stage: Stage | None = None,
+) -> Pipeline:
     store, settings = _load_settings(args)
-    api_key = _check_settings(settings) if full_run else (_api_key(settings) if require_api else "")
+    api_key = ""
+    glossary_api_key = ""
+    if full_run:
+        api_key, glossary_api_key = _check_settings(settings)
+    elif stage is Stage.TRANSLATE:
+        api_key = _api_key(settings)
+    elif stage is Stage.GLOSSARY:
+        glossary_api_key = _glossary_api_key(settings)
     return Pipeline(
         args.manifest,
         settings,
         api_key,
         local_data_dir(),
+        glossary_api_key=glossary_api_key,
         log=_print_log,
         progress=_print_progress,
     )
@@ -94,6 +116,8 @@ def _status(args: argparse.Namespace) -> int:
         "manifest": str(Path(args.manifest).resolve()),
         "active_version": manifest.active_version,
         "run_mode": manifest.run_mode.value,
+        "translation_scope": manifest.translation_scope.__dict__,
+        "import_scope": manifest.import_scope.__dict__,
         "stages": records,
     }
     if args.json:
@@ -126,8 +150,9 @@ def _settings_check(args: argparse.Namespace) -> int:
 
 def _api_test(args: argparse.Namespace) -> int:
     _, settings = _load_settings(args)
-    key = _api_key(settings)
-    response = test_api(settings, key)
+    glossary = args.target == "glossary"
+    key = _glossary_api_key(settings) if glossary else _api_key(settings)
+    response = test_api(settings, key, glossary=glossary)
     print(response)
     return 0
 
@@ -186,7 +211,7 @@ def _run(args: argparse.Namespace) -> int:
     pipeline = _pipeline(
         args,
         full_run=stage is None,
-        require_api=stage in {Stage.GLOSSARY, Stage.TRANSLATE},
+        stage=stage,
     )
     interrupted = False
 
@@ -226,13 +251,21 @@ def _retry(args: argparse.Namespace) -> int:
 
 def _scope(args: argparse.Namespace) -> int:
     pipeline = _pipeline(args)
-    current = pipeline.manifest.import_scope
+    current = (
+        pipeline.manifest.translation_scope
+        if args.target == "translation"
+        else pipeline.manifest.import_scope
+    )
     values = {
         name: getattr(args, name) if getattr(args, name) is not None else getattr(current, name)
         for name in ("display", "external", "optional_name", "halfwidth", "filename")
     }
-    pipeline.set_import_scope(ImportScope(**values))
-    print(json.dumps(values, ensure_ascii=False))
+    scope = ImportScope(**values)
+    if args.target == "translation":
+        pipeline.set_translation_scope(scope)
+    else:
+        pipeline.set_import_scope(scope)
+    print(json.dumps({"target": args.target, **values}, ensure_ascii=False))
     return 0
 
 
@@ -248,7 +281,13 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--no-api", action="store_true", help="只检查工具配置，不要求 API 密钥")
     settings.add_argument("--json", action="store_true", help="使用 JSON 输出")
 
-    subparsers.add_parser("api-test", help="使用持久化 API 配置发送一次测试请求")
+    api_test = subparsers.add_parser("api-test", help="使用持久化 API 配置发送一次测试请求")
+    api_test.add_argument(
+        "--target",
+        choices=("translation", "glossary"),
+        default="translation",
+        help="测试 AiNiee 翻译或术语生成 API（默认 translation）",
+    )
 
     ainiee = subparsers.add_parser("ainiee-prepare", help="安装或选择 AiNiee，并准备隔离依赖运行时")
     ainiee.add_argument("--source", help="已有 AiNiee GUI、安装目录或源码目录")
@@ -278,8 +317,14 @@ def build_parser() -> argparse.ArgumentParser:
     retry = subparsers.add_parser("retry", help="重置失败/取消阶段及其后续阶段")
     retry.add_argument("manifest", help="project.json")
 
-    scope = subparsers.add_parser("scope", help="查看或修改导入范围")
+    scope = subparsers.add_parser("scope", help="查看或修改翻译范围或导入范围")
     scope.add_argument("manifest", help="project.json")
+    scope.add_argument(
+        "--target",
+        choices=("translation", "import"),
+        default="import",
+        help="要修改的范围（默认 import）",
+    )
     for name in ("display", "external", "optional_name", "halfwidth", "filename"):
         scope.add_argument(
             f"--{name.replace('_', '-')}",

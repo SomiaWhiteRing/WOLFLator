@@ -57,6 +57,38 @@ class CliTests(unittest.TestCase):
             manifest = Path(output.getvalue().strip())
             self.assertTrue(manifest.is_file())
 
+    def test_api_test_can_target_glossary_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.ini"
+            store = cli.SettingsStore(settings_path)
+            item = AppSettings(
+                api_base_url="https://translate.example/v1",
+                api_model="translate-model",
+                glossary_api_base_url="https://glossary.example/v1",
+                glossary_api_model="glossary-model",
+            )
+            store.set_api_key(item, "translate-secret")
+            store.set_glossary_api_key(item, "glossary-secret")
+            store.save(item)
+            output = io.StringIO()
+            with patch.object(cli, "test_api", return_value="glossary-ok") as test, redirect_stdout(output):
+                self.assertEqual(
+                    0,
+                    cli.main(
+                        [
+                            "--settings",
+                            str(settings_path),
+                            "api-test",
+                            "--target",
+                            "glossary",
+                        ]
+                    ),
+                )
+            self.assertEqual("glossary-ok", output.getvalue().strip())
+            test.assert_called_once()
+            self.assertEqual("glossary-secret", test.call_args.args[1])
+            self.assertTrue(test.call_args.kwargs["glossary"])
+
     def test_scope_updates_the_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -64,7 +96,17 @@ class CliTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(0, cli.main(["scope", str(manifest), "--external"]))
-            self.assertTrue(cli.load_manifest(manifest).import_scope.external)
+            loaded = cli.load_manifest(manifest)
+            self.assertTrue(loaded.import_scope.external)
+            self.assertFalse(loaded.translation_scope.external)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    0,
+                    cli.main(["scope", str(manifest), "--target", "translation", "--optional-name"]),
+                )
+            loaded = cli.load_manifest(manifest)
+            self.assertTrue(loaded.translation_scope.optional_name)
+            self.assertFalse(loaded.import_scope.optional_name)
 
     def test_ctrl_c_cancels_pipeline_and_returns_130(self):
         class FakePipeline:

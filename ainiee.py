@@ -673,8 +673,8 @@ class OpenAICompatibleClient:
                     f"response_bytes={len(raw)} finish_reason={choice.get('finish_reason')} "
                     f"content_chars={len(content)} usage={json.dumps(usage, ensure_ascii=False, sort_keys=True)}"
                 )
-            if not content.strip() and choice.get("finish_reason") == "length":
-                raise ApiError("模型在推理阶段达到输出上限，没有返回最终正文。")
+            if str(choice.get("finish_reason", "")).lower() == "length":
+                raise ApiError("模型输出达到上限，响应被截断。")
             return content
         except (KeyError, IndexError, TypeError) as exc:
             if self.diagnostic_log:
@@ -685,8 +685,11 @@ class OpenAICompatibleClient:
             raise ApiError(f"API 返回格式不兼容: {str(result)[:1000]}") from exc
 
 
-def test_api(settings: AppSettings, api_key: str) -> str:
-    client = OpenAICompatibleClient(settings.api_base_url, api_key, settings.api_model, settings.api_timeout)
+def test_api(settings: AppSettings, api_key: str, *, glossary: bool = False) -> str:
+    base_url = settings.glossary_api_base_url if glossary else settings.api_base_url
+    model = settings.glossary_api_model if glossary else settings.api_model
+    timeout = settings.glossary_api_timeout if glossary else settings.api_timeout
+    client = OpenAICompatibleClient(base_url, api_key, model, timeout)
     response = client.chat(
         "小可爱，你在干嘛",
         max_tokens=None,
@@ -737,6 +740,7 @@ def _request_chunk(
     chunk: str,
     *,
     cancel_event: threading.Event | None,
+    max_tokens: int | None = None,
     split_depth: int = 0,
     diagnostic_log: Callable[[str], None] | None = None,
     request_label: str = "",
@@ -752,7 +756,10 @@ def _request_chunk(
                 f"chunk_sha256={hashlib.sha256(chunk.encode('utf-8')).hexdigest()[:16]}"
             )
         try:
-            response_text = client.chat(prompt_prefix + "\n\n原文语料：\n" + chunk)
+            response_text = client.chat(
+                prompt_prefix + "\n\n原文语料：\n" + chunk,
+                max_tokens=max_tokens,
+            )
             result = _json_list(response_text)
             if diagnostic_log:
                 diagnostic_log(f"glossary.response label={request_label} rows={len(result)}")
@@ -770,7 +777,10 @@ def _request_chunk(
                         f"glossary.invalid_json label={request_label} response_chars={len(response_text)} "
                         f"response_tail={response_text[-4000:]}"
                     )
-            context_error = any(word in message for word in ("context", "too many tokens", "maximum", "请求过长"))
+            context_error = any(
+                word in message
+                for word in ("context", "too many tokens", "maximum", "请求过长", "输出达到上限")
+            )
             if context_error and split_depth < 5 and "\n" in chunk:
                 lines = chunk.splitlines()
                 midpoint = len(lines) // 2
@@ -781,10 +791,12 @@ def _request_chunk(
                     )
                 return _request_chunk(
                     client, prompt_prefix, "\n".join(lines[:midpoint]), cancel_event=cancel_event,
+                    max_tokens=max_tokens,
                     split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
                     request_label=request_label + ".left",
                 ) + _request_chunk(
                     client, prompt_prefix, "\n".join(lines[midpoint:]), cancel_event=cancel_event,
+                    max_tokens=max_tokens,
                     split_depth=split_depth + 1, diagnostic_log=diagnostic_log,
                     request_label=request_label + ".right",
                 )
@@ -804,6 +816,7 @@ def _parallel_stage(
     log: Callable[[str], None] | None,
     diagnostic_log: Callable[[str], None] | None,
     label: str,
+    max_tokens: int | None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(chunks)))) as executor:
@@ -814,6 +827,7 @@ def _parallel_stage(
                 prompt,
                 chunk,
                 cancel_event=cancel_event,
+                max_tokens=max_tokens,
                 diagnostic_log=diagnostic_log,
                 request_label=f"{label}:{index}/{len(chunks)}",
             ): index
@@ -866,16 +880,18 @@ def generate_glossary(
         raise ValueError("工作簿中没有可分析文本。")
     corpus = "\n".join(lines)
     chunks = _chunks(lines)
+    max_tokens = settings.glossary_api_max_tokens or None
     if diagnostic_log:
         diagnostic_log(
             f"glossary.start source_rows={len(lines)} corpus_chars={len(corpus)} chunks={len(chunks)} "
-            f"workers={settings.api_threads} model={settings.api_model}"
+            f"workers={settings.glossary_api_threads} model={settings.glossary_api_model} "
+            f"max_tokens={max_tokens}"
         )
     client = OpenAICompatibleClient(
-        settings.api_base_url,
+        settings.glossary_api_base_url,
         api_key,
-        settings.api_model,
-        settings.api_timeout,
+        settings.glossary_api_model,
+        settings.glossary_api_timeout,
         diagnostic_log,
     )
     character_prompt = """分析日文游戏语料中的人物。只输出 JSON 数组，每项包含：
@@ -883,7 +899,15 @@ original_name, translated_name, aliases(字符串数组), gender, age, personali
 speech_style, pronouns, speech_quirks, additional_info。
 只收录语料中确实出现的人物；译名使用简体中文；无法判断的字段用空字符串。"""
     characters = _parallel_stage(
-        client, character_prompt, chunks, settings.api_threads, cancel_event, log, diagnostic_log, "角色分析"
+        client,
+        character_prompt,
+        chunks,
+        settings.glossary_api_threads,
+        cancel_event,
+        log,
+        diagnostic_log,
+        "角色分析",
+        max_tokens,
     )
     normalized_characters: list[dict[str, object]] = []
     character_fields = (
@@ -905,7 +929,15 @@ speech_style, pronouns, speech_quirks, additional_info。
 不要重复人物；候选词应至少在完整语料中出现两次。
 人物参考：{reference}"""
     entities = _parallel_stage(
-        client, entity_prompt, chunks, settings.api_threads, cancel_event, log, diagnostic_log, "实体分析"
+        client,
+        entity_prompt,
+        chunks,
+        settings.glossary_api_threads,
+        cancel_event,
+        log,
+        diagnostic_log,
+        "实体分析",
+        max_tokens,
     )
     normalized_entities = []
     for row in entities:

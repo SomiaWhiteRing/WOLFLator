@@ -18,7 +18,11 @@ import ainiee
 from models import AppSettings, ImportCategory, ImportScope, ToolResult
 from wolf_tools import (
     CancelledError,
+    _official_config_text,
+    apply_managed_translations,
+    classify_optional_name_delta,
     merge_ainiee_output,
+    name_baseline_scope,
     protect_control_tokens,
     read_translation_items,
     reconcile_incremental,
@@ -86,6 +90,101 @@ class WorkbookTests(unittest.TestCase):
             protected = payload[0]["original"]
             self.assertIn(chr(0xE100), protected)
             self.assertNotIn(r"\C[1]", protected)
+
+    def test_safe_scope_excludes_optional_rows_from_ai(self):
+        with tempfile.TemporaryDirectory() as directory:
+            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
+            payload = to_paratranz(items, ImportScope())
+            self.assertEqual(3, len(payload))
+            self.assertNotIn("主人公", {row["original"] for row in payload})
+            self.assertNotIn("Picture/顔.png", {row["original"] for row in payload})
+            translated = [
+                {
+                    **row,
+                    "translation": "译文" + "".join(
+                        char for char in row["original"] if 0xE100 <= ord(char) <= 0xF7FF
+                    ),
+                    "stage": 1,
+                }
+                for row in payload
+            ]
+            merged = merge_ainiee_output(items, translated, ImportScope())
+            self.assertEqual("", merged[1].translation)
+            self.assertEqual("", merged[2].translation)
+
+    def test_official_config_exports_all_and_fonts_use_managed_defaults(self):
+        config = _official_config_text()
+        self.assertIn("Tool_A_Get_CommonEvent_Name=1\r\n", config)
+        self.assertIn("Tool_A_Get_DB_DataName=1\r\n", config)
+        self.assertIn("Tool_A_Get_TXT=1\r\n", config)
+        baseline = _official_config_text(name_baseline_scope())
+        self.assertIn("Tool_A_Get_CommonEvent_Name=0\r\n", baseline)
+        self.assertIn("Tool_A_Get_DB_DataName=0\r\n", baseline)
+        self.assertIn("Tool_A_Get_TXT=1\r\n", baseline)
+
+        with tempfile.TemporaryDirectory() as directory:
+            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
+            items[0].code = "BASICDATA-3"
+            apply_managed_translations(items)
+            self.assertEqual("KaiTi", items[0].translation)
+
+    def test_full_baseline_delta_and_cross_category_copy_are_scope_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            full_path = root / "full.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["NAME-D-UDB-1-0", "", "UDB info", "Data name", "", "攻撃力", ""])
+            sheet.append(
+                [
+                    "UDB-1-0-0",
+                    "COPY-FROM-NAME-D-UDB-1-0",
+                    "Status",
+                    "Label",
+                    "",
+                    "攻撃力",
+                    "",
+                ]
+            )
+            sheet.append(["COMMON-1-0-0", "", "Event", "(Common Event)", "", "内部名", ""])
+            sheet.append(["DISPLAY-1", "", "Event", "Message", "", "顔", ""])
+            sheet.append(["FILE-1", "<FILENAME>\nCOPY-FROM-DISPLAY-1", "Image", "File", "", "顔", ""])
+            workbook.save(full_path)
+
+            baseline_path = root / "baseline.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["UDB-1-0-0", "", "Status", "Label", "", "攻撃力", ""])
+            sheet.append(["DISPLAY-1", "", "Event", "Message", "", "顔", ""])
+            sheet.append(["FILE-1", "<FILENAME>\nCOPY-FROM-DISPLAY-1", "Image", "File", "", "顔", ""])
+            workbook.save(baseline_path)
+
+            items = read_translation_items(full_path)
+            baseline_items = read_translation_items(baseline_path)
+            self.assertEqual(2, classify_optional_name_delta(items, baseline_items))
+            self.assertEqual(ImportCategory.OPTIONAL_NAME, items[0].category)
+            self.assertEqual(ImportCategory.DISPLAY, items[1].copy_category)
+            self.assertEqual(ImportCategory.OPTIONAL_NAME, items[2].category)
+
+            payload = to_paratranz(items, ImportScope())
+            self.assertEqual(["攻撃力"], [row["original"] for row in payload])
+            merge_ainiee_output(items, [{**payload[0], "translation": "攻击力", "stage": 1}], ImportScope())
+            translated_full = write_full_workbook(full_path, root / "translated.xlsx", items)
+            scoped = write_scoped_workbook(
+                translated_full,
+                root / "scoped.xlsx",
+                ImportScope(),
+                root / "game",
+                items,
+            )
+            output = load_workbook(scoped)
+            self.assertEqual("攻击力", output.active["G2"].value)
+            self.assertIsNone(output.active["G3"].value)
+            self.assertIsNone(output.active["G4"].value)
+            self.assertIsNone(output.active["G5"].value)
+            self.assertIsNone(output.active["G6"].value)
 
     def test_merge_and_scoped_workbook_preserve_table(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -260,6 +359,59 @@ class AiNieeTests(unittest.TestCase):
             "你接下来要扮演我的女朋友，名字叫欣雨，请你以女朋友的方式回复我。",
             chat.call_args.kwargs["system_prompt"],
         )
+
+    def test_api_test_uses_dedicated_glossary_settings(self):
+        settings = AppSettings(
+            api_base_url="https://translate.example/v1",
+            api_model="translate-model",
+            glossary_api_base_url="https://glossary.example/v1",
+            glossary_api_model="glossary-model",
+            glossary_api_timeout=77,
+        )
+        with mock.patch.object(ainiee, "OpenAICompatibleClient") as client:
+            client.return_value.chat.return_value = "ok"
+            self.assertEqual("ok", ainiee.test_api(settings, "glossary-secret", glossary=True))
+        client.assert_called_once_with(
+            "https://glossary.example/v1",
+            "glossary-secret",
+            "glossary-model",
+            77,
+        )
+
+    def test_nonempty_length_response_is_rejected(self):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": '[{"src":"truncated"}'}, "finish_reason": "length"}]}
+        ).encode("utf-8")
+        response.status = 200
+        response.__enter__.return_value = response
+        client = ainiee.OpenAICompatibleClient("https://example.com/v1", "secret", "model")
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(ainiee.ApiError, "输出达到上限"):
+                client.chat("hello", max_tokens=4096)
+
+    def test_glossary_output_limit_splits_chunk_immediately(self):
+        client = mock.Mock()
+        client.chat.side_effect = [
+            ainiee.ApiError("模型输出达到上限，响应被截断。"),
+            '[{"src":"left"}]',
+            '[{"src":"right"}]',
+        ]
+        diagnostics = []
+        rows = ainiee._request_chunk(
+            client,
+            "prompt",
+            "left line\nright line",
+            cancel_event=None,
+            max_tokens=65_535,
+            diagnostic_log=diagnostics.append,
+            request_label="角色分析:1/1",
+        )
+        self.assertEqual([{"src": "left"}, {"src": "right"}], rows)
+        self.assertEqual(3, client.chat.call_count)
+        self.assertIn("glossary.split label=角色分析:1/1", "\n".join(diagnostics))
+        self.assertNotIn("glossary.retry label=角色分析:1/1", "\n".join(diagnostics))
+        self.assertTrue(all(call.kwargs["max_tokens"] == 65_535 for call in client.chat.call_args_list))
 
     def test_deepseek_request_matches_managed_ainiee_profile(self):
         response = mock.MagicMock()

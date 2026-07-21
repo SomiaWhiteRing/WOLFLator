@@ -32,6 +32,21 @@ GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
+COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
+SIMPLIFIED_CHINESE_FONTS = {
+    "BASICDATA-3": "KaiTi",
+    "BASICDATA-4": "Microsoft YaHei",
+    "BASICDATA-5": "Microsoft YaHei",
+    "BASICDATA-6": "Microsoft YaHei",
+}
+
+
+def full_export_scope() -> ImportScope:
+    return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
+
+
+def name_baseline_scope() -> ImportScope:
+    return ImportScope(display=True, external=True, optional_name=False, halfwidth=True, filename=True)
 
 
 class CancelledError(RuntimeError):
@@ -242,7 +257,10 @@ class UberWolfRunner:
         return result
 
 
-def _official_config_text() -> str:
+def _official_config_text(scope: ImportScope | None = None) -> str:
+    scope = scope or full_export_scope()
+    include_external = "1" if scope.external else "0"
+    include_names = "1" if scope.optional_name else "0"
     values = {
         "LastBackupFile": "",
         "LastDiffFile": "",
@@ -250,16 +268,16 @@ def _official_config_text() -> str:
         "LastTargetLang": "1",
         **{f"NotTranslatedFlag{i}": "0" for i in range(1, 11)},
         "Original_Language": "1",
-        "Tool_A_Get_CSV": "1",
-        "Tool_A_Get_CommonEvent_Name": "1",
-        "Tool_A_Get_DB_DataName": "1",
-        "Tool_A_Get_DB_ItemName": "1",
-        "Tool_A_Get_DB_TypeName": "1",
-        "Tool_A_Get_MapEvent_Name": "1",
-        "Tool_A_Get_TXT": "1",
-        "Tool_A_Include_CDB_Name": "1",
-        "Tool_A_Include_SDB_Name": "1",
-        "Tool_A_Include_UDB_Name": "1",
+        "Tool_A_Get_CSV": include_external,
+        "Tool_A_Get_CommonEvent_Name": include_names,
+        "Tool_A_Get_DB_DataName": include_names,
+        "Tool_A_Get_DB_ItemName": include_names,
+        "Tool_A_Get_DB_TypeName": include_names,
+        "Tool_A_Get_MapEvent_Name": include_names,
+        "Tool_A_Get_TXT": include_external,
+        "Tool_A_Include_CDB_Name": include_names,
+        "Tool_A_Include_SDB_Name": include_names,
+        "Tool_A_Include_UDB_Name": include_names,
         "Tool_A_Sort": "1",
         "Translated_Language_1": "4",
         **{f"Translated_Language_{i}": "0" for i in range(2, 11)},
@@ -267,11 +285,11 @@ def _official_config_text() -> str:
     return "[System]\r\n" + "".join(f"{key}={value}\r\n" for key, value in values.items())
 
 
-def write_official_game_config(game_root: str | Path) -> Path:
+def write_official_game_config(game_root: str | Path, scope: ImportScope | None = None) -> Path:
     support = Path(game_root) / SUPPORT_DIR
     support.mkdir(parents=True, exist_ok=True)
     path = support / GAME_CONFIG_NAME
-    path.write_bytes(b"\xff\xfe" + _official_config_text().encode("utf-16le"))
+    path.write_bytes(b"\xff\xfe" + _official_config_text(scope).encode("utf-16le"))
     return path
 
 
@@ -291,8 +309,9 @@ def prepare_official_tool(source_exe: str | Path, cache_root: str | Path) -> Pat
 
 
 class OfficialToolRunner:
-    def __init__(self, executable: str | Path):
+    def __init__(self, executable: str | Path, scope: ImportScope | None = None):
         self.executable = Path(executable)
+        self.scope = scope or full_export_scope()
 
     def run(
         self,
@@ -305,7 +324,7 @@ class OfficialToolRunner:
         diagnostic_log: Callable[[str], None] | None = None,
     ) -> ToolResult:
         root = Path(game_root).resolve()
-        write_official_game_config(root)
+        write_official_game_config(root, self.scope)
         command = [
             str(self.executable),
             "-mode",
@@ -371,12 +390,10 @@ def locate_workbook(game_root: str | Path) -> Path:
     raise FileNotFoundError(f"{support} 中没有兼容的官方 XLSX。")
 
 
-def _category(code: str, flag: str, type_name: str) -> ImportCategory:
+def _content_category(code: str, flag: str, type_name: str) -> ImportCategory:
     upper_flag = flag.upper()
     upper_code = code.upper()
     upper_type = type_name.upper()
-    if "COPY-FROM-" in upper_flag:
-        return ImportCategory.COPY
     if "<FILENAME>" in upper_flag:
         return ImportCategory.FILENAME
     if "<HALF-WIDTH CHARACTERS ONLY>" in upper_flag:
@@ -386,6 +403,12 @@ def _category(code: str, flag: str, type_name: str) -> ImportCategory:
     if upper_code.startswith(("TXT-", "CSV-")) or "TXT" in upper_type or "CSV" in upper_type:
         return ImportCategory.EXTERNAL
     return ImportCategory.DISPLAY
+
+
+def _category(code: str, flag: str, type_name: str) -> ImportCategory:
+    if "COPY-FROM-" in flag.upper():
+        return ImportCategory.COPY
+    return _content_category(code, flag, type_name)
 
 
 def stable_key(code: str, flag: str, original: str, ordinal: int) -> str:
@@ -503,6 +526,11 @@ def read_translation_items(workbook_path: str | Path) -> list[TranslationItem]:
     for _row, values, ordinal in _iter_data_rows(worksheet):
         signature = _scan_control_tokens(values["original"])
         category = _category(values["code"], values["flag"], values["type"])
+        copy_category = (
+            _content_category(values["code"], values["flag"], values["type"])
+            if category is ImportCategory.COPY
+            else None
+        )
         items.append(
             TranslationItem(
                 key=stable_key(values["code"], values["flag"], values["original"], ordinal),
@@ -518,6 +546,7 @@ def read_translation_items(workbook_path: str | Path) -> list[TranslationItem]:
                 type=values["type"],
                 info=values["info"],
                 category=category,
+                copy_category=copy_category,
                 control_signature=signature,
             )
         )
@@ -525,11 +554,124 @@ def read_translation_items(workbook_path: str | Path) -> list[TranslationItem]:
     return items
 
 
-def to_paratranz(items: list[TranslationItem]) -> list[dict[str, object]]:
-    output: list[dict[str, object]] = []
+def is_managed_translation(item: TranslationItem) -> bool:
+    return item.code.upper() in SIMPLIFIED_CHINESE_FONTS
+
+
+def apply_managed_translations(items: list[TranslationItem]) -> None:
     for item in items:
-        if item.category is ImportCategory.COPY:
+        translation = SIMPLIFIED_CHINESE_FONTS.get(item.code.upper())
+        if translation:
+            item.translation = translation
+            item.stage = 1
+
+
+def _location_identities(items: list[TranslationItem]) -> list[tuple[str, str, int]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    identities: list[tuple[str, str, int]] = []
+    for item in items:
+        identity = (item.code, item.original)
+        counts[identity] += 1
+        identities.append((item.code, item.original, counts[identity]))
+    return identities
+
+
+def classify_optional_name_delta(
+    full_items: list[TranslationItem],
+    baseline_items: list[TranslationItem],
+) -> int:
+    full_identities = _location_identities(full_items)
+    full_set = set(full_identities)
+    baseline_set = set(_location_identities(baseline_items))
+    missing_from_full = baseline_set - full_set
+    if missing_from_full:
+        raise ValueError(f"基准导出包含全量导出中不存在的行，共 {len(missing_from_full)} 条。")
+
+    optional_count = 0
+    for item, identity in zip(full_items, full_identities):
+        if identity not in baseline_set:
+            if item.category is ImportCategory.COPY:
+                item.copy_category = ImportCategory.OPTIONAL_NAME
+            else:
+                item.category = ImportCategory.OPTIONAL_NAME
+            optional_count += 1
+        elif item.category is ImportCategory.OPTIONAL_NAME:
+            item.category = ImportCategory.DISPLAY
+        elif item.category is ImportCategory.COPY and item.copy_category is ImportCategory.OPTIONAL_NAME:
+            item.copy_category = ImportCategory.DISPLAY
+    return optional_count
+
+
+def _copy_source(item: TranslationItem, by_code: dict[str, list[TranslationItem]]) -> TranslationItem:
+    current = item
+    visited: set[str] = set()
+    while current.category is ImportCategory.COPY:
+        match = COPY_FROM_RE.search(current.flag)
+        if not match:
+            raise ValueError(f"COPY-FROM 行缺少来源代码: {current.code}")
+        source_code = match.group(1)
+        marker = f"{current.code}\0{source_code}\0{current.original}"
+        if marker in visited:
+            raise ValueError(f"COPY-FROM 出现循环引用: {current.code}")
+        visited.add(marker)
+        candidates = by_code.get(source_code, [])
+        exact = [candidate for candidate in candidates if candidate.original == current.original]
+        if exact:
+            current = exact[0]
+        elif len(candidates) == 1:
+            current = candidates[0]
+        else:
+            raise ValueError(f"COPY-FROM 找不到唯一来源: {current.code} -> {source_code}")
+    return current
+
+
+def selected_translation_requirements(
+    items: list[TranslationItem],
+    scope: ImportScope | None = None,
+) -> dict[str, set[ImportCategory]]:
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
+
+    groups: dict[str, set[ImportCategory]] = {}
+    sources: dict[str, TranslationItem] = {}
+    for item in items:
+        category = item.copy_category if item.category is ImportCategory.COPY else item.category
+        if category is None:
             continue
+        source = _copy_source(item, by_code) if item.category is ImportCategory.COPY else item
+        sources[source.key] = source
+        groups.setdefault(source.key, set()).add(category)
+
+    requirements: dict[str, set[ImportCategory]] = {}
+    for key, categories in groups.items():
+        if is_managed_translation(sources[key]) or scope is None:
+            requirements[key] = categories
+            continue
+        # ponytail: COPY-FROM cannot give duplicate uses different translations. Keep the
+        # whole group untouched until dangerous filename/half-width uses are explicitly enabled.
+        dangerous = {ImportCategory.FILENAME, ImportCategory.HALFWIDTH} & categories
+        if any(not scope.allows(category) for category in dangerous):
+            continue
+        if any(scope.allows(category) for category in categories):
+            requirements[key] = categories
+    return requirements
+
+
+def selected_translation_items(
+    items: list[TranslationItem],
+    scope: ImportScope | None = None,
+) -> list[TranslationItem]:
+    required = selected_translation_requirements(items, scope)
+    return [item for item in items if item.key in required and not is_managed_translation(item)]
+
+
+def to_paratranz(
+    items: list[TranslationItem],
+    scope: ImportScope | None = None,
+) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for item in selected_translation_items(items, scope):
         protected, tokens = protect_control_tokens(item.original)
         if tokens != item.control_signature:
             raise ValueError(f"控制符签名发生变化: {item.code}")
@@ -550,8 +692,12 @@ def to_paratranz(items: list[TranslationItem]) -> list[dict[str, object]]:
     return output
 
 
-def merge_ainiee_output(items: list[TranslationItem], translated: list[dict[str, object]]) -> list[TranslationItem]:
-    expected = {item.key: item for item in items if item.category is not ImportCategory.COPY}
+def merge_ainiee_output(
+    items: list[TranslationItem],
+    translated: list[dict[str, object]],
+    scope: ImportScope | None = None,
+) -> list[TranslationItem]:
+    expected = {item.key: item for item in selected_translation_items(items, scope)}
     actual: dict[str, dict[str, object]] = {}
     for row in translated:
         key = str(row.get("key", ""))
@@ -660,18 +806,27 @@ def write_scoped_workbook(
     output_path: str | Path,
     scope: ImportScope,
     game_root: str | Path,
+    items: list[TranslationItem] | None = None,
 ) -> Path:
     workbook = load_workbook(full_path)
     worksheet = workbook.active
     _header_row, headers = _header_map(worksheet)
+    requirements = selected_translation_requirements(items, scope) if items is not None else None
     missing_filenames: list[str] = []
-    for row_index, values, _ordinal in _iter_data_rows(worksheet):
+    for row_index, values, ordinal in _iter_data_rows(worksheet):
+        key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         category = _category(values["code"], values["flag"], values["type"])
         cell = worksheet.cell(row_index, headers["__target__"])
-        if category is ImportCategory.COPY or not scope.allows(category):
+        if requirements is None:
+            keep = scope.allows(category)
+            required_categories = {category} if keep else set()
+        else:
+            required_categories = requirements.get(key, set())
+            keep = bool(required_categories)
+        if category is ImportCategory.COPY or not keep:
             cell.value = ""
             continue
-        if category is ImportCategory.FILENAME and cell.value:
+        if ImportCategory.FILENAME in required_categories and cell.value:
             if not _filename_target_exists(Path(game_root), str(cell.value)):
                 missing_filenames.append(str(cell.value))
     if missing_filenames:

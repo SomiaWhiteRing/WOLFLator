@@ -126,6 +126,14 @@ class SettingsStore:
                 raw = str(raw or "")
             values[name] = raw
         item = AppSettings(**values)
+        if not self._settings.contains("glossary_api_base_url"):
+            item.glossary_api_base_url = item.api_base_url
+        if not self._settings.contains("glossary_api_model"):
+            item.glossary_api_model = item.api_model
+        if not self._settings.contains("glossary_api_key_blob"):
+            item.glossary_api_key_blob = item.api_key_blob
+        if not self._settings.contains("glossary_api_timeout"):
+            item.glossary_api_timeout = item.api_timeout
         if not item.ascii_runner_dir:
             item.ascii_runner_dir = default_ascii_runner_dir()
         if not item.projects_root:
@@ -142,9 +150,16 @@ class SettingsStore:
     def set_api_key(self, item: AppSettings, secret: str) -> None:
         item.api_key_blob = protect_secret(secret.strip())
 
+    def set_glossary_api_key(self, item: AppSettings, secret: str) -> None:
+        item.glossary_api_key_blob = protect_secret(secret.strip())
+
     @staticmethod
     def api_key(item: AppSettings) -> str:
         return unprotect_secret(item.api_key_blob)
+
+    @staticmethod
+    def glossary_api_key(item: AppSettings) -> str:
+        return unprotect_secret(item.glossary_api_key_blob)
 
 
 def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
@@ -157,14 +172,18 @@ def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
     if not item.ainiee_source or not Path(item.ainiee_source).exists():
         errors.append("请选择或安装 AiNiee-Next。")
     if require_api:
-        if not item.api_base_url.strip() or not item.api_model.strip():
-            errors.append("请填写 API 基础地址和模型。")
-        try:
-            key = SettingsStore.api_key(item)
-        except Exception:
-            key = ""
-        if not key:
-            errors.append("请填写 API 密钥。")
+        for label, base_url, model, key_blob in (
+            ("术语生成", item.glossary_api_base_url, item.glossary_api_model, item.glossary_api_key_blob),
+            ("AiNiee 翻译", item.api_base_url, item.api_model, item.api_key_blob),
+        ):
+            if not base_url.strip() or not model.strip():
+                errors.append(f"请填写{label} API 基础地址和模型。")
+            try:
+                key = unprotect_secret(key_blob)
+            except Exception:
+                key = ""
+            if not key:
+                errors.append(f"请填写{label} API 密钥。")
     if not item.license_accepted:
         errors.append("请确认 FreeGames 工具许可范围。")
     runner = Path(item.ascii_runner_dir)

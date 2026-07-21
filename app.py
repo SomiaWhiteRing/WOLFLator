@@ -146,14 +146,15 @@ class ApiTestThread(QThread):
     succeeded = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, settings, api_key: str):
+    def __init__(self, settings, api_key: str, *, glossary: bool = False):
         super().__init__()
         self.settings = settings
         self.api_key = api_key
+        self.glossary = glossary
 
     def run(self) -> None:
         try:
-            self.succeeded.emit(test_api(self.settings, self.api_key))
+            self.succeeded.emit(test_api(self.settings, self.api_key, glossary=self.glossary))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -177,13 +178,14 @@ class SettingsDialog(QDialog):
         self.settings = store.load()
         self.install_thread: InstallThread | None = None
         self.api_thread: ApiTestThread | None = None
+        self.api_test_target = "translation"
         self.setWindowTitle("WOLFLator 设置")
         self.setMinimumWidth(720)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 20)
         layout.setSpacing(16)
 
-        title = QLabel("工具与 API")
+        title = QLabel("设置")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
 
@@ -223,6 +225,67 @@ class SettingsDialog(QDialog):
         manage_layout.addStretch(1)
         form.addRow("版本管理", management)
 
+        self.projects_root = QLineEdit(self.settings.projects_root)
+        form.addRow("项目目录", _path_row(self.projects_root, "选择", self._choose_projects_root))
+        self.ascii_dir = QLineEdit(self.settings.ascii_runner_dir)
+        form.addRow("ASCII 执行目录", _path_row(self.ascii_dir, "选择", self._choose_ascii_dir))
+        layout.addLayout(form)
+
+        self.api_tabs = QTabWidget()
+        glossary_page = QWidget()
+        glossary_form = QFormLayout(glossary_page)
+        glossary_form.setHorizontalSpacing(18)
+        glossary_form.setVerticalSpacing(10)
+        self.glossary_api_url = QLineEdit(self.settings.glossary_api_base_url)
+        self.glossary_api_url.setPlaceholderText("https://example.com/v1")
+        self.glossary_api_model = QLineEdit(self.settings.glossary_api_model)
+        self.glossary_api_key = QLineEdit()
+        self.glossary_api_key.setEchoMode(QLineEdit.Password)
+        try:
+            self.glossary_api_key.setText(self.store.glossary_api_key(self.settings))
+        except Exception:
+            pass
+        glossary_form.addRow("API 基础地址", self.glossary_api_url)
+        glossary_form.addRow("模型", self.glossary_api_model)
+        glossary_form.addRow("API 密钥", self.glossary_api_key)
+
+        glossary_limits = QWidget()
+        glossary_limits_layout = QHBoxLayout(glossary_limits)
+        glossary_limits_layout.setContentsMargins(0, 0, 0, 0)
+        self.glossary_api_threads = QSpinBox()
+        self.glossary_api_threads.setRange(1, 100)
+        self.glossary_api_threads.setValue(self.settings.glossary_api_threads)
+        self.glossary_api_timeout = QSpinBox()
+        self.glossary_api_timeout.setRange(10, 3600)
+        self.glossary_api_timeout.setSuffix(" 秒")
+        self.glossary_api_timeout.setValue(self.settings.glossary_api_timeout)
+        glossary_limits_layout.addWidget(QLabel("并发"))
+        glossary_limits_layout.addWidget(self.glossary_api_threads)
+        glossary_limits_layout.addWidget(QLabel("超时"))
+        glossary_limits_layout.addWidget(self.glossary_api_timeout)
+        glossary_limits_layout.addStretch(1)
+        glossary_form.addRow("请求", glossary_limits)
+
+        glossary_output = QWidget()
+        glossary_output_layout = QHBoxLayout(glossary_output)
+        glossary_output_layout.setContentsMargins(0, 0, 0, 0)
+        self.glossary_api_max_tokens = QSpinBox()
+        self.glossary_api_max_tokens.setRange(0, 1_000_000)
+        self.glossary_api_max_tokens.setSpecialValueText("服务端默认")
+        self.glossary_api_max_tokens.setGroupSeparatorShown(True)
+        self.glossary_api_max_tokens.setValue(self.settings.glossary_api_max_tokens)
+        self.glossary_test_button = QPushButton("测试术语 API")
+        self.glossary_test_button.clicked.connect(lambda: self._test_api(True))
+        glossary_output_layout.addWidget(self.glossary_api_max_tokens)
+        glossary_output_layout.addWidget(self.glossary_test_button)
+        glossary_output_layout.addStretch(1)
+        glossary_form.addRow("最大输出 Token", glossary_output)
+        self.api_tabs.addTab(glossary_page, "术语生成 API")
+
+        translation_page = QWidget()
+        translation_form = QFormLayout(translation_page)
+        translation_form.setHorizontalSpacing(18)
+        translation_form.setVerticalSpacing(10)
         self.api_url = QLineEdit(self.settings.api_base_url)
         self.api_url.setPlaceholderText("https://example.com/v1")
         self.api_model = QLineEdit(self.settings.api_model)
@@ -232,9 +295,9 @@ class SettingsDialog(QDialog):
             self.api_key.setText(self.store.api_key(self.settings))
         except Exception:
             pass
-        form.addRow("API 基础地址", self.api_url)
-        form.addRow("模型", self.api_model)
-        form.addRow("API 密钥", self.api_key)
+        translation_form.addRow("API 基础地址", self.api_url)
+        translation_form.addRow("模型", self.api_model)
+        translation_form.addRow("API 密钥", self.api_key)
 
         limits = QWidget()
         limits_layout = QHBoxLayout(limits)
@@ -246,21 +309,34 @@ class SettingsDialog(QDialog):
         self.api_timeout.setRange(10, 3600)
         self.api_timeout.setSuffix(" 秒")
         self.api_timeout.setValue(self.settings.api_timeout)
-        self.test_button = QPushButton("测试 API")
-        self.test_button.clicked.connect(self._test_api)
         limits_layout.addWidget(QLabel("并发"))
         limits_layout.addWidget(self.api_threads)
         limits_layout.addWidget(QLabel("超时"))
         limits_layout.addWidget(self.api_timeout)
-        limits_layout.addWidget(self.test_button)
         limits_layout.addStretch(1)
-        form.addRow("请求", limits)
+        translation_form.addRow("请求", limits)
 
-        self.projects_root = QLineEdit(self.settings.projects_root)
-        form.addRow("项目目录", _path_row(self.projects_root, "选择", self._choose_projects_root))
-        self.ascii_dir = QLineEdit(self.settings.ascii_runner_dir)
-        form.addRow("ASCII 执行目录", _path_row(self.ascii_dir, "选择", self._choose_ascii_dir))
-        layout.addLayout(form)
+        quotas = QWidget()
+        quotas_layout = QHBoxLayout(quotas)
+        quotas_layout.setContentsMargins(0, 0, 0, 0)
+        self.api_rpm = QSpinBox()
+        self.api_rpm.setRange(1, 1_000_000)
+        self.api_rpm.setValue(self.settings.api_rpm)
+        self.api_tpm = QSpinBox()
+        self.api_tpm.setRange(1, 2_000_000_000)
+        self.api_tpm.setGroupSeparatorShown(True)
+        self.api_tpm.setValue(self.settings.api_tpm)
+        self.test_button = QPushButton("测试翻译 API")
+        self.test_button.clicked.connect(lambda: self._test_api(False))
+        quotas_layout.addWidget(QLabel("RPM"))
+        quotas_layout.addWidget(self.api_rpm)
+        quotas_layout.addWidget(QLabel("TPM"))
+        quotas_layout.addWidget(self.api_tpm)
+        quotas_layout.addWidget(self.test_button)
+        quotas_layout.addStretch(1)
+        translation_form.addRow("请求限制", quotas)
+        self.api_tabs.addTab(translation_page, "AiNiee 翻译 API")
+        layout.addWidget(self.api_tabs)
 
         self.license_check = QCheckBox("我确认仅将 FreeGames 工具用于其许可范围内的免费游戏")
         self.license_check.setChecked(self.settings.license_accepted)
@@ -380,39 +456,53 @@ class SettingsDialog(QDialog):
         item.api_model = self.api_model.text().strip()
         item.api_threads = self.api_threads.value()
         item.api_timeout = self.api_timeout.value()
+        item.api_rpm = self.api_rpm.value()
+        item.api_tpm = self.api_tpm.value()
+        item.glossary_api_base_url = self.glossary_api_url.text().strip().rstrip("/")
+        item.glossary_api_model = self.glossary_api_model.text().strip()
+        item.glossary_api_threads = self.glossary_api_threads.value()
+        item.glossary_api_timeout = self.glossary_api_timeout.value()
+        item.glossary_api_max_tokens = self.glossary_api_max_tokens.value()
         item.projects_root = self.projects_root.text().strip()
         item.ascii_runner_dir = self.ascii_dir.text().strip()
         item.license_accepted = self.license_check.isChecked()
         return item
 
-    def _test_api(self) -> None:
+    def _test_api(self, glossary: bool = False) -> None:
         item = self._current_settings()
-        key = self.api_key.text().strip()
+        key = (self.glossary_api_key if glossary else self.api_key).text().strip()
         if not key:
             QMessageBox.warning(self, "API", "请填写 API 密钥。")
             return
+        self.api_test_target = "glossary" if glossary else "translation"
         self.test_button.setEnabled(False)
-        self.activity.setText("正在测试 API...")
-        self.api_thread = ApiTestThread(item, key)
+        self.glossary_test_button.setEnabled(False)
+        self.activity.setText("正在测试术语 API..." if glossary else "正在测试翻译 API...")
+        self.api_thread = ApiTestThread(item, key, glossary=glossary)
         self.api_thread.succeeded.connect(self._api_succeeded)
         self.api_thread.failed.connect(self._api_failed)
         self.api_thread.start()
 
     def _api_succeeded(self, response: str) -> None:
         self.test_button.setEnabled(True)
-        self.activity.setText("API 连接成功")
+        self.glossary_test_button.setEnabled(True)
+        label = "术语 API" if self.api_test_target == "glossary" else "翻译 API"
+        self.activity.setText(f"{label} 连接成功")
         preview = response[:500] + ("..." if len(response) > 500 else "")
-        QMessageBox.information(self, "API 连接成功", f"模型已返回正文：\n\n{preview}")
+        QMessageBox.information(self, f"{label} 连接成功", f"模型已返回正文：\n\n{preview}")
 
     def _api_failed(self, error: str) -> None:
         self.test_button.setEnabled(True)
-        self.activity.setText("API 测试失败")
-        QMessageBox.critical(self, "API 测试失败", error)
+        self.glossary_test_button.setEnabled(True)
+        label = "术语 API" if self.api_test_target == "glossary" else "翻译 API"
+        self.activity.setText(f"{label} 测试失败")
+        QMessageBox.critical(self, f"{label} 测试失败", error)
 
     def _save(self) -> None:
         item = self._current_settings()
         try:
             self.store.set_api_key(item, self.api_key.text())
+            self.store.set_glossary_api_key(item, self.glossary_api_key.text())
             errors = validate_settings(item)
             if errors:
                 QMessageBox.warning(self, "设置未完成", "\n".join(errors))
@@ -496,7 +586,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._workflow_tab(), "流程")
         self.tabs.addTab(self._glossary_tab(), "术语")
-        self.tabs.addTab(self._scope_tab(), "导入范围")
+        self.tabs.addTab(self._scope_tab(), "范围")
         layout.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -730,23 +820,53 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(18, 20, 18, 18)
-        self.scope_checks = {
+        layout.setSpacing(14)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("范围类型"))
+        self.scope_mode_group = QButtonGroup(self)
+        self.scope_mode_group.setExclusive(True)
+        self.translation_scope_button = QPushButton("翻译范围")
+        self.import_scope_button = QPushButton("导入范围")
+        for button in (self.translation_scope_button, self.import_scope_button):
+            button.setCheckable(True)
+            button.setObjectName("segment")
+            self.scope_mode_group.addButton(button)
+            mode_row.addWidget(button)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        self.scope_stack = QStackedWidget()
+        self.translation_scope_checks = self._scope_panel(self.scope_stack, "translation")
+        self.import_scope_checks = self._scope_panel(self.scope_stack, "import")
+        layout.addWidget(self.scope_stack, 1)
+        self.translation_scope_button.setChecked(True)
+        self.translation_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(0))
+        self.import_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(1))
+        return page
+
+    def _scope_panel(self, stack: QStackedWidget, target: str) -> dict[str, QCheckBox]:
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 6, 0, 0)
+        checks = {
             "display": QCheckBox("显示文本"),
             "external": QCheckBox("外部 TXT / CSV"),
             "optional_name": QCheckBox("数据库、地图和事件名称"),
             "halfwidth": QCheckBox("纯半角字符串"),
             "filename": QCheckBox("文件名引用"),
         }
-        self.scope_checks["display"].setChecked(True)
-        for key, check in self.scope_checks.items():
-            check.toggled.connect(self._save_scope)
-            layout.addWidget(check)
-            if key == "filename":
+        checks["display"].setChecked(True)
+        for key, check in checks.items():
+            check.toggled.connect(lambda _checked=False, scope_target=target: self._save_scope(scope_target))
+            panel_layout.addWidget(check)
+            if target == "import" and key == "filename":
                 warning = QLabel("启用文件名导入前，发布副本中必须存在对应的目标文件。")
                 warning.setObjectName("warningText")
-                layout.addWidget(warning)
-        layout.addStretch(1)
-        return page
+                panel_layout.addWidget(warning)
+        panel_layout.addStretch(1)
+        stack.addWidget(panel)
+        return checks
 
     def _open_settings(self, _checked=False, first_run: bool = False) -> None:
         dialog = SettingsDialog(self.store, self)
@@ -870,10 +990,14 @@ class MainWindow(QMainWindow):
         else:
             self.retry_button.setToolTip("重试失败阶段")
             self.retry_button.setEnabled(not running and bool(failed_stages))
-        for name, check in self.scope_checks.items():
-            check.blockSignals(True)
-            check.setChecked(bool(getattr(manifest.import_scope, name)))
-            check.blockSignals(False)
+        for scope, checks in (
+            (manifest.translation_scope, self.translation_scope_checks),
+            (manifest.import_scope, self.import_scope_checks),
+        ):
+            for name, check in checks.items():
+                check.blockSignals(True)
+                check.setChecked(bool(getattr(scope, name)))
+                check.blockSignals(False)
         self._load_glossary()
 
     def _new_project(self) -> None:
@@ -920,10 +1044,11 @@ class MainWindow(QMainWindow):
         self._set_mode(mode)
         self._load_project_view()
 
-    def _save_scope(self) -> None:
+    def _save_scope(self, target: str) -> None:
         if not self.current_manifest_path:
             return
-        if self.scope_checks["filename"].isChecked():
+        checks = self.translation_scope_checks if target == "translation" else self.import_scope_checks
+        if target == "import" and checks["filename"].isChecked():
             answer = QMessageBox.warning(
                 self,
                 "文件名导入",
@@ -931,17 +1056,20 @@ class MainWindow(QMainWindow):
                 QMessageBox.Ok | QMessageBox.Cancel,
             )
             if answer != QMessageBox.Ok:
-                self.scope_checks["filename"].blockSignals(True)
-                self.scope_checks["filename"].setChecked(False)
-                self.scope_checks["filename"].blockSignals(False)
-        new_scope = ImportScope(**{name: check.isChecked() for name, check in self.scope_checks.items()})
+                checks["filename"].blockSignals(True)
+                checks["filename"].setChecked(False)
+                checks["filename"].blockSignals(False)
+        new_scope = ImportScope(**{name: check.isChecked() for name, check in checks.items()})
         pipeline = Pipeline(
             self.current_manifest_path,
             self.settings,
             "",
             local_data_dir(),
         )
-        pipeline.set_import_scope(new_scope)
+        if target == "translation":
+            pipeline.set_translation_scope(new_scope)
+        else:
+            pipeline.set_import_scope(new_scope)
         if self.pipeline:
             self.pipeline.manifest = pipeline.manifest
 
@@ -1033,17 +1161,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "设置未完成", "\n".join(errors))
             return
         try:
-            try:
+            key = ""
+            glossary_key = ""
+            if stage is None or stage is Stage.TRANSLATE:
                 key = self.store.api_key(self.settings)
-            except Exception:
-                if stage is None:
-                    raise
-                key = ""
+            if stage is None or stage is Stage.GLOSSARY:
+                glossary_key = self.store.glossary_api_key(self.settings)
             self.pipeline = Pipeline(
                 self.current_manifest_path,
                 self.settings,
                 key,
                 local_data_dir(),
+                glossary_api_key=glossary_key,
             )
             self.pipeline_thread = PipelineThread(self.pipeline, stage)
             self.pipeline_thread.log_line.connect(self._append_log)
@@ -1058,8 +1187,11 @@ class MainWindow(QMainWindow):
                 button.setEnabled(False)
             self.retry_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-            for check in self.scope_checks.values():
-                check.setEnabled(False)
+            for checks in (self.translation_scope_checks, self.import_scope_checks):
+                for check in checks.values():
+                    check.setEnabled(False)
+            self.translation_scope_button.setEnabled(False)
+            self.import_scope_button.setEnabled(False)
             self.status_label.setText(
                 f"正在执行：{STAGE_LABELS[stage]}" if stage is not None else "运行中"
             )
@@ -1127,8 +1259,11 @@ class MainWindow(QMainWindow):
 
     def _pipeline_finished(self) -> None:
         self.stop_button.setEnabled(False)
-        for check in self.scope_checks.values():
-            check.setEnabled(True)
+        for checks in (self.translation_scope_checks, self.import_scope_checks):
+            for check in checks.values():
+                check.setEnabled(True)
+        self.translation_scope_button.setEnabled(True)
+        self.import_scope_button.setEnabled(True)
         self.pipeline_thread = None
         self.pipeline = None
         self._load_project_view()
@@ -1162,6 +1297,7 @@ class MainWindow(QMainWindow):
                 self.settings,
                 self.store.api_key(self.settings),
                 local_data_dir(),
+                glossary_api_key=self.store.glossary_api_key(self.settings),
             )
             pipeline.retry_failed()
             self._load_project_view()

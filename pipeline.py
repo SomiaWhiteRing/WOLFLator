@@ -34,21 +34,30 @@ from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
     UberWolfRunner,
+    apply_managed_translations,
+    classify_optional_name_delta,
     dump_items,
+    full_export_scope,
     hash_directory,
     load_items,
     locate_workbook,
     merge_ainiee_output,
+    name_baseline_scope,
     prepare_official_tool,
     prepare_uberwolf,
     read_translation_items,
     reconcile_incremental,
+    selected_translation_items,
+    selected_translation_requirements,
     to_paratranz,
     write_full_workbook,
     write_scoped_workbook,
     WORKBOOK_NAME,
     SUPPORT_DIR,
 )
+
+
+EXPORT_SCHEMA = 2
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -122,6 +131,7 @@ class Pipeline:
         api_key: str,
         cache_root: str | Path,
         *,
+        glossary_api_key: str | None = None,
         log: Callable[[str], None] | None = None,
         progress: Callable[[int, int, Stage], None] | None = None,
     ):
@@ -129,6 +139,7 @@ class Pipeline:
         self.project_dir = self.manifest_path.parent
         self.settings = settings
         self.api_key = api_key
+        self.glossary_api_key = api_key if glossary_api_key is None else glossary_api_key
         self.cache_root = Path(cache_root)
         self._log_sink = log or (lambda _message: None)
         self._log_lock = threading.Lock()
@@ -136,12 +147,28 @@ class Pipeline:
         self._safe_api_url = urlunsplit(
             (parsed_api_url.scheme, parsed_api_url.netloc.rsplit("@", 1)[-1], parsed_api_url.path, "", "")
         )
+        parsed_glossary_api_url = urlsplit(settings.glossary_api_base_url)
+        self._safe_glossary_api_url = urlunsplit(
+            (
+                parsed_glossary_api_url.scheme,
+                parsed_glossary_api_url.netloc.rsplit("@", 1)[-1],
+                parsed_glossary_api_url.path,
+                "",
+                "",
+            )
+        )
         self._sensitive_values = {
             value
             for value in (
                 api_key,
+                self.glossary_api_key,
                 parsed_api_url.password or "",
+                parsed_glossary_api_url.password or "",
                 *(value for _name, value in parse_qsl(parsed_api_url.query, keep_blank_values=False)),
+                *(
+                    value
+                    for _name, value in parse_qsl(parsed_glossary_api_url.query, keep_blank_values=False)
+                ),
             )
             if value
         }
@@ -197,6 +224,8 @@ class Pipeline:
                 f"operation={operation}",
                 f"api_url={self._safe_api_url}",
                 f"api_model={self.settings.api_model}",
+                f"glossary_api_url={self._safe_glossary_api_url}",
+                f"glossary_api_model={self.settings.glossary_api_model}",
                 f"wolf_tool={self.settings.wolf_tool_path}",
                 f"ainiee_source={self.settings.ainiee_source}",
                 f"ascii_runner_dir={self.settings.ascii_runner_dir}",
@@ -223,6 +252,8 @@ class Pipeline:
         text = str(message).rstrip("\r\n")
         if self.settings.api_base_url:
             text = text.replace(self.settings.api_base_url, self._safe_api_url)
+        if self.settings.glossary_api_base_url:
+            text = text.replace(self.settings.glossary_api_base_url, self._safe_glossary_api_url)
         for secret in self._sensitive_values:
             text = text.replace(secret, "[REDACTED]")
         try:
@@ -259,7 +290,17 @@ class Pipeline:
         if self.manifest.import_scope == scope:
             return
         self.manifest.import_scope = scope
-        for stage in (Stage.IMPORT, Stage.RELEASE):
+        for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:
+            record = self.manifest.version.stage(stage)
+            record.status = StageStatus.PENDING
+            record.error = ""
+        self.save()
+
+    def set_translation_scope(self, scope: ImportScope) -> None:
+        if self.manifest.translation_scope == scope:
+            return
+        self.manifest.translation_scope = scope
+        for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]:
             record = self.manifest.version.stage(stage)
             record.status = StageStatus.PENDING
             record.error = ""
@@ -286,8 +327,18 @@ class Pipeline:
             tool = Path(self.settings.wolf_tool_path)
             extra["wolf_tool"] = str(tool.resolve()) if tool.exists() else str(tool)
             extra["wolf_tool_size"] = tool.stat().st_size if tool.is_file() else 0
+            extra["export_schema"] = EXPORT_SCHEMA
         elif stage is Stage.GLOSSARY:
-            extra.update({"api_url": self.settings.api_base_url, "model": self.settings.api_model})
+            extra.update(
+                {
+                    "api_url": self.settings.glossary_api_base_url,
+                    "model": self.settings.glossary_api_model,
+                    "threads": self.settings.glossary_api_threads,
+                    "timeout": self.settings.glossary_api_timeout,
+                    "max_tokens": self.settings.glossary_api_max_tokens,
+                    "translation_scope": self.manifest.translation_scope.__dict__,
+                }
+            )
         elif stage is Stage.TRANSLATE:
             glossary = self.project_dir / "glossary.json"
             extra.update(
@@ -296,6 +347,7 @@ class Pipeline:
                     "model": self.settings.api_model,
                     "threads": self.settings.api_threads,
                     "glossary_sha256": hashlib.sha256(glossary.read_bytes()).hexdigest() if glossary.is_file() else "",
+                    "translation_scope": self.manifest.translation_scope.__dict__,
                 }
             )
         elif stage is Stage.IMPORT:
@@ -391,12 +443,12 @@ class Pipeline:
         index = keys.index(self.manifest.active_version)
         return self.manifest.versions[keys[index - 1]] if index > 0 else None
 
-    def _official_runner(self) -> OfficialToolRunner:
+    def _official_runner(self, scope: ImportScope | None = None) -> OfficialToolRunner:
         executable = prepare_official_tool(
             self.settings.wolf_tool_path,
             self.cache_root / "tools" / "wolf-official",
         )
-        return OfficialToolRunner(executable)
+        return OfficialToolRunner(executable, scope or full_export_scope())
 
     def _copy(self) -> dict[str, str]:
         original = _validate_game(self.manifest.version.original_path)
@@ -426,7 +478,8 @@ class Pipeline:
         return {"data": str(self.work_dir / "Data"), "uberwolf": str(executable)}
 
     def _extract(self) -> dict[str, str]:
-        runner = self._official_runner()
+        runner = self._official_runner(full_export_scope())
+        self.log("正在生成全量 WOLF 翻译工作簿...")
         previous = self._previous_version()
         previous_full = None
         conflicts: list[dict[str, object]] = []
@@ -456,16 +509,36 @@ class Pipeline:
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         extracted = self.artifacts_dir / "source.xlsx"
         shutil.copy2(workbook, extracted)
+
+        self.log("正在生成名称分类基准工作簿...")
+        baseline_workbook = self._official_runner(name_baseline_scope()).extract(
+            self.work_dir,
+            cancel_event=self.cancel_event,
+            log=self.log,
+            diagnostic_log=self.detail,
+        )
+        baseline = self.artifacts_dir / "source-baseline.xlsx"
+        shutil.copy2(baseline_workbook, baseline)
+        shutil.copy2(extracted, self.work_dir / SUPPORT_DIR / WORKBOOK_NAME)
+
         items = read_translation_items(extracted)
+        baseline_items = read_translation_items(baseline)
+        optional_name_rows = classify_optional_name_delta(items, baseline_items)
         items_path = dump_items(self.artifacts_dir / "items-extracted.json", items)
         categories: dict[str, int] = {}
         for item in items:
             categories[item.category.value] = categories.get(item.category.value, 0) + 1
         self.detail(
-            f"extract.complete workbook={extracted} rows={len(items)} categories="
+            f"extract.complete workbook={extracted} baseline={baseline} rows={len(items)} "
+            f"baseline_rows={len(baseline_items)} optional_name_rows={optional_name_rows} categories="
             + json.dumps(categories, ensure_ascii=False, sort_keys=True)
         )
-        artifacts = {"workbook": str(extracted), "items": str(items_path)}
+        artifacts = {
+            "workbook": str(extracted),
+            "baseline_workbook": str(baseline),
+            "items": str(items_path),
+            "optional_name_rows": str(optional_name_rows),
+        }
         if conflicts:
             conflicts_path = self.artifacts_dir / "incremental-conflicts.json"
             _atomic_json(conflicts_path, conflicts)
@@ -477,11 +550,12 @@ class Pipeline:
     def _glossary(self) -> dict[str, str]:
         items_path = self.manifest.version.stage(Stage.EXTRACT).artifacts["items"]
         glossary_path = self.project_dir / "glossary.json"
+        items = selected_translation_items(load_items(items_path), self.manifest.translation_scope)
         rules = generate_glossary(
-            load_items(items_path),
+            items,
             glossary_path,
             self.settings,
-            self.api_key,
+            self.glossary_api_key,
             cancel_event=self.cancel_event,
             log=self.log,
             diagnostic_log=self.detail,
@@ -491,32 +565,37 @@ class Pipeline:
     def _translate(self) -> dict[str, str]:
         extract = self.manifest.version.stage(Stage.EXTRACT).artifacts
         items = load_items(extract["items"])
-        paratranz = to_paratranz(items)
+        apply_managed_translations(items)
+        paratranz = to_paratranz(items, self.manifest.translation_scope)
         input_path = self.artifacts_dir / "ainiee-input.json"
         _atomic_json(input_path, paratranz)
         self.detail(
             f"translate.input extracted_rows={len(items)} translatable_rows={len(paratranz)} input={input_path}"
         )
-        runtime = require_managed_runtime(
-            self.settings.ainiee_source,
-            self.cache_root / "runtime" / "ainiee",
-        )
-        glossary = json.loads((self.project_dir / "glossary.json").read_text(encoding="utf-8"))
-        raw = run_translation(
-            runtime,
-            input_path,
-            self.artifacts_dir / "ainiee-output",
-            glossary,
-            self.manifest.project_id,
-            self.settings,
-            self.api_key,
-            cancel_event=self.cancel_event,
-            log=self.log,
-            diagnostic_log=self.detail,
-        )
+        if paratranz:
+            runtime = require_managed_runtime(
+                self.settings.ainiee_source,
+                self.cache_root / "runtime" / "ainiee",
+            )
+            glossary = json.loads((self.project_dir / "glossary.json").read_text(encoding="utf-8"))
+            raw = run_translation(
+                runtime,
+                input_path,
+                self.artifacts_dir / "ainiee-output",
+                glossary,
+                self.manifest.project_id,
+                self.settings,
+                self.api_key,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+            )
+        else:
+            self.log("当前翻译范围没有需要交给 AiNiee 的文本。")
+            raw = []
         raw_path = self.artifacts_dir / "ainiee-output.json"
         _atomic_json(raw_path, raw)
-        merged = merge_ainiee_output(items, raw)
+        merged = merge_ainiee_output(items, raw, self.manifest.translation_scope)
         items_path = dump_items(self.artifacts_dir / "items-translated.json", merged)
         translated_count = sum(bool(item.translation) for item in merged)
         self.detail(
@@ -532,7 +611,13 @@ class Pipeline:
         reread = read_translation_items(full)
         if len(reread) != len(items):
             raise RuntimeError("完整工作簿回读行数不一致。")
-        missing = [item for item in reread if item.category.value != "copy" and not item.translation]
+        required = selected_translation_requirements(items, self.manifest.translation_scope)
+        reread_by_key = {item.key: item for item in reread}
+        missing = [
+            item
+            for item in items
+            if item.key in required and not reread_by_key.get(item.key, item).translation
+        ]
         self.detail(
             f"validate.result expected_rows={len(items)} workbook_rows={len(reread)} missing={len(missing)} "
             f"workbook={full}"
@@ -543,6 +628,15 @@ class Pipeline:
 
     def _import(self) -> dict[str, str]:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
+        items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
+        required = selected_translation_requirements(items, self.manifest.import_scope)
+        missing = [item for item in items if item.key in required and not item.translation]
+        if missing:
+            sample = "、".join(item.original[:30] for item in missing[:3])
+            raise RuntimeError(
+                f"导入范围中有 {len(missing)} 条内容没有译文，请扩大翻译范围并重新翻译。"
+                + (f"例如：{sample}" if sample else "")
+            )
         self.detail(
             "import.start scope="
             + json.dumps(self.manifest.import_scope.__dict__, ensure_ascii=False, sort_keys=True)
@@ -552,6 +646,7 @@ class Pipeline:
             self.artifacts_dir / "import-scoped.xlsx",
             self.manifest.import_scope,
             self.work_dir,
+            items,
         )
         support = self.work_dir / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)

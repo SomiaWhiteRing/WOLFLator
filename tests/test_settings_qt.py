@@ -35,6 +35,45 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(item.ainiee_source, dialog.ainiee_path.text())
             dialog.close()
 
+    def test_legacy_api_settings_seed_dedicated_glossary_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.ini")
+            encrypted = protect_secret("legacy-secret")
+            store._settings.setValue("api_base_url", "https://legacy.example/v1")
+            store._settings.setValue("api_model", "legacy-model")
+            store._settings.setValue("api_key_blob", encrypted)
+            store._settings.setValue("api_timeout", 75)
+            store._settings.sync()
+            item = store.load()
+            self.assertEqual("https://legacy.example/v1", item.glossary_api_base_url)
+            self.assertEqual("legacy-model", item.glossary_api_model)
+            self.assertEqual("legacy-secret", store.glossary_api_key(item))
+            self.assertEqual(75, item.glossary_api_timeout)
+            self.assertEqual(3, item.glossary_api_threads)
+            self.assertEqual(0, item.glossary_api_max_tokens)
+
+    def test_dialog_loads_separate_api_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.ini")
+            item = AppSettings(
+                api_base_url="https://translate.example/v1",
+                api_model="translate-model",
+                api_threads=12,
+                glossary_api_base_url="https://glossary.example/v1",
+                glossary_api_model="glossary-model",
+                glossary_api_threads=2,
+                glossary_api_max_tokens=65_535,
+            )
+            store.save(item)
+            dialog = SettingsDialog(store)
+            self.assertEqual(2, dialog.api_tabs.count())
+            self.assertEqual("https://translate.example/v1", dialog.api_url.text())
+            self.assertEqual("https://glossary.example/v1", dialog.glossary_api_url.text())
+            self.assertEqual(12, dialog.api_threads.value())
+            self.assertEqual(2, dialog.glossary_api_threads.value())
+            self.assertEqual(65_535, dialog.glossary_api_max_tokens.value())
+            dialog.close()
+
     def test_install_thread_prepares_dependencies_before_reporting_ready(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -75,6 +114,10 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(window.workflow_page.isAncestorOf(window.step_mode))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.log_view))
                 self.assertEqual(3, window.tabs.count())
+                self.assertEqual("范围", window.tabs.tabText(2))
+                self.assertEqual(2, window.scope_stack.count())
+                self.assertTrue(window.tabs.widget(2).isAncestorOf(window.translation_scope_button))
+                self.assertTrue(window.tabs.widget(2).isAncestorOf(window.import_scope_button))
                 self.assertEqual(8, len(window.step_buttons))
                 self.assertEqual(8, len(window.step_skip_buttons))
                 self.assertTrue(all(button.text() == "执行" for button in window.step_buttons.values()))

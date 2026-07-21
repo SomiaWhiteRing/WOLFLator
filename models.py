@@ -75,6 +75,12 @@ class AppSettings:
     api_threads: int = 3
     api_rpm: int = 60
     api_tpm: int = 100_000
+    glossary_api_base_url: str = ""
+    glossary_api_model: str = ""
+    glossary_api_key_blob: str = ""
+    glossary_api_timeout: int = 120
+    glossary_api_threads: int = 3
+    glossary_api_max_tokens: int = 0
     license_accepted: bool = False
     last_project: str = ""
 
@@ -136,6 +142,7 @@ class ProjectManifest:
     updated_at: str = field(default_factory=utc_now)
     active_version: str = ""
     run_mode: RunMode = RunMode.ONE_CLICK
+    translation_scope: ImportScope = field(default_factory=ImportScope)
     import_scope: ImportScope = field(default_factory=ImportScope)
     versions: dict[str, VersionManifest] = field(default_factory=dict)
 
@@ -157,6 +164,8 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
+        import_scope_data = dict(data.get("import_scope", {}))
+        translation_scope_data = dict(data.get("translation_scope", import_scope_data))
         item = cls(
             project_id=str(data["project_id"]),
             name=str(data.get("name", data["project_id"])),
@@ -164,7 +173,8 @@ class ProjectManifest:
             updated_at=str(data.get("updated_at", utc_now())),
             active_version=str(data.get("active_version", "")),
             run_mode=RunMode(data.get("run_mode", RunMode.ONE_CLICK.value)),
-            import_scope=ImportScope(**dict(data.get("import_scope", {}))),
+            translation_scope=ImportScope(**translation_scope_data),
+            import_scope=ImportScope(**import_scope_data),
         )
         item.versions = {
             key: VersionManifest.from_dict(value)
@@ -185,17 +195,21 @@ class TranslationItem:
     type: str = ""
     info: str = ""
     category: ImportCategory = ImportCategory.DISPLAY
+    copy_category: ImportCategory | None = None
     control_signature: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
         data["category"] = self.category.value
+        data["copy_category"] = self.copy_category.value if self.copy_category else None
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TranslationItem":
         values = dict(data)
         values["category"] = ImportCategory(values.get("category", ImportCategory.DISPLAY.value))
+        copy_category = values.get("copy_category")
+        values["copy_category"] = ImportCategory(copy_category) if copy_category else None
         return cls(**values)
 
 

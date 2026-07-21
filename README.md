@@ -14,10 +14,14 @@ python app.py
 
 ```powershell
 python cli.py settings-check
+python cli.py api-test --target glossary
+python cli.py api-test --target translation
 python cli.py ainiee-prepare                 # 安装固定版本并准备依赖
 python cli.py project-create "C:\Games\MyWolfGame"
 python cli.py run "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json"
 python cli.py status "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --json
+python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --target translation --external
+python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --target import --external
 ```
 
 `run --stage translate` 可只执行单个阶段；`scope`、`skip`、`retry` 与图形界面中的对应操作一致。失败时命令返回非零退出码，并保留项目版本目录下的外部日志和完整 Python 堆栈。
@@ -26,10 +30,11 @@ python cli.py status "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" -
 
 - 自行取得的 WOLF Translation Support Tool for FreeGames EXE；同目录必须有 `LibXL.dll`。
 - 已安装/解压的 AiNiee-Next，或在设置窗口点击“安装 V2.7.5”。
-- OpenAI 兼容 API 的基础地址、模型和密钥。
+- 两套 OpenAI 兼容 API 配置：术语生成，以及交给 AiNiee 使用的翻译配置。两者可使用不同的地址、模型、密钥、并发和超时。
 - 项目目录和纯 ASCII 的 UberWolf 执行目录。
 
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。
+官方工具始终生成全量 XLSX，并额外生成一份关闭名称项的内部基准表来精确分类；翻译范围和导入范围可独立切换，切换范围不需要重新导出。
 
 ## 构建 Windows 发行包
 
@@ -52,4 +57,4 @@ python cli.py status "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" -
     release/      最终可运行游戏
 ```
 
-API 密钥通过当前 Windows 用户的 DPAPI 加密保存。AiNiee 运行时采用隔离副本，带密钥的 session profile 会在任务结束及下次启动时删除。
+两套 API 密钥都通过当前 Windows 用户的 DPAPI 加密保存。AiNiee 运行时采用隔离副本，带翻译密钥的 session profile 会在任务结束及下次启动时删除。
