@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from app import InstallThread, MainWindow, SettingsDialog
 from models import AppSettings, RunMode, Stage, StageStatus
@@ -24,6 +24,13 @@ class SettingsQtTests(unittest.TestCase):
         encrypted = protect_secret("test-secret")
         self.assertNotIn("test-secret", encrypted)
         self.assertEqual("test-secret", unprotect_secret(encrypted))
+
+    def test_completed_stage_can_surface_official_warnings(self):
+        label = QLabel()
+        MainWindow._update_stage_status(label, StageStatus.COMPLETED, "details", 16)
+        self.assertEqual("已完成（16 个警告）", label.text())
+        self.assertEqual("warning", label.property("state"))
+        self.assertEqual("details", label.toolTip())
 
     def test_dialog_loads_persisted_paths(self):
         with tempfile.TemporaryDirectory() as directory:

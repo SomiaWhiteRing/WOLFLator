@@ -37,6 +37,7 @@ from wolf_tools import (
     locate_workbook,
     merge_ainiee_output,
     name_baseline_scope,
+    parse_official_diagnostics,
     protect_control_tokens,
     read_translation_items,
     reconcile_incremental,
@@ -271,12 +272,12 @@ class WorkbookTests(unittest.TestCase):
             )
             output = load_workbook(scoped)
             self.assertEqual("攻击力", output.active["G2"].value)
-            self.assertIsNone(output.active["G3"].value)
+            self.assertEqual("攻击力", output.active["G3"].value)
             self.assertIsNone(output.active["G4"].value)
             self.assertIsNone(output.active["G5"].value)
-            self.assertIsNone(output.active["G6"].value)
+            self.assertEqual("顔", output.active["G6"].value)
             self.assertIsNone(output.active["G7"].value)
-            self.assertIsNone(output.active["G8"].value)
+            self.assertEqual("トイレ", output.active["G8"].value)
 
     def test_merge_and_scoped_workbook_preserve_table(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -302,7 +303,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertIsNone(values[1])
             self.assertIsNone(values[2])
             self.assertIsNone(values[3])
-            self.assertIsNone(values[4])
+            self.assertEqual(r"译文\C[1]", values[4])
             self.assertIsNone(values[5])
             self.assertTrue(values[6])
             self.assertTrue(values[7])
@@ -440,6 +441,27 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(3, attempts)
             self.assertEqual("captured", json.loads(path.read_text(encoding="utf-8"))["text"])
 
+    def test_official_diagnostics_survive_console_wrapping(self):
+        output = """[Error!] COMMO
+N-221-Name => ロード => The command line seems to be misali
+gned. [Error!] COMMON-243-Name => エンドリスト
+=> The command line seems to be misaligned."""
+        self.assertEqual(
+            [
+                {
+                    "code": "COMMON-221-Name",
+                    "source": "ロード",
+                    "message": "The command line seems to be misaligned.",
+                },
+                {
+                    "code": "COMMON-243-Name",
+                    "source": "エンドリスト",
+                    "message": "The command line seems to be misaligned.",
+                },
+            ],
+            parse_official_diagnostics(output),
+        )
+
     def test_hidden_process_startupinfo_uses_windows_hide_flag(self):
         startupinfo = _process_startupinfo(True)
         if os.name == "nt":
@@ -450,7 +472,7 @@ class ProcessTests(unittest.TestCase):
             self.assertIsNone(startupinfo)
         self.assertIsNone(_process_startupinfo(False))
 
-    def test_official_runner_waits_and_captures_hidden_console(self):
+    def test_official_runner_captures_hidden_console_without_key_wait(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root / "official.exe"
@@ -458,16 +480,26 @@ class ProcessTests(unittest.TestCase):
             details = []
             with mock.patch(
                 "wolf_tools.run_process",
-                return_value=ToolResult([], 0, "", "", 0.1),
+                return_value=ToolResult(
+                    [],
+                    0,
+                    "",
+                    "",
+                    0.1,
+                    "[Error!] COMMON-1-Name => 原文 => The command line seems to be misaligned.",
+                ),
             ) as run:
-                OfficialToolRunner(executable, ImportScope()).run(
+                runner = OfficialToolRunner(executable, ImportScope())
+                runner.run(
                     "EXTRACT", root, diagnostic_log=details.append
                 )
             command = run.call_args.args[0]
-            self.assertEqual("-wait", command[-1])
+            self.assertNotIn("-wait", command)
             self.assertTrue(run.call_args.kwargs["hide_window"])
             self.assertTrue(run.call_args.kwargs["capture_console"])
             self.assertTrue(any("MessageBeep" in line and "IsWindow" in line for line in details))
+            self.assertEqual("COMMON-1-Name", runner.diagnostics[0]["code"])
+            self.assertEqual("EXTRACT", runner.diagnostics[0]["mode"])
 
     def test_nonzero_and_cancel(self):
         with self.assertRaisesRegex(RuntimeError, "退出码 3"):

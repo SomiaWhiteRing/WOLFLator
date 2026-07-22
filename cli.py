@@ -128,6 +128,8 @@ def _status(args: argparse.Namespace) -> int:
         for stage in STAGE_ORDER:
             record = version.stage(stage)
             suffix = f"：{record.error}" if record.error else ""
+            if record.artifacts.get("official_warning_count"):
+                suffix = f"（{record.artifacts['official_warning_count']} 个官方警告）"
             print(f"{stage.value:10} {record.status.value}{suffix}")
     return 0
 

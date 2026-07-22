@@ -221,7 +221,7 @@ def _silent_official_executable(path: str | Path) -> bytes:
 
 
 CONSOLE_CAPTURE_ARG = "--console-capture-worker"
-CONSOLE_CLOSE_PROMPT = "Press any key to close this window."
+OFFICIAL_MISALIGNED_MESSAGE = "The command line seems to be misaligned."
 
 
 def _console_capture_command(process_id: int, snapshot_path: Path) -> list[str]:
@@ -243,6 +243,29 @@ def _console_delta(previous: str, current: str) -> list[str]:
     while common < min(len(old_lines), len(new_lines)) and old_lines[common] == new_lines[common]:
         common += 1
     return [line for line in new_lines[common:] if line]
+
+
+def parse_official_diagnostics(text: str) -> list[dict[str, str]]:
+    compact = re.sub(r"\s+", "", text)
+    markers = list(re.finditer(r"\[Error!\](?P<code>[A-Za-z0-9_-]+)=>", compact))
+    diagnostics = []
+    compact_misaligned = re.sub(r"\s+", "", OFFICIAL_MISALIGNED_MESSAGE)
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(compact)
+        body = compact[marker.end() : end]
+        source, separator, detail = body.partition("=>")
+        if compact_misaligned in detail:
+            message = OFFICIAL_MISALIGNED_MESSAGE
+        else:
+            message = detail[:500] if separator else "官方工具报告了无法完整解析的错误。"
+        diagnostics.append(
+            {
+                "code": marker.group("code"),
+                "source": source[:500],
+                "message": message,
+            }
+        )
+    return diagnostics
 
 
 def _write_console_snapshot(path: Path, *, text: str = "", done: bool = False, error: str = "") -> None:
@@ -298,27 +321,6 @@ def _console_capture_worker_windows(process_id: int, snapshot_path: Path) -> int
             ("dwMaximumWindowSize", Coord),
         ]
 
-    class CharUnion(ctypes.Union):
-        _fields_ = [("UnicodeChar", wintypes.WCHAR), ("AsciiChar", wintypes.CHAR)]
-
-    class KeyEvent(ctypes.Structure):
-        _anonymous_ = ("character",)
-        _fields_ = [
-            ("bKeyDown", wintypes.BOOL),
-            ("wRepeatCount", wintypes.WORD),
-            ("wVirtualKeyCode", wintypes.WORD),
-            ("wVirtualScanCode", wintypes.WORD),
-            ("character", CharUnion),
-            ("dwControlKeyState", wintypes.DWORD),
-        ]
-
-    class EventUnion(ctypes.Union):
-        _fields_ = [("KeyEvent", KeyEvent), ("padding", ctypes.c_byte * 16)]
-
-    class InputRecord(ctypes.Structure):
-        _anonymous_ = ("event",)
-        _fields_ = [("EventType", wintypes.WORD), ("event", EventUnion)]
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
@@ -346,13 +348,6 @@ def _console_capture_worker_windows(process_id: int, snapshot_path: Path) -> int
         wintypes.HANDLE,
         ctypes.POINTER(ConsoleInfo),
     ]
-    kernel32.WriteConsoleInputW.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(InputRecord),
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-
     kernel32.FreeConsole()
     attached = False
     for _ in range(100):
@@ -366,9 +361,8 @@ def _console_capture_worker_windows(process_id: int, snapshot_path: Path) -> int
     access = 0x80000000 | 0x40000000
     sharing = 0x00000001 | 0x00000002
     output = kernel32.CreateFileW("CONOUT$", access, sharing, None, 3, 0, None)
-    input_handle = kernel32.CreateFileW("CONIN$", access, sharing, None, 3, 0, None)
     invalid_handle = ctypes.c_void_p(-1).value
-    if output == invalid_handle or input_handle == invalid_handle:
+    if output == invalid_handle:
         raise ctypes.WinError(ctypes.get_last_error())
 
     process_handle = kernel32.OpenProcess(0x00100000, False, process_id)
@@ -397,28 +391,12 @@ def _console_capture_worker_windows(process_id: int, snapshot_path: Path) -> int
             if text != last_text:
                 _write_console_snapshot(snapshot_path, text=text)
                 last_text = text
-            if re.sub(r"\s+", "", CONSOLE_CLOSE_PROMPT) in re.sub(r"\s+", "", text):
-                records = (InputRecord * 2)()
-                for index, key_down in enumerate((True, False)):
-                    records[index].EventType = 0x0001
-                    records[index].KeyEvent.bKeyDown = key_down
-                    records[index].KeyEvent.wRepeatCount = 1
-                    records[index].KeyEvent.wVirtualKeyCode = 0x0D
-                    records[index].KeyEvent.wVirtualScanCode = 0x1C
-                    records[index].KeyEvent.UnicodeChar = "\r"
-                written = wintypes.DWORD()
-                if not kernel32.WriteConsoleInputW(
-                    input_handle, records, len(records), ctypes.byref(written)
-                ):
-                    raise ctypes.WinError(ctypes.get_last_error())
-                _write_console_snapshot(snapshot_path, text=text, done=True)
-                return 0
             if kernel32.WaitForSingleObject(process_handle, 0) == 0:
                 _write_console_snapshot(snapshot_path, text=text, done=True)
                 return 0
-            time.sleep(0.2)
+            time.sleep(0.05)
     finally:
-        for handle in (process_handle, input_handle, output):
+        for handle in (process_handle, output):
             kernel32.CloseHandle(handle)
 
 
@@ -463,6 +441,7 @@ def run_process(
     console_snapshot: Path | None = None
     console_helper: subprocess.Popen[str] | None = None
     console_text = ""
+    console_history: list[str] = []
     console_revision = 0
     console_done = False
     if capture_console:
@@ -511,6 +490,7 @@ def run_process(
             raise RuntimeError(f"官方工具控制台捕获失败：{error}")
         current = str(payload.get("text", ""))
         for line in _console_delta(console_text, current):
+            console_history.append(line)
             _emit_log(detail, f"process.console pid={process.pid} {line}")
         console_text = current
         console_done = bool(payload.get("done", False))
@@ -588,7 +568,21 @@ def run_process(
     stderr = "\n".join(captured["stderr"])
     if console_helper and console_helper.returncode not in (None, 0):
         raise RuntimeError(f"官方工具控制台捕获进程异常退出：{console_helper.returncode}")
-    result = ToolResult(command, process.returncode or 0, stdout, stderr, time.monotonic() - started)
+    result = ToolResult(
+        command,
+        process.returncode or 0,
+        stdout,
+        stderr,
+        time.monotonic() - started,
+        console_text,
+        console_history,
+    )
+    if console_text:
+        _emit_log(
+            detail,
+            f"process.console.final pid={process.pid} text="
+            + json.dumps(console_text, ensure_ascii=False),
+        )
     _emit_log(
         detail,
         f"process.exit pid={process.pid} code={result.return_code} duration={result.duration_seconds:.3f}s "
@@ -709,6 +703,8 @@ class OfficialToolRunner:
     def __init__(self, executable: str | Path, scope: ImportScope):
         self.executable = Path(executable)
         self.scope = scope
+        self.diagnostics: list[dict[str, str]] = []
+        self.console_outputs: list[dict[str, str]] = []
 
     def run(
         self,
@@ -734,8 +730,7 @@ class OfficialToolRunner:
         if language_index is not None:
             command.append(str(language_index))
         command.extend(["-gamedata", str(root) + os.sep, "-mes_lang", "EN"])
-        command.append("-wait")
-        return run_process(
+        result = run_process(
             command,
             cwd=self.executable.parent,
             cancel_event=cancel_event,
@@ -744,6 +739,21 @@ class OfficialToolRunner:
             hide_window=True,
             capture_console=True,
         )
+        self.console_outputs.append(
+            {
+                "mode": mode,
+                "timeline": "\n".join(result.console_history),
+                "final": result.console_output,
+            }
+        )
+        for diagnostic in parse_official_diagnostics(result.console_output):
+            diagnostic["mode"] = mode
+            self.diagnostics.append(diagnostic)
+            _emit_log(
+                diagnostic_log,
+                "official.diagnostic " + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True),
+            )
+        return result
 
     def extract(self, game_root: str | Path, **kwargs) -> Path:
         existing = Path(game_root) / SUPPORT_DIR / WORKBOOK_NAME
@@ -759,6 +769,8 @@ class OfficialToolRunner:
         return locate_workbook(game_root)
 
     def translate(self, game_root: str | Path, **kwargs) -> Path:
+        self.diagnostics.clear()
+        self.console_outputs.clear()
         root = Path(game_root)
         for path in root.glob("Translated*_Chinese (Simplified)"):
             if path.is_dir():
@@ -1259,6 +1271,10 @@ def write_scoped_workbook(
     worksheet = workbook.active
     _header_row, headers = _header_map(worksheet)
     requirements = selected_translation_requirements(items, scope)
+    items_by_key = {item.key: item for item in items}
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
     missing_filenames: list[str] = []
     for row_index, values, ordinal in _iter_data_rows(worksheet):
         key = stable_key(values["code"], values["flag"], values["original"], ordinal)
@@ -1266,7 +1282,19 @@ def write_scoped_workbook(
         cell = worksheet.cell(row_index, headers["__target__"])
         required_categories = requirements.get(key, set())
         keep = bool(required_categories)
-        if category is ImportCategory.COPY or not keep:
+        if category is ImportCategory.COPY:
+            item = items_by_key.get(key)
+            if item is None:
+                raise ValueError(f"范围工作簿找不到 COPY-FROM 条目: {values['code']}")
+            source = _copy_source(item, by_code)
+            copy_enabled = (
+                source.key in requirements
+                and item.copy_category is not None
+                and scope.allows(item.copy_category)
+            )
+            cell.value = source.translation if copy_enabled and source.translation else item.original
+            continue
+        if not keep:
             cell.value = ""
             continue
         if ImportCategory.FILENAME in required_categories and cell.value:

@@ -347,3 +347,5 @@ class ToolResult:
     stdout: str = ""
     stderr: str = ""
     duration_seconds: float = 0.0
+    console_output: str = ""
+    console_history: list[str] = field(default_factory=list)

@@ -978,13 +978,16 @@ class MainWindow(QMainWindow):
         self._load_project_view()
 
     @staticmethod
-    def _update_stage_status(label: QLabel, status: StageStatus, detail: str = "") -> None:
+    def _update_stage_status(
+        label: QLabel, status: StageStatus, detail: str = "", warning_count: int = 0
+    ) -> None:
         display_status = {
             StageStatus.RUNNING: StageStatus.PENDING,
             StageStatus.CANCELLED: StageStatus.FAILED,
         }.get(status, status)
-        label.setText(STATUS_LABELS[display_status])
-        label.setProperty("state", display_status.value)
+        warning = display_status is StageStatus.COMPLETED and warning_count > 0
+        label.setText(f"已完成（{warning_count} 个警告）" if warning else STATUS_LABELS[display_status])
+        label.setProperty("state", "warning" if warning else display_status.value)
         label.setToolTip(detail)
         label.style().unpolish(label)
         label.style().polish(label)
@@ -1026,10 +1029,18 @@ class MainWindow(QMainWindow):
         for stage in STAGE_ORDER:
             record = manifest.version.stage(stage)
             skipped = record.artifacts.get("skipped") == "true"
-            detail = "已手动跳过" if skipped else record.error or next(iter(record.artifacts.values()), "")
+            warning_value = record.artifacts.get("official_warning_count", "0")
+            warning_count = int(warning_value) if warning_value.isdigit() else 0
+            detail = "已手动跳过" if skipped else record.error or record.artifacts.get(
+                "official_warnings", next(iter(record.artifacts.values()), "")
+            )
             easy_status = StageStatus.PENDING if skipped else record.status
-            self._update_stage_status(self.easy_stage_status[stage], easy_status, detail)
-            self._update_stage_status(self.step_status_labels[stage], record.status, detail)
+            self._update_stage_status(
+                self.easy_stage_status[stage], easy_status, detail, warning_count
+            )
+            self._update_stage_status(
+                self.step_status_labels[stage], record.status, detail, warning_count
+            )
             self.step_buttons[stage].setEnabled(not running)
             self.step_skip_buttons[stage].setEnabled(not running)
             if record.status in {StageStatus.FAILED, StageStatus.CANCELLED}:
@@ -1436,6 +1447,7 @@ QLabel#stageArrow { color: #8b9890; font-size: 18px; }
 QLabel#stageStatus { color: #6d776f; font-size: 12px; }
 QLabel#stageStatus[state="running"] { color: #1769aa; font-weight: 600; }
 QLabel#stageStatus[state="completed"] { color: #247047; font-weight: 600; }
+QLabel#stageStatus[state="warning"] { color: #a24625; font-weight: 600; }
 QLabel#stageStatus[state="failed"], QLabel#stageStatus[state="cancelled"] { color: #b14132; font-weight: 600; }
 QTabWidget::pane { border: 1px solid #d5ddd7; background: #ffffff; border-radius: 6px; }
 QTabBar::tab { background: transparent; padding: 9px 18px; color: #5b685f; }

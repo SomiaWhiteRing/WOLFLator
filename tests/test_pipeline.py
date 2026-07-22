@@ -6,7 +6,7 @@ from unittest import mock
 
 from models import STAGE_ORDER, AppSettings, ImportScope, RunMode, Stage, StageStatus, TranslationItem
 from pipeline import Pipeline, create_project, load_manifest
-from wolf_tools import dump_items, load_items
+from wolf_tools import dump_items, full_export_scope, load_items
 
 
 def make_game(root: Path) -> Path:
@@ -106,7 +106,7 @@ class PipelineTests(unittest.TestCase):
                     pipeline._translate()
             self.assertEqual(2, run.call_count)
 
-    def test_import_passes_the_selected_scope_to_the_official_runner(self):
+    def test_import_uses_the_same_full_structure_as_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pipeline = self._translation_pipeline(root)
@@ -121,15 +121,60 @@ class PipelineTests(unittest.TestCase):
             translated = root / "translated-game"
             runner = mock.Mock()
             runner.translate.return_value = translated
+            runner.diagnostics = []
+            runner.console_outputs = []
+            stale_diagnostics = pipeline.artifacts_dir / "official-diagnostics.json"
+            stale_diagnostics.parent.mkdir(parents=True, exist_ok=True)
+            stale_diagnostics.write_text("stale", encoding="utf-8")
 
             with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
                 "pipeline.write_scoped_workbook", return_value=scoped
             ):
                 artifacts = pipeline._import()
 
-            factory.assert_called_once_with(pipeline.manifest.import_scope)
+            factory.assert_called_once_with(full_export_scope())
             runner.translate.assert_called_once()
             self.assertEqual(str(translated), artifacts["translated_game"])
+            self.assertFalse(stale_diagnostics.exists())
+
+    def test_import_persists_official_warnings_and_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = self._translation_pipeline(root)
+            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1")]
+            items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
+            pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
+                "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
+                "items": str(items_path),
+            }
+            scoped = root / "import-scoped.xlsx"
+            scoped.write_bytes(b"xlsx")
+            runner = mock.Mock()
+            runner.translate.return_value = root / "translated-game"
+            runner.diagnostics = [
+                {
+                    "mode": "TRANSLATE",
+                    "code": "COMMON-1",
+                    "source": "normalized-source",
+                    "message": "warning",
+                }
+            ]
+            runner.console_outputs = [
+                {"mode": "TRANSLATE", "timeline": "earlier screen", "final": "raw screen"}
+            ]
+
+            with mock.patch.object(pipeline, "_official_runner", return_value=runner), mock.patch(
+                "pipeline.write_scoped_workbook", return_value=scoped
+            ):
+                artifacts = pipeline._import()
+
+            self.assertEqual("1", artifacts["official_warning_count"])
+            warnings = json.loads(Path(artifacts["official_warnings"]).read_text(encoding="utf-8"))
+            self.assertEqual(runner.diagnostics, warnings)
+            self.assertEqual("甲", warnings[0]["source"])
+            console = Path(artifacts["official_console"]).read_text(encoding="utf-8")
+            self.assertIn("earlier screen", console)
+            self.assertIn("raw screen", console)
 
     def test_manifest_rejects_missing_translation_scope(self):
         with tempfile.TemporaryDirectory() as directory:

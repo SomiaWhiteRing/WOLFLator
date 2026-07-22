@@ -746,13 +746,42 @@ class Pipeline:
         support = self.work_dir / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)
         shutil.copy2(scoped, support / WORKBOOK_NAME)
-        translated = self._official_runner(self.manifest.import_scope).translate(
+        runner = self._official_runner(full_export_scope())
+        translated = runner.translate(
             self.work_dir,
             cancel_event=self.cancel_event,
             log=self.log,
             diagnostic_log=self.detail,
         )
-        return {"scoped_workbook": str(scoped), "translated_game": str(translated)}
+        artifacts = {"scoped_workbook": str(scoped), "translated_game": str(translated)}
+        diagnostics = runner.diagnostics
+        originals_by_code: dict[str, set[str]] = {}
+        for item in items:
+            originals_by_code.setdefault(item.code, set()).add(item.original)
+        for diagnostic in diagnostics:
+            originals = originals_by_code.get(diagnostic["code"], set())
+            if len(originals) == 1:
+                diagnostic["source"] = next(iter(originals))
+        diagnostics_path = self.artifacts_dir / "official-diagnostics.json"
+        if diagnostics:
+            _atomic_json(diagnostics_path, diagnostics)
+            artifacts["official_warning_count"] = str(len(diagnostics))
+            artifacts["official_warnings"] = str(diagnostics_path)
+            self.log(f"官方工具完成，但报告了 {len(diagnostics)} 条警告；详情已保存。")
+        else:
+            diagnostics_path.unlink(missing_ok=True)
+        if runner.console_outputs:
+            console_path = self.artifacts_dir / "official-console.txt"
+            console_path.write_text(
+                "\n\n".join(
+                    f"===== {entry['mode']} TIMELINE =====\n{entry['timeline']}\n\n"
+                    f"===== {entry['mode']} FINAL SCREEN =====\n{entry['final']}"
+                    for entry in runner.console_outputs
+                ),
+                encoding="utf-8",
+            )
+            artifacts["official_console"] = str(console_path)
+        return artifacts
 
     def _release(self) -> dict[str, str]:
         translated = Path(self.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"])
