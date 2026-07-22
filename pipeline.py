@@ -47,6 +47,7 @@ from wolf_tools import (
     prepare_uberwolf,
     read_translation_items,
     reconcile_incremental,
+    retryable_translation_errors,
     selected_translation_items,
     selected_translation_requirements,
     to_paratranz,
@@ -575,6 +576,7 @@ class Pipeline:
         self.detail(
             f"translate.input extracted_rows={len(items)} translatable_rows={len(paratranz)} input={input_path}"
         )
+        retry_artifacts: dict[str, str] = {}
         if paratranz:
             runtime = require_managed_runtime(
                 self.settings.ainiee_source,
@@ -593,6 +595,91 @@ class Pipeline:
                 log=self.log,
                 diagnostic_log=self.detail,
             )
+            retry_errors = retryable_translation_errors(
+                items, raw, self.manifest.translation_scope
+            )
+            if retry_errors:
+                first_output_path = self.artifacts_dir / "ainiee-output-pass1.json"
+                retry_input_path = self.artifacts_dir / "ainiee-retry-input.json"
+                retry_reasons_path = self.artifacts_dir / "ainiee-retry-reasons.json"
+                retry_output_path = self.artifacts_dir / "ainiee-retry-output.json"
+                retry_report_path = self.artifacts_dir / "ainiee-retry-result.json"
+                _atomic_json(first_output_path, raw)
+                retry_input = [row for row in paratranz if str(row.get("key", "")) in retry_errors]
+                if len(retry_input) != len(retry_errors):
+                    raise RuntimeError("无法按失败键完整生成 AiNiee 重跑输入。")
+                selected_by_key = {
+                    item.key: item
+                    for item in selected_translation_items(items, self.manifest.translation_scope)
+                }
+                retry_reasons = [
+                    {
+                        "key": row["key"],
+                        "code": selected_by_key[str(row["key"])].code,
+                        "context": selected_by_key[str(row["key"])].context,
+                        "error": retry_errors[str(row["key"])],
+                    }
+                    for row in retry_input
+                ]
+                _atomic_json(retry_input_path, retry_input)
+                _atomic_json(retry_reasons_path, retry_reasons)
+                self.log(
+                    f"AiNiee 首轮有 {len(retry_input)} 条未通过 WOLFLator 校验，"
+                    f"新建会话定向重跑，最多 {self.settings.translation_rounds} 轮。"
+                )
+                self.detail(
+                    f"translate.retry.start rows={len(retry_input)} input={retry_input_path} "
+                    f"reasons={retry_reasons_path}"
+                )
+                retry_raw = run_translation(
+                    runtime,
+                    retry_input_path,
+                    self.artifacts_dir / "ainiee-retry-output",
+                    glossary,
+                    f"{self.manifest.project_id}-retry",
+                    self.settings,
+                    self.api_key,
+                    cancel_event=self.cancel_event,
+                    log=self.log,
+                    diagnostic_log=self.detail,
+                )
+                _atomic_json(retry_output_path, retry_raw)
+                retry_items = [selected_by_key[str(row["key"])] for row in retry_input]
+                remaining_errors = retryable_translation_errors(
+                    retry_items, retry_raw, self.manifest.translation_scope
+                )
+                retry_by_key = {str(row["key"]): row for row in retry_raw}
+                combined_by_key = {
+                    str(row["key"]): row
+                    for row in raw
+                    if str(row.get("key", "")) not in retry_errors
+                }
+                combined_by_key.update(retry_by_key)
+                raw = [
+                    combined_by_key[str(row["key"])]
+                    for row in paratranz
+                    if str(row["key"]) in combined_by_key
+                ]
+                _atomic_json(
+                    retry_report_path,
+                    {
+                        "first_pass_failed": len(retry_errors),
+                        "retry_output_rows": len(retry_raw),
+                        "remaining_failed": len(remaining_errors),
+                        "remaining_errors": remaining_errors,
+                    },
+                )
+                self.detail(
+                    f"translate.retry.complete output_rows={len(retry_raw)} "
+                    f"remaining={len(remaining_errors)} output={retry_output_path}"
+                )
+                retry_artifacts = {
+                    "ainiee_first_output": str(first_output_path),
+                    "ainiee_retry_input": str(retry_input_path),
+                    "ainiee_retry_reasons": str(retry_reasons_path),
+                    "ainiee_retry_output": str(retry_output_path),
+                    "ainiee_retry_result": str(retry_report_path),
+                }
         else:
             self.log("当前翻译范围没有需要交给 AiNiee 的文本。")
             raw = []
@@ -605,7 +692,12 @@ class Pipeline:
             f"translate.complete raw_rows={len(raw)} merged_rows={len(merged)} "
             f"translated_rows={translated_count} output={raw_path}"
         )
-        return {"ainiee_input": str(input_path), "ainiee_output": str(raw_path), "items": str(items_path)}
+        return {
+            "ainiee_input": str(input_path),
+            "ainiee_output": str(raw_path),
+            "items": str(items_path),
+            **retry_artifacts,
+        }
 
     def _validate(self) -> dict[str, str]:
         template = self.manifest.version.stage(Stage.EXTRACT).artifacts["workbook"]

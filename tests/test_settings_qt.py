@@ -48,10 +48,15 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual("", item.glossary_api_base_url)
             self.assertEqual("", item.glossary_api_model)
             self.assertEqual("", store.glossary_api_key(item))
-            self.assertEqual(120, item.glossary_api_timeout)
+            self.assertEqual(600, item.glossary_api_timeout)
             self.assertEqual(3, item.glossary_api_threads)
             self.assertEqual(500_000, item.glossary_chunk_chars)
             self.assertEqual(393_216, item.glossary_api_max_tokens)
+            self.assertEqual("token", item.translation_chunk_mode)
+            self.assertEqual(256, item.translation_token_limit)
+            self.assertEqual(8, item.translation_line_limit)
+            self.assertEqual(1, item.translation_retry_min_lines)
+            self.assertEqual(6, item.translation_rounds)
 
     def test_dialog_loads_separate_api_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -72,6 +77,11 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual("https://translate.example/v1", dialog.api_url.text())
             self.assertEqual("https://glossary.example/v1", dialog.glossary_api_url.text())
             self.assertEqual(12, dialog.api_threads.value())
+            self.assertTrue(dialog.translation_token_mode.isChecked())
+            self.assertEqual(256, dialog.translation_token_limit.value())
+            self.assertEqual(8, dialog.translation_line_limit.value())
+            self.assertEqual(1, dialog.translation_retry_min_lines.value())
+            self.assertEqual(6, dialog.translation_rounds.value())
             self.assertEqual(2, dialog.glossary_api_threads.value())
             self.assertEqual(456_789, dialog.glossary_chunk_chars.value())
             self.assertEqual(65_535, dialog.glossary_api_max_tokens.value())

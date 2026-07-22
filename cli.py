@@ -335,6 +335,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
     QCoreApplication.setApplicationName("WOLFLator")
     QCoreApplication.setOrganizationName("WOLFLator")
     parser = build_parser()

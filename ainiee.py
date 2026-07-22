@@ -700,6 +700,12 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "auto_set_output_path": False,
         "response_conversion_toggle": False,
         "auto_process_text_code_segment": True,
+        "tokens_limit_switch": settings.translation_chunk_mode == "token",
+        "tokens_limit": settings.translation_token_limit,
+        "lines_limit": settings.translation_line_limit,
+        "retry_split_min_lines": settings.translation_retry_min_lines,
+        "round_limit": settings.translation_rounds,
+        "enable_smart_round_limit": False,
     }
 
 
@@ -732,6 +738,68 @@ def _report_ainiee_logs(
         diagnostic_log(f"ainiee.session {line}")
 
 
+def _restore_excluded_rows(
+    input_rows: list[dict[str, object]],
+    translated: list[dict[str, object]],
+    output: Path,
+    diagnostic_log: Callable[[str], None] | None,
+) -> list[dict[str, object]]:
+    expected: dict[str, dict[str, object]] = {}
+    for row in input_rows:
+        key = str(row.get("key", ""))
+        if not key or key in expected:
+            raise ValueError(f"AiNiee 输入包含空键或重复键: {key!r}")
+        expected[key] = row
+    actual: set[str] = set()
+    for row in translated:
+        key = str(row.get("key", ""))
+        if not key or key in actual:
+            raise ValueError(f"AiNiee 输出包含空键或重复键: {key!r}")
+        actual.add(key)
+    missing = set(expected) - actual
+    if not missing:
+        return translated
+
+    cache_path = output / "cache" / "AinieeCacheData.json"
+    if not cache_path.is_file():
+        return translated
+    cache = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+    files = cache.get("files") if isinstance(cache, dict) else None
+    if not isinstance(files, dict):
+        raise ValueError("AiNiee 缓存缺少 files 对象。")
+
+    restored: dict[str, dict[str, object]] = {}
+    for file_data in files.values():
+        cache_items = file_data.get("items") if isinstance(file_data, dict) else None
+        if not isinstance(cache_items, list):
+            raise ValueError("AiNiee 缓存文件缺少 items 数组。")
+        for cache_item in cache_items:
+            if not isinstance(cache_item, dict) or cache_item.get("translation_status") != 7:
+                continue
+            extra = cache_item.get("extra")
+            key = str(extra.get("key", "")) if isinstance(extra, dict) else ""
+            if key not in missing:
+                continue
+            source = str(cache_item.get("source_text", ""))
+            original = str(expected[key].get("original", ""))
+            if source != original:
+                raise ValueError(f"AiNiee 排除项与输入原文不一致: {key}")
+            if key in restored:
+                raise ValueError(f"AiNiee 缓存包含重复排除键: {key}")
+            restored[key] = {
+                **expected[key],
+                "translation": original,
+                "stage": 1,
+                "wolflator_excluded": True,
+            }
+    if diagnostic_log:
+        diagnostic_log(
+            f"ainiee.translate.excluded restored={len(restored)} "
+            f"unresolved={len(missing - set(restored))}"
+        )
+    return translated + list(restored.values())
+
+
 def run_translation(
     runtime: str | Path,
     input_json: str | Path,
@@ -756,32 +824,42 @@ def run_translation(
         diagnostic_log(
             f"ainiee.translate.start runtime={root} input={Path(input_json).resolve()} "
             f"input_bytes={Path(input_json).stat().st_size} output={output.resolve()} "
-            f"profile={SESSION_PROFILE} rules_profile={rules_name}"
+            f"profile={SESSION_PROFILE} rules_profile={rules_name} "
+            f"chunk_mode={settings.translation_chunk_mode} "
+            f"chunk_limit={settings.translation_token_limit if settings.translation_chunk_mode == 'token' else settings.translation_line_limit} "
+            f"rounds={settings.translation_rounds}"
         )
     child_env = os.environ.copy()
     child_env["PYTHONUTF8"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
     with _active_session_profile(root, _session_profile(settings, api_key), rules_name, managed_rules):
         try:
+            command = [
+                str(locate_uv()),
+                "run",
+                "--frozen",
+                "--no-sync",
+                "ainiee_cli.py",
+                "translate",
+                str(Path(input_json).resolve()),
+                "-o",
+                str(output.resolve()),
+                "-s",
+                "Japanese",
+                "-t",
+                "Chinese",
+                "--type",
+                "Paratranz",
+                "--rounds",
+                str(settings.translation_rounds),
+                "--yes",
+            ]
+            if settings.translation_chunk_mode == "token":
+                command.extend(["--tokens", str(settings.translation_token_limit)])
+            else:
+                command.extend(["--lines", str(settings.translation_line_limit)])
             run_process(
-                [
-                    str(locate_uv()),
-                    "run",
-                    "--frozen",
-                    "--no-sync",
-                    "ainiee_cli.py",
-                    "translate",
-                    str(Path(input_json).resolve()),
-                    "-o",
-                    str(output.resolve()),
-                    "-s",
-                    "Japanese",
-                    "-t",
-                    "Chinese",
-                    "--type",
-                    "Paratranz",
-                    "--yes",
-                ],
+                command,
                 cwd=root,
                 timeout=24 * 3600,
                 cancel_event=cancel_event,
@@ -804,6 +882,10 @@ def run_translation(
         data = json.loads(result_path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
             raise ValueError("AiNiee 输出不是 Paratranz 对象数组。")
+        input_rows = json.loads(Path(input_json).read_text(encoding="utf-8-sig"))
+        if not isinstance(input_rows, list) or not all(isinstance(row, dict) for row in input_rows):
+            raise ValueError("AiNiee 输入不是 Paratranz 对象数组。")
+        data = _restore_excluded_rows(input_rows, data, output, diagnostic_log)
         if diagnostic_log:
             diagnostic_log(f"ainiee.translate.complete rows={len(data)}")
         return data

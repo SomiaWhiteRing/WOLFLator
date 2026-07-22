@@ -2,9 +2,11 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest import mock
 
-from models import STAGE_ORDER, AppSettings, ImportScope, RunMode, Stage, StageStatus
+from models import STAGE_ORDER, AppSettings, ImportScope, RunMode, Stage, StageStatus, TranslationItem
 from pipeline import Pipeline, create_project, load_manifest
+from wolf_tools import dump_items, load_items
 
 
 def make_game(root: Path) -> Path:
@@ -34,6 +36,76 @@ class FailingPipeline(FakePipeline):
 
 
 class PipelineTests(unittest.TestCase):
+    def _translation_pipeline(self, root: Path) -> Pipeline:
+        manifest_path = create_project(root / "projects", make_game(root / "game"))
+        pipeline = Pipeline(
+            manifest_path,
+            AppSettings(translation_rounds=6),
+            "secret",
+            root / "cache",
+            glossary_api_key="",
+        )
+        items = [
+            TranslationItem(key="plain", original="甲", code="COMMON-1"),
+            TranslationItem(
+                key="control",
+                original=r"\C[1]乙",
+                code="COMMON-2",
+                control_signature=[r"\C[1]"],
+            ),
+        ]
+        items_path = dump_items(pipeline.artifacts_dir / "items-extracted.json", items)
+        pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
+        (pipeline.project_dir / "glossary.json").write_text("{}", encoding="utf-8")
+        return pipeline
+
+    def test_translation_retries_only_failed_rows_in_one_fresh_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = self._translation_pipeline(root)
+            calls = []
+
+            def fake_translation(_runtime, input_json, output_dir, *_args, **_kwargs):
+                rows = json.loads(Path(input_json).read_text(encoding="utf-8"))
+                calls.append((rows, Path(output_dir)))
+                if len(calls) == 1:
+                    return [{**rows[0], "translation": "译文甲", "stage": 1}]
+                self.assertEqual(["control"], [row["key"] for row in rows])
+                return [
+                    {
+                        **rows[0],
+                        "translation": chr(0xE100) + "译文乙",
+                        "stage": 1,
+                    }
+                ]
+
+            with mock.patch("pipeline.require_managed_runtime", return_value=root / "runtime"), mock.patch(
+                "pipeline.run_translation", side_effect=fake_translation
+            ):
+                artifacts = pipeline._translate()
+
+            self.assertEqual(2, len(calls))
+            self.assertEqual("ainiee-output", calls[0][1].name)
+            self.assertEqual("ainiee-retry-output", calls[1][1].name)
+            merged = load_items(artifacts["items"])
+            self.assertEqual(["译文甲", r"\C[1]译文乙"], [item.translation for item in merged])
+            retry_input = json.loads(Path(artifacts["ainiee_retry_input"]).read_text(encoding="utf-8"))
+            self.assertEqual(["control"], [row["key"] for row in retry_input])
+            report = json.loads(Path(artifacts["ainiee_retry_result"]).read_text(encoding="utf-8"))
+            self.assertEqual(1, report["first_pass_failed"])
+            self.assertEqual(0, report["remaining_failed"])
+
+    def test_translation_stops_after_one_failed_only_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = self._translation_pipeline(root)
+            with mock.patch("pipeline.require_managed_runtime", return_value=root / "runtime"), mock.patch(
+                "pipeline.run_translation", return_value=[]
+            ) as run:
+                with self.assertRaisesRegex(ValueError, "missing=2"):
+                    pipeline._translate()
+            self.assertEqual(2, run.call_count)
+
     def test_manifest_rejects_missing_translation_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

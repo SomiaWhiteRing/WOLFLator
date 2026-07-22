@@ -34,6 +34,7 @@ from wolf_tools import (
     read_translation_items,
     reconcile_incremental,
     restore_control_tokens,
+    retryable_translation_errors,
     run_process,
     to_paratranz,
     write_full_workbook,
@@ -118,6 +119,48 @@ class WorkbookTests(unittest.TestCase):
             merged = merge_ainiee_output(items, translated, ImportScope())
             self.assertEqual("", merged[1].translation)
             self.assertEqual("", merged[2].translation)
+
+    def test_explicit_ainiee_exclusion_is_restored_without_becoming_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
+            payload = to_paratranz(items, ImportScope())
+            translated = [
+                {
+                    **row,
+                    "translation": row["original"] if index == 0 else "译文",
+                    "stage": 1,
+                    **({"wolflator_excluded": True} if index == 0 else {}),
+                }
+                for index, row in enumerate(payload)
+            ]
+            merged = merge_ainiee_output(items, translated, ImportScope())
+            self.assertEqual(items[0].original, merged[0].translation)
+
+            translated[0]["translation"] = "被篡改"
+            with self.assertRaisesRegex(ValueError, "不能安全原样回填"):
+                merge_ainiee_output(items, translated, ImportScope())
+
+    def test_control_failure_identifies_the_wolf_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
+            payload = to_paratranz(items, ImportScope())
+            translated = [{**row, "translation": "译文", "stage": 1} for row in payload]
+            with self.assertRaisesRegex(ValueError, "COMMON-1.*占位序列"):
+                merge_ainiee_output(items, translated, ImportScope())
+
+    def test_retryable_errors_include_only_missing_empty_and_invalid_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
+            payload = to_paratranz(items, ImportScope())
+            translated = [
+                {**payload[0], "translation": "缺少控制符", "stage": 1},
+                {**payload[1], "translation": "", "stage": 0},
+            ]
+            errors = retryable_translation_errors(items, translated, ImportScope())
+            self.assertEqual({row["key"] for row in payload}, set(errors))
+            self.assertIn("控制符", errors[payload[0]["key"]])
+            self.assertIn("没有生成译文", errors[payload[1]["key"]])
+            self.assertIn("缺少输出", errors[payload[2]["key"]])
 
     def test_official_config_exports_all_and_fonts_use_managed_defaults(self):
         config = _official_config_text(full_export_scope())
@@ -374,6 +417,17 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(0, result.return_code)
         self.assertTrue(any(r"\ufffd" in message for message in messages))
 
+    def test_detached_console_cannot_invalidate_completed_process(self):
+        def detached_console(_message: str) -> None:
+            raise OSError(22, "invalid console handle")
+
+        result = run_process(
+            [sys.executable, "-c", "print('completed')"],
+            timeout=10,
+            log=detached_console,
+        )
+        self.assertEqual(0, result.return_code)
+
 
 class AiNieeTests(unittest.TestCase):
     def make_runtime(self, root: Path) -> Path:
@@ -520,8 +574,52 @@ class AiNieeTests(unittest.TestCase):
         self.assertFalse(profile["auto_set_output_path"])
         self.assertFalse(profile["response_conversion_toggle"])
         self.assertTrue(profile["auto_process_text_code_segment"])
+        self.assertTrue(profile["tokens_limit_switch"])
+        self.assertEqual(256, profile["tokens_limit"])
+        self.assertEqual(8, profile["lines_limit"])
+        self.assertEqual(1, profile["retry_split_min_lines"])
+        self.assertEqual(6, profile["round_limit"])
+        self.assertFalse(profile["enable_smart_round_limit"])
         self.assertFalse(platform["think_switch"])
         self.assertEqual("deepseek-v4-flash", platform["model"])
+
+    def test_only_verified_ainiee_exclusions_are_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            cache = output / "cache"
+            cache.mkdir()
+            input_rows = [{"key": "k", "original": "x", "translation": "", "stage": 0}]
+            cache_data = {
+                "files": {
+                    "input.json": {
+                        "items": [
+                            {
+                                "source_text": "x",
+                                "translation_status": 7,
+                                "extra": {"key": "k"},
+                            }
+                        ]
+                    }
+                }
+            }
+            (cache / "AinieeCacheData.json").write_text(
+                json.dumps(cache_data, ensure_ascii=False), encoding="utf-8"
+            )
+            diagnostics = []
+            restored = ainiee._restore_excluded_rows(input_rows, [], output, diagnostics.append)
+            self.assertEqual("x", restored[0]["translation"])
+            self.assertTrue(restored[0]["wolflator_excluded"])
+            self.assertIn("restored=1 unresolved=0", diagnostics[0])
+
+            cache_data["files"]["input.json"]["items"][0]["source_text"] = "changed"
+            (cache / "AinieeCacheData.json").write_text(
+                json.dumps(cache_data, ensure_ascii=False), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "原文不一致"):
+                ainiee._restore_excluded_rows(input_rows, [], output, None)
+
+            with self.assertRaisesRegex(ValueError, "重复键"):
+                ainiee._restore_excluded_rows(input_rows * 2, [], output, None)
 
     def test_empty_dictionary_still_enables_control_protection(self):
         rules = ainiee._rules_with_control_protection(
@@ -840,6 +938,9 @@ class AiNieeTests(unittest.TestCase):
             def fake_process(command, *, cwd, **_kwargs):
                 self.assertNotIn("-p", command)
                 self.assertNotIn("--rules-profile", command)
+                self.assertEqual("6", command[command.index("--rounds") + 1])
+                self.assertEqual("256", command[command.index("--tokens") + 1])
+                self.assertNotIn("--lines", command)
                 self.assertEqual("1", _kwargs["env"]["PYTHONUTF8"])
                 self.assertEqual("utf-8", _kwargs["env"]["PYTHONIOENCODING"])
                 active = json.loads(config_path.read_text(encoding="utf-8"))
@@ -852,6 +953,10 @@ class AiNieeTests(unittest.TestCase):
                     (runtime / "Resource" / "rules_profiles" / "WOLFLator_project.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual("secret", profile["platforms"]["deepseek"]["api_key"])
+                self.assertTrue(profile["tokens_limit_switch"])
+                self.assertEqual(256, profile["tokens_limit"])
+                self.assertEqual(6, profile["round_limit"])
+                self.assertFalse(profile["enable_smart_round_limit"])
                 self.assertEqual([], rules["prompt_dictionary_data"])
                 self.assertTrue(rules["prompt_dictionary_switch"])
                 self.assertTrue(rules["exclusion_list_switch"])

@@ -89,10 +89,15 @@ class AppSettings:
     api_threads: int = 3
     api_rpm: int = 60
     api_tpm: int = 100_000
+    translation_chunk_mode: str = "token"
+    translation_token_limit: int = 256
+    translation_line_limit: int = 8
+    translation_retry_min_lines: int = 1
+    translation_rounds: int = 6
     glossary_api_base_url: str = ""
     glossary_api_model: str = ""
     glossary_api_key_blob: str = ""
-    glossary_api_timeout: int = 120
+    glossary_api_timeout: int = 600
     glossary_api_threads: int = 3
     glossary_chunk_chars: int = 500_000
     glossary_api_max_tokens: int = 393_216

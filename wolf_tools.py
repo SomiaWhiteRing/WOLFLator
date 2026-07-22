@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -117,7 +118,15 @@ def _emit_log(sink: Callable[[str], None] | None, message: str) -> None:
         sink(message)
     except UnicodeEncodeError:
         # ponytail: Preserve process execution on narrow consoles; UTF-8 file sinks keep the original text.
-        sink(message.encode("ascii", errors="backslashreplace").decode("ascii"))
+        try:
+            sink(message.encode("ascii", errors="backslashreplace").decode("ascii"))
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.EPIPE}:
+                raise
+    except OSError as exc:
+        # A detached CLI console must not turn a completed external process into a failed pipeline stage.
+        if exc.errno not in {errno.EINVAL, errno.EPIPE}:
+            raise
 
 
 def run_process(
@@ -700,27 +709,71 @@ def to_paratranz(
     return output
 
 
-def merge_ainiee_output(
-    items: list[TranslationItem],
+def _index_ainiee_rows(
     translated: list[dict[str, object]],
-    scope: ImportScope,
-) -> list[TranslationItem]:
-    expected = {item.key: item for item in selected_translation_items(items, scope)}
+) -> dict[str, dict[str, object]]:
     actual: dict[str, dict[str, object]] = {}
     for row in translated:
         key = str(row.get("key", ""))
         if not key or key in actual:
             raise ValueError(f"AiNiee 输出包含空键或重复键: {key!r}")
         actual[key] = row
+    return actual
+
+
+def _validated_ainiee_translation(
+    item: TranslationItem,
+    row: dict[str, object],
+) -> str:
+    if row.get("wolflator_excluded") is True:
+        protected, tokens = protect_control_tokens(item.original)
+        if str(row.get("translation", "")) != protected or tokens != item.control_signature:
+            raise ValueError(f"AiNiee 排除项不能安全原样回填: {item.code}")
+        return item.original
+    raw = str(row.get("translation", ""))
+    if not raw.strip():
+        raise ValueError(f"AiNiee 没有生成译文: {item.code} / {item.original[:80]}")
+    try:
+        return restore_control_tokens(raw, item.control_signature)
+    except ValueError as exc:
+        raise ValueError(f"AiNiee 译文控制符校验失败: {item.code}: {exc}") from exc
+
+
+def retryable_translation_errors(
+    items: list[TranslationItem],
+    translated: list[dict[str, object]],
+    scope: ImportScope,
+) -> dict[str, str]:
+    expected = {item.key: item for item in selected_translation_items(items, scope)}
+    actual = _index_ainiee_rows(translated)
+    extra = set(actual) - set(expected)
+    if extra:
+        raise ValueError(f"AiNiee 输出包含不属于当前输入的键: extra={len(extra)}")
+    errors: dict[str, str] = {}
+    for key, item in expected.items():
+        if key not in actual:
+            errors[key] = f"AiNiee 缺少输出: {item.code}"
+            continue
+        try:
+            _validated_ainiee_translation(item, actual[key])
+        except ValueError as exc:
+            errors[key] = str(exc)
+    return errors
+
+
+def merge_ainiee_output(
+    items: list[TranslationItem],
+    translated: list[dict[str, object]],
+    scope: ImportScope,
+) -> list[TranslationItem]:
+    expected = {item.key: item for item in selected_translation_items(items, scope)}
+    actual = _index_ainiee_rows(translated)
     missing = set(expected) - set(actual)
     extra = set(actual) - set(expected)
     if missing or extra:
         raise ValueError(f"AiNiee 输出键集合不一致: missing={len(missing)}, extra={len(extra)}")
     for key, item in expected.items():
-        raw = str(actual[key].get("translation", ""))
-        if not raw.strip():
-            raise ValueError(f"AiNiee 没有生成译文: {item.code} / {item.original[:80]}")
-        item.translation = restore_control_tokens(raw, item.control_signature)
+        item.translation = _validated_ainiee_translation(item, actual[key])
         item.stage = 1
     for item in items:
         if item.category is ImportCategory.COPY:

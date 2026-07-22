@@ -176,6 +176,16 @@ def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
                 key = ""
             if not key:
                 errors.append(f"请填写{label} API 密钥。")
+    if item.translation_chunk_mode not in {"token", "line"}:
+        errors.append("翻译分块模式必须是 Token 或条目。")
+    if not 64 <= item.translation_token_limit <= 8192:
+        errors.append("翻译 Token 分块必须在 64 到 8192 之间。")
+    if not 1 <= item.translation_line_limit <= 100:
+        errors.append("每批翻译条目必须在 1 到 100 之间。")
+    if not 1 <= item.translation_retry_min_lines <= item.translation_line_limit:
+        errors.append("重试最小批次必须在 1 到每批翻译条目之间。")
+    if not 1 <= item.translation_rounds <= 20:
+        errors.append("翻译最大轮次必须在 1 到 20 之间。")
     if not item.license_accepted:
         errors.append("请确认 FreeGames 工具许可范围。")
     runner = Path(item.ascii_runner_dir)
