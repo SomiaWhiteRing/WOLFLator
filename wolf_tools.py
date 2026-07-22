@@ -1054,12 +1054,9 @@ def selected_translation_requirements(
     for key, categories in groups.items():
         if is_font_setting(sources[key]):
             continue
-        # ponytail: COPY-FROM cannot give duplicate uses different translations. Keep the
-        # whole group untouched until dangerous filename/half-width uses are explicitly enabled.
-        dangerous = {ImportCategory.FILENAME, ImportCategory.HALFWIDTH} & categories
-        if any(not scope.allows(category) for category in dangerous):
-            continue
-        if any(scope.allows(category) for category in categories):
+        # ponytail: COPY-FROM is one shared value in WOLF. Mixed-scope groups stay
+        # original; enable every category in the group to translate it atomically.
+        if all(scope.allows(category) for category in categories):
             requirements[key] = categories
     return requirements
 
@@ -1342,11 +1339,7 @@ def write_scoped_workbook(
             if item is None:
                 raise ValueError(f"范围工作簿找不到 COPY-FROM 条目: {values['code']}")
             source = _copy_source(item, by_code)
-            copy_enabled = (
-                source.key in requirements
-                and item.copy_category is not None
-                and scope.allows(item.copy_category)
-            )
+            copy_enabled = source.key in requirements
             cell.value = source.translation if copy_enabled and source.translation else item.original
             continue
         if not keep:

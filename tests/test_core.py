@@ -341,7 +341,7 @@ class WorkbookAndFontTests(unittest.TestCase):
         self.assertIn("微软雅黑", families)
         self.assertIn(ord("中"), codepoints)
 
-    def test_copy_corpus_uses_the_final_imported_source_text(self):
+    def test_copy_corpus_keeps_mixed_scope_group_atomic(self):
         source = TranslationItem(
             key="source",
             original="原文",
@@ -358,8 +358,12 @@ class WorkbookAndFontTests(unittest.TestCase):
             copy_category=ImportCategory.OPTIONAL_NAME,
         )
         self.assertEqual(
-            ["最终译文", "最终译文"],
+            ["原文", "原文"],
             final_display_texts([source, copied], ImportScope()),
+        )
+        self.assertEqual(
+            ["最终译文", "最终译文"],
+            final_display_texts([source, copied], ImportScope(optional_name=True)),
         )
 
     def test_full_baseline_delta_and_cross_category_copy_are_scope_safe(self):
@@ -406,8 +410,7 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual(ImportCategory.OPTIONAL_NAME, items[2].category)
 
             payload = to_paratranz(items, ImportScope())
-            self.assertEqual(["攻撃力"], [row["original"] for row in payload])
-            merge_ainiee_output(items, [{**payload[0], "translation": "攻击力", "stage": 1}], ImportScope())
+            self.assertEqual([], payload)
             translated_full = write_full_workbook(full_path, root / "translated.xlsx", items)
             scoped = write_scoped_workbook(
                 translated_full,
@@ -417,13 +420,75 @@ class WorkbookAndFontTests(unittest.TestCase):
                 items,
             )
             output = load_workbook(scoped)
-            self.assertEqual("攻击力", output.active["G2"].value)
-            self.assertEqual("攻击力", output.active["G3"].value)
+            self.assertIsNone(output.active["G2"].value)
+            self.assertEqual("攻撃力", output.active["G3"].value)
             self.assertIsNone(output.active["G4"].value)
             self.assertIsNone(output.active["G5"].value)
             self.assertEqual("顔", output.active["G6"].value)
             self.assertIsNone(output.active["G7"].value)
             self.assertEqual("トイレ", output.active["G8"].value)
+
+    def test_database_name_and_all_copy_references_change_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["NAME-T-UDB-17", "", "UDB info", "Type name", "", "システム設定", ""])
+            sheet.append(
+                [
+                    "MAP-0-Ev014-Page1-72-2",
+                    "COPY-FROM-NAME-T-UDB-17",
+                    "Event",
+                    "Show Choice",
+                    "",
+                    "システム設定",
+                    "",
+                ]
+            )
+            sheet.append(
+                [
+                    "COMMON-48-87-1",
+                    "COPY-FROM-NAME-T-UDB-17",
+                    "Event",
+                    "DB Management",
+                    "",
+                    "システム設定",
+                    "",
+                ]
+            )
+            workbook.save(source_path)
+
+            items = read_translation_items(source_path)
+            items[1].copy_category = ImportCategory.DISPLAY
+            items[2].copy_category = ImportCategory.OPTIONAL_NAME
+            items[0].translation = "系统设置"
+            translated = write_full_workbook(source_path, root / "translated.xlsx", items)
+
+            default_scoped = write_scoped_workbook(
+                translated,
+                root / "default.xlsx",
+                ImportScope(),
+                root / "game",
+                items,
+            )
+            default_sheet = load_workbook(default_scoped).active
+            self.assertIsNone(default_sheet["G2"].value)
+            self.assertEqual("システム設定", default_sheet["G3"].value)
+            self.assertEqual("システム設定", default_sheet["G4"].value)
+
+            names_scoped = write_scoped_workbook(
+                translated,
+                root / "names.xlsx",
+                ImportScope(optional_name=True),
+                root / "game",
+                items,
+            )
+            names_sheet = load_workbook(names_scoped).active
+            self.assertEqual("系统设置", names_sheet["G2"].value)
+            self.assertEqual("系统设置", names_sheet["G3"].value)
+            self.assertEqual("系统设置", names_sheet["G4"].value)
 
     def test_merge_and_scoped_workbook_preserve_table(self):
         with tempfile.TemporaryDirectory() as directory:
