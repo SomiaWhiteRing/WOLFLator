@@ -10,7 +10,9 @@ import sys
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
+
+from safe_io import atomic_output_path, atomic_write_json, project_lock, read_text_with_retry
 
 
 FONT_CODES = ("BASICDATA-3", "BASICDATA-4", "BASICDATA-5", "BASICDATA-6")
@@ -144,7 +146,7 @@ def load_original_fonts(project_dir: str | Path, version_id: str) -> dict[str, o
     if not path.is_file():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise FontError(f"无法读取字体原始记录: {error}") from error
     return _validate_original_fonts(value, version_id)
@@ -157,32 +159,30 @@ def record_original_fonts(
     source_hash: str,
     workbook_path: str | Path,
 ) -> Path:
-    values = list(slots)
-    record = _validate_original_fonts(
-        {
-            "schema": ORIGINAL_FONTS_SCHEMA,
-            "version_id": version_id,
-            "source_hash": source_hash,
-            "workbook_sha256": _sha256_file(workbook_path),
-            "slots": values,
-        },
-        version_id,
-    )
-    path = original_fonts_path(project_dir, version_id)
-    existing = load_original_fonts(project_dir, version_id)
-    if existing is not None:
-        if existing["slots"] != record["slots"] or (
-            existing["source_hash"]
-            and record["source_hash"]
-            and existing["source_hash"] != record["source_hash"]
-        ):
-            raise FontError("同一源版本的原字体记录发生变化，请新建游戏版本")
+    with project_lock(project_dir, "record-original-fonts"):
+        values = list(slots)
+        record = _validate_original_fonts(
+            {
+                "schema": ORIGINAL_FONTS_SCHEMA,
+                "version_id": version_id,
+                "source_hash": source_hash,
+                "workbook_sha256": _sha256_file(workbook_path),
+                "slots": values,
+            },
+            version_id,
+        )
+        path = original_fonts_path(project_dir, version_id)
+        existing = load_original_fonts(project_dir, version_id)
+        if existing is not None:
+            if existing["slots"] != record["slots"] or (
+                existing["source_hash"]
+                and record["source_hash"]
+                and existing["source_hash"] != record["source_hash"]
+            ):
+                raise FontError("同一源版本的原字体记录发生变化，请新建游戏版本")
+            return path
+        atomic_write_json(path, record)
         return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-    return path
 
 
 def _safe_project_file(project_dir: Path, relative: str) -> Path:
@@ -301,7 +301,7 @@ def load_font_scheme(project_dir: str | Path, *, check_files: bool = True) -> di
     if not path.is_file():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise FontError(f"无法读取字体方案: {error}") from error
     return validate_font_scheme(project_dir, value, check_files=check_files)
@@ -309,12 +309,11 @@ def load_font_scheme(project_dir: str | Path, *, check_files: bool = True) -> di
 
 def save_font_scheme(project_dir: str | Path, value: object) -> Path:
     root = Path(project_dir)
-    scheme = validate_font_scheme(root, value, check_files=True)
-    path = font_scheme_path(root)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(scheme, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-    return path
+    with project_lock(root, "save-font-scheme"):
+        scheme = validate_font_scheme(root, value, check_files=True)
+        path = font_scheme_path(root)
+        atomic_write_json(path, scheme)
+        return path
 
 
 def scheme_hash(scheme: dict[str, object] | None) -> str:
@@ -365,6 +364,14 @@ def resolve_scheme_files(project_dir: str | Path, scheme: dict[str, object]) -> 
 
 
 def materialize_candidate(project_dir: str | Path, candidate: FontCandidate) -> dict[str, object]:
+    with project_lock(project_dir, "materialize-font"):
+        return _materialize_candidate_locked(project_dir, candidate)
+
+
+def _materialize_candidate_locked(
+    project_dir: str | Path,
+    candidate: FontCandidate,
+) -> dict[str, object]:
     if candidate.source not in {"bundled", "game", "system"} or not candidate.files:
         raise FontError("字体候选来源无效或没有字体文件")
     records: list[dict[str, str]] = []
@@ -390,9 +397,8 @@ def materialize_candidate(project_dir: str | Path, candidate: FontCandidate) -> 
             if destination.is_file() and _sha256_file(destination) != digest:
                 raise FontError(f"项目字体缓存冲突: {destination}")
             if not destination.exists():
-                temporary = destination.with_name(destination.name + ".tmp")
-                shutil.copy2(path, temporary)
-                os.replace(temporary, destination)
+                with atomic_output_path(destination) as temporary:
+                    shutil.copy2(path, temporary)
             records.append(
                 {
                     "kind": "project",
@@ -602,14 +608,25 @@ def font_file_info(path: str | Path) -> tuple[tuple[str, ...], frozenset[int]]:
     return _font_info_cached(str(target), stat.st_size, stat.st_mtime_ns)
 
 
-def _font_paths(root: Path | None, *, recursive: bool) -> list[Path]:
+def _font_paths(
+    root: Path | None,
+    *,
+    recursive: bool,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[Path]:
     if root is None or not root.is_dir():
         return []
     iterator = root.rglob("*") if recursive else root.iterdir()
-    return [path for path in iterator if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS]
+    result = []
+    for path in iterator:
+        if cancelled and cancelled():
+            raise InterruptedError("字体扫描已取消")
+        if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS:
+            result.append(path)
+    return result
 
 
-def _system_font_paths() -> list[Path]:
+def _system_font_paths(cancelled: Callable[[], bool] | None = None) -> list[Path]:
     if os.name != "nt":
         return []
     import winreg
@@ -627,6 +644,8 @@ def _system_font_paths() -> list[Path]:
         try:
             with winreg.OpenKey(hive, key_name) as key:
                 for index in range(winreg.QueryInfoKey(key)[1]):
+                    if cancelled and cancelled():
+                        raise InterruptedError("字体扫描已取消")
                     _name, value, _kind = winreg.EnumValue(key, index)
                     if not isinstance(value, str):
                         continue
@@ -639,22 +658,35 @@ def _system_font_paths() -> list[Path]:
                         if candidate.is_file():
                             paths.add(candidate.resolve())
                             break
+        except InterruptedError:
+            raise
         except OSError:
             continue
     return sorted(paths, key=lambda path: str(path).casefold())
 
 
-def discover_font_candidates(game_root: str | Path, required: Iterable[str]) -> list[FontCandidate]:
+def discover_font_candidates(
+    game_root: str | Path,
+    required: Iterable[str],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[FontCandidate]:
     game = Path(game_root)
     sources = (
         ("bundled", [bundled_font_path()]),
-        ("game", _font_paths(game, recursive=False) + _font_paths(game / "Data", recursive=True)),
-        ("system", _system_font_paths()),
+        (
+            "game",
+            _font_paths(game, recursive=False, cancelled=cancelled)
+            + _font_paths(game / "Data", recursive=True, cancelled=cancelled),
+        ),
+        ("system", _system_font_paths(cancelled)),
     )
     grouped: dict[tuple[str, str], dict[str, object]] = {}
     required_set = set(required)
     for source, paths in sources:
         for path in paths:
+            if cancelled and cancelled():
+                raise InterruptedError("字体扫描已取消")
             try:
                 families, codepoints = font_file_info(path)
             except (OSError, FontError):
@@ -672,6 +704,8 @@ def discover_font_candidates(game_root: str | Path, required: Iterable[str]) -> 
     order = {"bundled": 0, "game": 1, "system": 2}
     result = []
     for item in grouped.values():
+        if cancelled and cancelled():
+            raise InterruptedError("字体扫描已取消")
         missing = frozenset(character for character in required_set if ord(character) not in item["coverage"])
         result.append(
             FontCandidate(

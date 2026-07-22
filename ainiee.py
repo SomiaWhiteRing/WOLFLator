@@ -12,12 +12,19 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import count
 from pathlib import Path
 from typing import Callable, Iterable
 
 from models import AppSettings, ImportCategory, TranslationItem
+from safe_io import (
+    atomic_write_bytes,
+    atomic_write_json,
+    package_lock,
+    replace_with_retry,
+    runtime_lock,
+)
 from wolf_tools import CancelledError, run_process, sha256_file, verified_vendor_file
 
 
@@ -38,7 +45,6 @@ COMMON_PROMPT_ID = 100
 CONTROL_PLACEHOLDER_REGEX = r"[\uE100-\uF7FF]"
 REQUIRED_PATHS = ("ainiee_cli.py", "pyproject.toml", "uv.lock", "Resource")
 SOURCE_HASH_EXCLUDED = {".git", ".venv", "__pycache__", "output", "logs", "updatetemp"}
-_SESSION_CONFIG_LOCK = threading.Lock()
 RULE_DEFAULTS = {
     "pre_translation_data": [],
     "post_translation_data": [],
@@ -62,21 +68,11 @@ RULE_DEFAULTS = {
 
 
 def _atomic_json(path: str | Path, value: object) -> Path:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, output)
-    return output
+    return atomic_write_json(path, value)
 
 
 def _atomic_bytes(path: str | Path, value: bytes) -> Path:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    temporary.write_bytes(value)
-    os.replace(temporary, output)
-    return output
+    return atomic_write_bytes(path, value)
 
 
 def _check_cancel(cancel_event: threading.Event | None) -> None:
@@ -326,7 +322,7 @@ def _ensure_web_dist(
         target = web_root / "dist"
         if target.exists():
             shutil.rmtree(target)
-        os.replace(staged, target)
+        replace_with_retry(staged, target)
     finally:
         part.unlink(missing_ok=True)
         for path in (extracting, staged):
@@ -369,6 +365,24 @@ def install_supported_ainiee(
     cancel_event: threading.Event | None = None,
     progress: Callable[[int, int], None] | None = None,
     log: Callable[[str], None] | None = None,
+) -> Path:
+    with package_lock(packages_root, "install-ainiee"):
+        return _install_supported_ainiee_locked(
+            packages_root,
+            repair=repair,
+            cancel_event=cancel_event,
+            progress=progress,
+            log=log,
+        )
+
+
+def _install_supported_ainiee_locked(
+    packages_root: str | Path,
+    *,
+    repair: bool,
+    cancel_event: threading.Event | None,
+    progress: Callable[[int, int], None] | None,
+    log: Callable[[str], None] | None,
 ) -> Path:
     packages = Path(packages_root)
     packages.mkdir(parents=True, exist_ok=True)
@@ -420,7 +434,7 @@ def install_supported_ainiee(
         shutil.move(str(source_root), staged)
         if final.exists():
             shutil.rmtree(final)
-        os.replace(staged, final)
+        replace_with_retry(staged, final)
         if log:
             log(f"AiNiee 已安装到 {final}")
         return _validate_managed_package(final)
@@ -439,6 +453,16 @@ def create_managed_runtime(
     runtime_root: str | Path,
     *,
     refresh: bool = False,
+) -> Path:
+    with runtime_lock(runtime_root, "create-runtime"):
+        return _create_managed_runtime_locked(source, runtime_root, refresh=refresh)
+
+
+def _create_managed_runtime_locked(
+    source: str | Path,
+    runtime_root: str | Path,
+    *,
+    refresh: bool,
 ) -> Path:
     source_root = locate_ainiee_source(source)
     fingerprint = _runtime_fingerprint(source_root)
@@ -475,7 +499,7 @@ def create_managed_runtime(
     )
     if final.exists():
         shutil.rmtree(final)
-    os.replace(temporary, final)
+    replace_with_retry(temporary, final)
     return validate_ainiee_source(final)
 
 
@@ -502,6 +526,23 @@ def sync_runtime(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
 ) -> None:
+    root = Path(runtime).resolve()
+    with runtime_lock(root.parent, "sync-runtime"):
+        _sync_runtime_locked(
+            root,
+            force=force,
+            cancel_event=cancel_event,
+            log=log,
+        )
+
+
+def _sync_runtime_locked(
+    runtime: str | Path,
+    *,
+    force: bool,
+    cancel_event: threading.Event | None,
+    log: Callable[[str], None] | None,
+) -> None:
     root = validate_ainiee_source(runtime)
     lock_hash = sha256_file(root / "uv.lock")
     marker = root / ".uv-sync"
@@ -514,7 +555,7 @@ def sync_runtime(
         cancel_event=cancel_event,
         log=log,
     )
-    marker.write_text(lock_hash, encoding="ascii")
+    atomic_write_bytes(marker, lock_hash.encode("ascii"))
 
 
 def prepare_managed_runtime(
@@ -525,13 +566,40 @@ def prepare_managed_runtime(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
 ) -> Path:
-    runtime = create_managed_runtime(source, runtime_root, refresh=force_sync)
-    _ensure_web_dist(runtime, cancel_event=cancel_event, log=log)
-    sync_runtime(runtime, force=force_sync, cancel_event=cancel_event, log=log)
-    return runtime
+    source_root = locate_ainiee_source(source)
+    package_context = (
+        package_lock(source_root.parent, "prepare-runtime-source")
+        if (source_root / "wolflator-package.json").is_file()
+        else nullcontext()
+    )
+    with package_context:
+        with runtime_lock(runtime_root, "prepare-runtime"):
+            runtime = _create_managed_runtime_locked(
+                source_root,
+                runtime_root,
+                refresh=force_sync,
+            )
+            _ensure_web_dist(runtime, cancel_event=cancel_event, log=log)
+            _sync_runtime_locked(
+                runtime,
+                force=force_sync,
+                cancel_event=cancel_event,
+                log=log,
+            )
+            return runtime
 
 
 def remove_managed_ainiee(
+    source: str | Path,
+    packages_root: str | Path,
+    runtime_root: str | Path,
+) -> None:
+    with package_lock(packages_root, "remove-ainiee"):
+        with runtime_lock(runtime_root, "remove-ainiee"):
+            _remove_managed_ainiee_locked(source, packages_root, runtime_root)
+
+
+def _remove_managed_ainiee_locked(
     source: str | Path,
     packages_root: str | Path,
     runtime_root: str | Path,
@@ -617,7 +685,7 @@ def _active_session_profile(
     rules_name: str,
     rules: dict[str, object],
 ):
-    with _SESSION_CONFIG_LOCK:
+    with runtime_lock(root.parent, "session-profile"):
         profiles = root / "Resource" / "profiles"
         rules_profiles = root / "Resource" / "rules_profiles"
         config_path = root / "Resource" / "config.json"
@@ -812,6 +880,36 @@ def run_translation(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
     diagnostic_log: Callable[[str], None] | None = None,
+) -> list[dict[str, object]]:
+    root = Path(runtime).resolve()
+    # ponytail: AiNiee has one shared active profile; use per-session runtime copies if parallel translation is needed.
+    with runtime_lock(root.parent, "translate"):
+        return _run_translation_locked(
+            root,
+            input_json,
+            output_dir,
+            rules,
+            project_id,
+            settings,
+            api_key,
+            cancel_event=cancel_event,
+            log=log,
+            diagnostic_log=diagnostic_log,
+        )
+
+
+def _run_translation_locked(
+    runtime: str | Path,
+    input_json: str | Path,
+    output_dir: str | Path,
+    rules: dict[str, object],
+    project_id: str,
+    settings: AppSettings,
+    api_key: str,
+    *,
+    cancel_event: threading.Event | None,
+    log: Callable[[str], None] | None,
+    diagnostic_log: Callable[[str], None] | None,
 ) -> list[dict[str, object]]:
     root = validate_ainiee_source(runtime)
     rules_name = _rules_name(project_id)

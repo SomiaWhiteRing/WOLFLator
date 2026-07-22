@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QLabel
 
 from app import InstallThread, MainWindow, SettingsDialog
 from models import AppSettings, RunMode, Stage, StageStatus
-from pipeline import create_project, load_manifest
+from pipeline import PipelineStateEvent, create_project, load_manifest
 from settings import SettingsStore, protect_secret, unprotect_secret
 
 
@@ -199,6 +199,41 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertEqual(1, window.progress.maximum())
                 self.assertTrue(window.step_buttons[Stage.COPY].isEnabled())
                 self.assertTrue(window.retry_button.isEnabled())
+                window.close()
+
+    def test_running_ui_is_locked_and_progress_does_not_reload_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            projects = root / "projects"
+            manifest_path = create_project(projects, game)
+            store = SettingsStore(root / "settings.ini")
+            store.save(AppSettings(projects_root=str(projects), last_project=str(manifest_path)))
+            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
+                window = MainWindow()
+                window._set_pipeline_ui_locked(True)
+                self.assertFalse(window.settings_button.isEnabled())
+                self.assertFalse(window.project_combo.isEnabled())
+                self.assertFalse(window.new_project_button.isEnabled())
+                self.assertFalse(window.add_version_button.isEnabled())
+                self.assertFalse(window.one_click.isEnabled())
+                self.assertFalse(window.open_release_button.isEnabled())
+                self.assertTrue(window.stop_button.isEnabled())
+                self.assertFalse(window.tabs.isTabEnabled(1))
+                self.assertFalse(window.tabs.isTabEnabled(2))
+                self.assertFalse(window.tabs.isTabEnabled(3))
+
+                with patch.object(window, "_load_project_view") as reload_view:
+                    window._stage_progress(1, 8, Stage.COPY.value)
+                    reload_view.assert_not_called()
+                window._stage_state(
+                    PipelineStateEvent(Stage.COPY, StageStatus.COMPLETED, 1, 8, "已完成")
+                )
+                self.assertEqual("已完成", window.easy_stage_status[Stage.COPY].text())
+                window._set_pipeline_ui_locked(False)
                 window.close()
 
 

@@ -21,6 +21,13 @@ from openpyxl import load_workbook
 
 from fonts import FONT_CODES
 from models import ImportCategory, ImportScope, ToolResult, TranslationItem
+from safe_io import (
+    atomic_output_path,
+    atomic_write_bytes,
+    atomic_write_json,
+    read_text_with_retry,
+    replace_with_retry,
+)
 
 
 CODE_HEADER = "Code (No Change)"
@@ -264,20 +271,7 @@ def parse_official_diagnostics(text: str) -> list[dict[str, str]]:
 
 
 def _write_console_snapshot(path: Path, *, text: str = "", done: bool = False, error: str = "") -> None:
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps({"text": text, "done": done, "error": error}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    deadline = time.monotonic() + 1.0
-    while True:
-        try:
-            os.replace(temporary, path)
-            return
-        except PermissionError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.01)
+    atomic_write_json(path, {"text": text, "done": done, "error": error}, indent=None)
 
 
 def console_capture_worker(process_id: int, snapshot_path: str | Path) -> int:
@@ -557,8 +551,12 @@ def run_process(
         finally:
             if console_snapshot:
                 console_snapshot.unlink(missing_ok=True)
-                for temporary in console_snapshot.parent.glob(f"{console_snapshot.name}.*.tmp"):
-                    temporary.unlink(missing_ok=True)
+                for pattern in (
+                    f"{console_snapshot.name}.*.tmp",
+                    f".{console_snapshot.name}.*.tmp",
+                ):
+                    for temporary in console_snapshot.parent.glob(pattern):
+                        temporary.unlink(missing_ok=True)
     stdout = "\n".join(captured["stdout"])
     stderr = "\n".join(captured["stderr"])
     if console_helper and console_helper.returncode not in (None, 0):
@@ -602,7 +600,8 @@ def prepare_uberwolf(ascii_dir: str | Path) -> Path:
         raise FileNotFoundError("未找到 UberWolfCli.exe。开发环境请运行 scripts/fetch_vendor.ps1。")
     target = target_dir / "UberWolfCli.exe"
     if not target.exists() or sha256_file(target) != sha256_file(source):
-        shutil.copy2(source, target)
+        with atomic_output_path(target) as temporary:
+            shutil.copy2(source, temporary)
     return target
 
 
@@ -669,7 +668,7 @@ def write_official_game_config(game_root: str | Path, scope: ImportScope) -> Pat
     support = Path(game_root) / SUPPORT_DIR
     support.mkdir(parents=True, exist_ok=True)
     path = support / GAME_CONFIG_NAME
-    path.write_bytes(b"\xff\xfe" + _official_config_text(scope).encode("utf-16le"))
+    atomic_write_bytes(path, b"\xff\xfe" + _official_config_text(scope).encode("utf-16le"))
     return path
 
 
@@ -684,13 +683,13 @@ def prepare_official_tool(source_exe: str | Path, cache_root: str | Path) -> Pat
     target_exe = target_dir / source.name
     silent_executable = _silent_official_executable(source)
     if not target_exe.is_file() or target_exe.read_bytes() != silent_executable:
-        temporary = target_exe.with_name(target_exe.name + ".tmp")
-        temporary.write_bytes(silent_executable)
-        shutil.copystat(source, temporary)
-        os.replace(temporary, target_exe)
+        with atomic_output_path(target_exe) as temporary:
+            temporary.write_bytes(silent_executable)
+            shutil.copystat(source, temporary)
     target_lib = target_dir / lib.name
     if not target_lib.exists() or sha256_file(lib) != sha256_file(target_lib):
-        shutil.copy2(lib, target_lib)
+        with atomic_output_path(target_lib) as temporary:
+            shutil.copy2(lib, temporary)
     return target_exe
 
 
@@ -755,7 +754,7 @@ class OfficialToolRunner:
         if existing.is_file():
             backup = existing.with_suffix(".pre-extract.bak")
             backup.unlink(missing_ok=True)
-            os.replace(existing, backup)
+            replace_with_retry(existing, backup)
         self.run("EXTRACT", game_root, **kwargs)
         return locate_workbook(game_root)
 
@@ -1212,10 +1211,8 @@ def reconcile_incremental(
 
 def _save_workbook_atomic(workbook, output_path: str | Path) -> Path:
     output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    workbook.save(temporary)
-    os.replace(temporary, output)
+    with atomic_output_path(output) as temporary:
+        workbook.save(temporary)
     return output
 
 
@@ -1368,22 +1365,15 @@ def locate_translated_game(game_root: str | Path) -> Path:
 
 def dump_items(path: str | Path, items: list[TranslationItem]) -> Path:
     output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(output.name + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            {"schema": ITEMS_SCHEMA, "items": [item.to_dict() for item in items]},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    atomic_write_json(
+        output,
+        {"schema": ITEMS_SCHEMA, "items": [item.to_dict() for item in items]},
     )
-    os.replace(temporary, output)
     return output
 
 
 def load_items(path: str | Path) -> list[TranslationItem]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(read_text_with_retry(path, encoding="utf-8"))
     if not isinstance(data, dict) or set(data) != {"schema", "items"}:
         raise ValueError("翻译条目文件结构不匹配。")
     if data["schema"] != ITEMS_SCHEMA:

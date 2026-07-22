@@ -2,6 +2,7 @@ import io
 import json
 import signal
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -11,6 +12,7 @@ import cli
 from PySide6.QtCore import QCoreApplication
 from models import AppSettings
 from pipeline import create_project
+from safe_io import project_lock
 from wolf_tools import CancelledError
 
 
@@ -137,6 +139,40 @@ class CliTests(unittest.TestCase):
             ), redirect_stderr(errors):
                 self.assertEqual(1, cli.main(["run", str(manifest)]))
             self.assertIn("runtime missing", errors.getvalue())
+
+    def test_busy_project_status_works_and_mutation_returns_three(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = create_project(root / "projects", make_game(root / "game"))
+            entered = threading.Event()
+            release = threading.Event()
+
+            def holder():
+                with project_lock(manifest, "test-holder"):
+                    entered.set()
+                    release.wait(5)
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(0, cli.main(["status", str(manifest), "--json"]))
+                status = json.loads(output.getvalue())
+                self.assertTrue(status["busy"])
+                self.assertEqual("test-holder", status["lock"]["operation"])
+
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(
+                        3,
+                        cli.main(["run", str(manifest), "--stage", "copy"]),
+                    )
+                self.assertIn("test-holder", errors.getvalue())
+            finally:
+                release.set()
+                thread.join()
 
 
 if __name__ == "__main__":

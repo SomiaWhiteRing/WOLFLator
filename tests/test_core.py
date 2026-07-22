@@ -647,7 +647,7 @@ class ProcessTests(unittest.TestCase):
                     raise PermissionError(5, "sharing violation")
                 return real_replace(source, target)
 
-            with mock.patch("wolf_tools.os.replace", side_effect=flaky_replace):
+            with mock.patch("safe_io.os.replace", side_effect=flaky_replace):
                 _write_console_snapshot(path, text="captured")
             self.assertEqual(3, attempts)
             self.assertEqual("captured", json.loads(path.read_text(encoding="utf-8"))["text"])

@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -46,6 +48,7 @@ from models import (
     VersionManifest,
     utc_now,
 )
+from safe_io import atomic_write_json, project_lock, read_text_with_retry, replace_with_retry
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
@@ -81,10 +84,17 @@ EXPORT_SCHEMA = 2
 
 
 def _atomic_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    atomic_write_json(path, value)
+
+
+@dataclass(frozen=True)
+class PipelineStateEvent:
+    stage: Stage
+    status: StageStatus
+    current: int
+    total: int
+    detail: str = ""
+    warnings: int = 0
 
 
 def _slug(value: str) -> str:
@@ -123,7 +133,7 @@ def create_project(projects_root: str | Path, game_path: str | Path, name: str =
 
 
 def load_manifest(path: str | Path) -> ProjectManifest:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(read_text_with_retry(path, encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("项目清单根节点不是对象。")
     return ProjectManifest.from_dict(data)
@@ -131,19 +141,20 @@ def load_manifest(path: str | Path) -> ProjectManifest:
 
 def add_version(manifest_path: str | Path, game_path: str | Path) -> ProjectManifest:
     path = Path(manifest_path)
-    manifest = load_manifest(path)
-    game = _validate_game(game_path)
-    version_id = utc_now().replace(":", "").replace("+00:00", "Z")
-    counter = 2
-    base = version_id
-    while version_id in manifest.versions:
-        version_id = f"{base}-{counter}"
-        counter += 1
-    manifest.versions[version_id] = VersionManifest(version_id=version_id, original_path=str(game))
-    manifest.active_version = version_id
-    manifest.updated_at = utc_now()
-    _atomic_json(path, manifest.to_dict())
-    return manifest
+    with project_lock(path, "add-version"):
+        manifest = load_manifest(path)
+        game = _validate_game(game_path)
+        version_id = utc_now().replace(":", "").replace("+00:00", "Z")
+        counter = 2
+        base = version_id
+        while version_id in manifest.versions:
+            version_id = f"{base}-{counter}"
+            counter += 1
+        manifest.versions[version_id] = VersionManifest(version_id=version_id, original_path=str(game))
+        manifest.active_version = version_id
+        manifest.updated_at = utc_now()
+        _atomic_json(path, manifest.to_dict())
+        return manifest
 
 
 class Pipeline:
@@ -157,6 +168,7 @@ class Pipeline:
         glossary_api_key: str,
         log: Callable[[str], None] | None = None,
         progress: Callable[[int, int, Stage], None] | None = None,
+        state: Callable[[PipelineStateEvent], None] | None = None,
     ):
         self.manifest_path = Path(manifest_path).resolve()
         self.project_dir = self.manifest_path.parent
@@ -197,7 +209,10 @@ class Pipeline:
         }
         self.log_path: Path | None = None
         self.progress = progress or (lambda _current, _total, _stage: None)
+        self.state = state or (lambda _event: None)
         self.cancel_event = threading.Event()
+        self._project_lock_depth = 0
+        self._project_lock_owner: int | None = None
         self.manifest = load_manifest(self.manifest_path)
 
     @property
@@ -221,6 +236,8 @@ class Pipeline:
         return self.version_dir / "release"
 
     def save(self) -> None:
+        if self._project_lock_depth < 1 or self._project_lock_owner != threading.get_ident():
+            raise RuntimeError("保存项目清单前必须持有项目锁。")
         self.manifest.updated_at = utc_now()
         self.detail(f"manifest.save.start path={self.manifest_path}")
         try:
@@ -229,6 +246,46 @@ class Pipeline:
             self.detail("manifest.save.failed\n" + traceback.format_exc())
             raise
         self.detail("manifest.save.complete")
+        legacy_temporary = self.manifest_path.with_name("project.json.tmp")
+        if legacy_temporary.is_file():
+            try:
+                legacy_temporary.unlink(missing_ok=True)
+            except OSError as error:
+                self.detail(f"manifest.legacy_tmp.cleanup_failed path={legacy_temporary} error={error}")
+
+    @contextmanager
+    def _mutation(self, operation: str):
+        current_thread = threading.get_ident()
+        if self._project_lock_depth and self._project_lock_owner == current_thread:
+            yield
+            return
+        with project_lock(self.project_dir, operation):
+            self._project_lock_depth = 1
+            self._project_lock_owner = current_thread
+            self.manifest = load_manifest(self.manifest_path)
+            try:
+                yield
+            finally:
+                self._project_lock_depth = 0
+                self._project_lock_owner = None
+
+    def _emit_state(
+        self,
+        stage: Stage,
+        status: StageStatus,
+        current: int,
+        total: int,
+        detail: str = "",
+    ) -> None:
+        record = self.manifest.version.stage(stage)
+        warnings = sum(
+            int(value) if str(value).isdigit() else 0
+            for value in (
+                record.artifacts.get("official_warning_count", "0"),
+                record.artifacts.get("font_warning_count", "0"),
+            )
+        )
+        self.state(PipelineStateEvent(stage, status, current, total, detail, warnings))
 
     def set_log_sink(self, sink: Callable[[str], None]) -> None:
         self._log_sink = sink
@@ -306,35 +363,48 @@ class Pipeline:
         self.cancel_event.set()
 
     def set_run_mode(self, mode: RunMode) -> None:
-        self.manifest.run_mode = mode
-        self.save()
+        with self._mutation("set-run-mode"):
+            self.manifest.run_mode = mode
+            self.save()
 
     def set_import_scope(self, scope: ImportScope) -> None:
-        if self.manifest.import_scope == scope:
-            return
-        self.manifest.import_scope = scope
-        for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:
-            record = self.manifest.version.stage(stage)
-            record.status = StageStatus.PENDING
-            record.error = ""
-        self.save()
+        with self._mutation("set-import-scope"):
+            if self.manifest.import_scope == scope:
+                return
+            self.manifest.import_scope = scope
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:
+                record = self.manifest.version.stage(stage)
+                record.status = StageStatus.PENDING
+                record.error = ""
+            self.save()
 
     def set_translation_scope(self, scope: ImportScope) -> None:
-        if self.manifest.translation_scope == scope:
-            return
-        self.manifest.translation_scope = scope
-        for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]:
-            record = self.manifest.version.stage(stage)
-            record.status = StageStatus.PENDING
-            record.error = ""
-        self.save()
+        with self._mutation("set-translation-scope"):
+            if self.manifest.translation_scope == scope:
+                return
+            self.manifest.translation_scope = scope
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]:
+                record = self.manifest.version.stage(stage)
+                record.status = StageStatus.PENDING
+                record.error = ""
+            self.save()
 
     def set_font_scheme(self, scheme: dict[str, object]) -> None:
-        save_font_scheme(self.project_dir, scheme)
-        record = self.manifest.version.stage(Stage.RELEASE)
-        record.status = StageStatus.PENDING
-        record.error = ""
-        self.save()
+        with self._mutation("set-font-scheme"):
+            save_font_scheme(self.project_dir, scheme)
+            record = self.manifest.version.stage(Stage.RELEASE)
+            record.status = StageStatus.PENDING
+            record.error = ""
+            self.save()
+
+    def set_glossary(self, glossary: dict[str, object]) -> None:
+        with self._mutation("set-glossary"):
+            _atomic_json(self.project_dir / "glossary.json", glossary)
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.TRANSLATE):]:
+                record = self.manifest.version.stage(stage)
+                record.status = StageStatus.PENDING
+                record.error = ""
+            self.save()
 
     def _safe_remove(self, path: Path) -> None:
         resolved = path.resolve()
@@ -1043,7 +1113,7 @@ class Pipeline:
             support = generated / SUPPORT_DIR
             if support.exists():
                 shutil.rmtree(support)
-            os.replace(generated, temporary)
+            replace_with_retry(generated, temporary)
         finally:
             if font_base.exists():
                 self._safe_remove(font_base)
@@ -1090,13 +1160,21 @@ class Pipeline:
             shutil.copytree(translated, temporary)
         try:
             if self.release_dir.exists():
-                os.replace(self.release_dir, previous)
-            os.replace(temporary, self.release_dir)
+                replace_with_retry(self.release_dir, previous)
+            replace_with_retry(temporary, self.release_dir)
             if previous.exists():
                 self._safe_remove(previous)
-        except Exception:
+        except Exception as error:
             if not self.release_dir.exists() and previous.exists():
-                os.replace(previous, self.release_dir)
+                try:
+                    replace_with_retry(previous, self.release_dir)
+                except Exception as restore_error:
+                    raise RuntimeError(
+                        f"发布替换失败，旧发布目录保留在 {previous}，但无法恢复到 {self.release_dir}: "
+                        f"{restore_error}"
+                    ) from restore_error
+            if isinstance(error, PermissionError) or getattr(error, "winerror", None) in {5, 32}:
+                raise RuntimeError(f"发布目录正在使用，无法替换: {self.release_dir}") from error
             raise
         self._check_source_unchanged()
         self.detail(f"release.complete path={self.release_dir}")
@@ -1116,6 +1194,10 @@ class Pipeline:
         return functions[stage]()
 
     def run(self) -> str:
+        with self._mutation("one-click"):
+            return self._run_locked()
+
+    def _run_locked(self) -> str:
         self.cancel_event.clear()
         self._start_run_log("one-click")
         self._reset_skipped_for_one_click()
@@ -1131,6 +1213,7 @@ class Pipeline:
                 continue
             input_hash = self._stage_input_hash(stage)
             self._mark_running(stage, input_hash)
+            self._emit_state(stage, StageStatus.RUNNING, index - 1, len(STAGE_ORDER), "正在执行")
             self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 开始")
             started = time.monotonic()
             try:
@@ -1142,14 +1225,26 @@ class Pipeline:
                     + traceback.format_exc()
                 )
                 self._mark_failed(stage, exc)
+                self._emit_state(
+                    stage,
+                    self.manifest.version.stage(stage).status,
+                    index - 1,
+                    len(STAGE_ORDER),
+                    str(exc),
+                )
                 self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}")
                 raise
             self.progress(index, len(STAGE_ORDER), stage)
+            self._emit_state(stage, StageStatus.COMPLETED, index, len(STAGE_ORDER), "已完成")
             self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
             self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"
 
     def run_stage(self, stage: Stage) -> str:
+        with self._mutation(stage.value):
+            return self._run_stage_locked(stage)
+
+    def _run_stage_locked(self, stage: Stage) -> str:
         self.cancel_event.clear()
         self._start_run_log(stage.value)
         self._reset_downstream(stage)
@@ -1158,6 +1253,7 @@ class Pipeline:
             record.artifacts = {}
         input_hash = self._stage_input_hash(stage)
         self._mark_running(stage, input_hash)
+        self._emit_state(stage, StageStatus.RUNNING, 0, 1, "正在执行")
         self.progress(0, 0, stage)
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 开始")
         started = time.monotonic()
@@ -1170,38 +1266,42 @@ class Pipeline:
                 + traceback.format_exc()
             )
             self._mark_failed(stage, exc)
+            self._emit_state(stage, self.manifest.version.stage(stage).status, 0, 1, str(exc))
             self.log(
                 f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}"
             )
             raise
         self.progress(1, 1, stage)
+        self._emit_state(stage, StageStatus.COMPLETED, 1, 1, "已完成")
         self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"
 
     def skip_stage(self, stage: Stage) -> None:
-        self._start_run_log(f"{stage.value}-skip")
-        self._reset_downstream(stage)
-        record = self.manifest.version.stage(stage)
-        record.status = StageStatus.COMPLETED
-        record.started_at = ""
-        record.finished_at = utc_now()
-        record.input_hash = ""
-        record.error = ""
-        record.artifacts = {"skipped": "true"}
-        self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 已手动跳过")
-        self.save()
+        with self._mutation(f"{stage.value}-skip"):
+            self._start_run_log(f"{stage.value}-skip")
+            self._reset_downstream(stage)
+            record = self.manifest.version.stage(stage)
+            record.status = StageStatus.COMPLETED
+            record.started_at = ""
+            record.finished_at = utc_now()
+            record.input_hash = ""
+            record.error = ""
+            record.artifacts = {"skipped": "true"}
+            self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 已手动跳过")
+            self.save()
 
     def retry_failed(self) -> None:
-        found = False
-        for stage in STAGE_ORDER:
-            record = self.manifest.version.stage(stage)
-            if record.status in {StageStatus.FAILED, StageStatus.CANCELLED}:
-                found = True
-            if found and record.status is not StageStatus.COMPLETED:
-                record.status = StageStatus.PENDING
-                record.error = ""
-        self.save()
+        with self._mutation("retry-failed"):
+            found = False
+            for stage in STAGE_ORDER:
+                record = self.manifest.version.stage(stage)
+                if record.status in {StageStatus.FAILED, StageStatus.CANCELLED}:
+                    found = True
+                if found and record.status is not StageStatus.COMPLETED:
+                    record.status = StageStatus.PENDING
+                    record.error = ""
+            self.save()
 
     def last_release(self) -> Path | None:
         value = self.manifest.version.stage(Stage.RELEASE).artifacts.get("release")

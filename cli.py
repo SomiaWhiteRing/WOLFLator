@@ -19,6 +19,7 @@ from ainiee import (
 )
 from models import STAGE_ORDER, AppSettings, ImportScope, Stage
 from pipeline import Pipeline, add_version, create_project, load_manifest
+from safe_io import ResourceBusyError, project_lock, project_lock_status
 from settings import SettingsStore, local_data_dir, validate_settings
 from wolf_tools import CancelledError
 
@@ -101,6 +102,12 @@ def _pipeline(
 
 def _status(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
+    busy, owner = project_lock_status(args.manifest)
+    safe_owner = {
+        key: owner[key]
+        for key in ("pid", "operation", "started_at")
+        if key in owner
+    }
     version = manifest.version
     records = {
         stage.value: {
@@ -118,6 +125,8 @@ def _status(args: argparse.Namespace) -> int:
         "run_mode": manifest.run_mode.value,
         "translation_scope": manifest.translation_scope.__dict__,
         "import_scope": manifest.import_scope.__dict__,
+        "busy": busy,
+        "lock": safe_owner if busy else {},
         "stages": records,
     }
     if args.json:
@@ -125,6 +134,17 @@ def _status(args: argparse.Namespace) -> int:
     else:
         print(f"项目：{manifest.name} ({manifest.project_id})")
         print(f"版本：{manifest.active_version}")
+        if busy:
+            details = "，".join(
+                str(value)
+                for value in (
+                    f"PID {safe_owner['pid']}" if safe_owner.get("pid") else "",
+                    f"操作 {safe_owner['operation']}" if safe_owner.get("operation") else "",
+                    f"开始于 {safe_owner['started_at']}" if safe_owner.get("started_at") else "",
+                )
+                if value
+            )
+            print(f"占用：是（{details or '占用者信息不可用'}）")
         for stage in STAGE_ORDER:
             record = version.stage(stage)
             suffix = f"：{record.error}" if record.error else ""
@@ -252,21 +272,22 @@ def _retry(args: argparse.Namespace) -> int:
 
 
 def _scope(args: argparse.Namespace) -> int:
-    pipeline = _pipeline(args)
-    current = (
-        pipeline.manifest.translation_scope
-        if args.target == "translation"
-        else pipeline.manifest.import_scope
-    )
-    values = {
-        name: getattr(args, name) if getattr(args, name) is not None else getattr(current, name)
-        for name in ("display", "external", "optional_name", "halfwidth", "filename")
-    }
-    scope = ImportScope(**values)
-    if args.target == "translation":
-        pipeline.set_translation_scope(scope)
-    else:
-        pipeline.set_import_scope(scope)
+    with project_lock(args.manifest, f"set-{args.target}-scope"):
+        pipeline = _pipeline(args)
+        current = (
+            pipeline.manifest.translation_scope
+            if args.target == "translation"
+            else pipeline.manifest.import_scope
+        )
+        values = {
+            name: getattr(args, name) if getattr(args, name) is not None else getattr(current, name)
+            for name in ("display", "external", "optional_name", "halfwidth", "filename")
+        }
+        scope = ImportScope(**values)
+        if args.target == "translation":
+            pipeline.set_translation_scope(scope)
+        else:
+            pipeline.set_import_scope(scope)
     print(json.dumps({"target": args.target, **values}, ensure_ascii=False))
     return 0
 
@@ -372,6 +393,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("已取消。", file=sys.stderr)
         return 130
+    except ResourceBusyError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 3
     except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

@@ -64,7 +64,8 @@ from fonts import (
     resolve_scheme_files,
 )
 from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus
-from pipeline import Pipeline, add_version, create_project, load_manifest
+from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
+from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
 from wolf_tools import final_display_texts, load_items, read_font_slots
 
@@ -101,6 +102,7 @@ STAGE_DESCRIPTIONS = {
 class PipelineThread(QThread):
     log_line = Signal(str)
     stage_progress = Signal(int, int, str)
+    stage_state = Signal(object)
     result_ready = Signal(str)
     failed = Signal(str)
 
@@ -110,6 +112,7 @@ class PipelineThread(QThread):
         self.stage = stage
         self.pipeline.set_log_sink(self.log_line.emit)
         self.pipeline.progress = lambda current, total, stage: self.stage_progress.emit(current, total, stage.value)
+        self.pipeline.state = self.stage_state.emit
 
     def run(self) -> None:
         try:
@@ -185,11 +188,15 @@ class FontScanThread(QThread):
     def run(self) -> None:
         try:
             manifest = load_manifest(self.manifest_path)
+            if self.isInterruptionRequested():
+                return
             record = manifest.version.stage(Stage.VALIDATE)
             items_path = record.artifacts.get("items", "")
             if record.status is not StageStatus.COMPLETED or not items_path or not Path(items_path).is_file():
                 raise RuntimeError("完成“校验译文”后才能检查和修改字体。")
             items = load_items(items_path)
+            if self.isInterruptionRequested():
+                return
             extract = manifest.version.stage(Stage.EXTRACT).artifacts
             original_record = load_original_fonts(
                 self.manifest_path.parent, manifest.active_version
@@ -206,21 +213,33 @@ class FontScanThread(QThread):
                 original_record = load_original_fonts(
                     self.manifest_path.parent, manifest.active_version
                 )
+            if self.isInterruptionRequested():
+                return
             if original_record is None:
                 raise RuntimeError("无法建立当前版本的原字体记录。")
             original_slots = list(original_record["slots"])
             required = required_characters(final_display_texts(items, manifest.import_scope))
+            if self.isInterruptionRequested():
+                return
             version_dir = self.manifest_path.parent / "versions" / manifest.active_version
             game_root = version_dir / "work"
             if not game_root.is_dir():
                 game_root = version_dir / "source"
             if not game_root.is_dir():
                 game_root = Path(manifest.version.original_path)
-            candidates = discover_font_candidates(game_root, required)
+            candidates = discover_font_candidates(
+                game_root,
+                required,
+                cancelled=self.isInterruptionRequested,
+            )
+            if self.isInterruptionRequested():
+                return
             scheme = load_font_scheme(self.manifest_path.parent)
             if scheme is not None:
                 resolved = resolve_scheme_files(self.manifest_path.parent, scheme)
                 for slot, files in zip(scheme["slots"], resolved, strict=True):
+                    if self.isInterruptionRequested():
+                        return
                     if slot["mode"] != "font":
                         continue
                     if any(
@@ -232,6 +251,8 @@ class FontScanThread(QThread):
                     coverage: set[int] = set()
                     aliases: set[str] = {str(slot["family"])}
                     for path in files:
+                        if self.isInterruptionRequested():
+                            return
                         families, codepoints = font_file_info(path)
                         aliases.update(families)
                         coverage.update(codepoints)
@@ -259,6 +280,8 @@ class FontScanThread(QThread):
                     "font_warnings": release_record.artifacts.get("font_warnings", ""),
                 }
             )
+        except InterruptedError:
+            return
         except Exception as exc:
             self.failed.emit(str(self.manifest_path), str(exc))
 
@@ -738,26 +761,26 @@ class MainWindow(QMainWindow):
         brand.setObjectName("brand")
         header.addWidget(brand)
         header.addStretch(1)
-        settings_button = QToolButton()
-        settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        settings_button.setToolTip("设置")
-        settings_button.clicked.connect(self._open_settings)
-        header.addWidget(settings_button)
+        self.settings_button = QToolButton()
+        self.settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.settings_button.setToolTip("设置")
+        self.settings_button.clicked.connect(self._open_settings)
+        header.addWidget(self.settings_button)
         layout.addLayout(header)
 
         project_row = QHBoxLayout()
         self.project_combo = QComboBox()
         self.project_combo.setMinimumWidth(340)
         self.project_combo.currentIndexChanged.connect(self._project_changed)
-        new_button = QPushButton("新建项目")
-        new_button.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
-        new_button.clicked.connect(self._new_project)
-        version_button = QPushButton("添加版本")
-        version_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
-        version_button.clicked.connect(self._add_version)
+        self.new_project_button = QPushButton("新建项目")
+        self.new_project_button.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        self.new_project_button.clicked.connect(self._new_project)
+        self.add_version_button = QPushButton("添加版本")
+        self.add_version_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        self.add_version_button.clicked.connect(self._add_version)
         project_row.addWidget(self.project_combo, 1)
-        project_row.addWidget(new_button)
-        project_row.addWidget(version_button)
+        project_row.addWidget(self.new_project_button)
+        project_row.addWidget(self.add_version_button)
         layout.addLayout(project_row)
 
         self.tabs = QTabWidget()
@@ -989,9 +1012,9 @@ class MainWindow(QMainWindow):
         characters_layout.addLayout(character_buttons)
         views.addTab(characters_page, "人物")
         layout.addWidget(views)
-        save_button = QPushButton("保存术语")
-        save_button.clicked.connect(self._save_glossary)
-        layout.addWidget(save_button, alignment=Qt.AlignRight)
+        self.save_glossary_button = QPushButton("保存术语")
+        self.save_glossary_button.clicked.connect(self._save_glossary)
+        layout.addWidget(self.save_glossary_button, alignment=Qt.AlignRight)
         return page
 
     def _scope_tab(self) -> QWidget:
@@ -1183,6 +1206,9 @@ class MainWindow(QMainWindow):
             self._set_font_controls_enabled(False)
 
     def _refresh_font_tab(self, *, force: bool = False) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            self._set_font_controls_enabled(False)
+            return
         if not self.current_manifest_path:
             self._clear_font_view()
             return
@@ -1207,6 +1233,8 @@ class MainWindow(QMainWindow):
         self.font_scan_thread.start()
 
     def _font_scan_succeeded(self, context: object) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         if not isinstance(context, dict) or not self.current_manifest_path:
             return
         if context.get("manifest") != str(self.current_manifest_path):
@@ -1238,8 +1266,12 @@ class MainWindow(QMainWindow):
             self._clear_font_view(error)
 
     def _font_scan_finished(self) -> None:
-        scanned = self.font_scan_thread.manifest_path if self.font_scan_thread else None
-        self.font_scan_thread = None
+        thread = self.sender()
+        scanned = thread.manifest_path if isinstance(thread, FontScanThread) else None
+        if self.font_scan_thread is thread:
+            self.font_scan_thread = None
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         if self.current_manifest_path and scanned != self.current_manifest_path:
             self._refresh_font_tab(force=True)
 
@@ -1375,31 +1407,32 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.Ok:
                 return False
-        slots = [
-            {"mode": "keep"}
-            if candidate is None
-            else materialize_candidate(self.current_manifest_path.parent, candidate)
-            for candidate in selections
-        ]
-        scheme: dict[str, object] = {
-            "schema": 1,
-            "origin": "user",
-            "slots": slots,
-            "coverage_ack": None,
-        }
-        if missing_count:
-            scheme["coverage_ack"] = {
-                "fingerprint": coverage_fingerprint(required, scheme),
-                "missing_count": missing_count,
+        with project_lock(self.current_manifest_path, "set-font-scheme"):
+            slots = [
+                {"mode": "keep"}
+                if candidate is None
+                else materialize_candidate(self.current_manifest_path.parent, candidate)
+                for candidate in selections
+            ]
+            scheme: dict[str, object] = {
+                "schema": 1,
+                "origin": "user",
+                "slots": slots,
+                "coverage_ack": None,
             }
-        pipeline = Pipeline(
-            self.current_manifest_path,
-            self.settings,
-            "",
-            local_data_dir(),
-            glossary_api_key="",
-        )
-        pipeline.set_font_scheme(scheme)
+            if missing_count:
+                scheme["coverage_ack"] = {
+                    "fingerprint": coverage_fingerprint(required, scheme),
+                    "missing_count": missing_count,
+                }
+            pipeline = Pipeline(
+                self.current_manifest_path,
+                self.settings,
+                "",
+                local_data_dir(),
+                glossary_api_key="",
+            )
+            pipeline.set_font_scheme(scheme)
         if self.pipeline:
             self.pipeline.manifest = pipeline.manifest
         self.status_label.setText("字体方案已保存")
@@ -1431,6 +1464,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法应用字体", str(exc))
 
     def _open_settings(self, _checked=False, first_run: bool = False) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         dialog = SettingsDialog(self.store, self)
         if dialog.exec() == QDialog.Accepted:
             self.settings = self.store.load()
@@ -1461,6 +1496,8 @@ class MainWindow(QMainWindow):
             self.status_label.setToolTip("\n".join(invalid[:10]))
 
     def _project_changed(self, _index: int) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         value = self.project_combo.currentData()
         self.font_context = None
         self.current_manifest_path = Path(value) if value else None
@@ -1503,6 +1540,8 @@ class MainWindow(QMainWindow):
         self._clear_font_view()
 
     def _load_project_view(self) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         if not self.current_manifest_path:
             return
         manifest = load_manifest(self.current_manifest_path)
@@ -1585,6 +1624,8 @@ class MainWindow(QMainWindow):
         self._refresh_font_tab()
 
     def _new_project(self) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
         errors = validate_settings(self.settings)
         if errors:
             QMessageBox.warning(self, "设置未完成", "\n".join(errors))
@@ -1600,7 +1641,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法创建项目", str(exc))
 
     def _add_version(self) -> None:
-        if not self.current_manifest_path:
+        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
         game = QFileDialog.getExistingDirectory(self, "选择新版本游戏目录")
         if not game:
@@ -1612,16 +1653,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法添加版本", str(exc))
 
     def _set_mode(self, mode: RunMode) -> None:
-        if not self.current_manifest_path:
+        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
-        if self.pipeline:
-            self.pipeline.set_run_mode(mode)
-        else:
-            manifest = load_manifest(self.current_manifest_path)
-            manifest.run_mode = mode
-            temporary = self.current_manifest_path.with_name("project.json.tmp")
-            temporary.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, self.current_manifest_path)
+        pipeline = Pipeline(
+            self.current_manifest_path,
+            self.settings,
+            "",
+            local_data_dir(),
+            glossary_api_key="",
+        )
+        pipeline.set_run_mode(mode)
 
     def _select_workflow_mode(self, mode: RunMode) -> None:
         self.workflow_stack.setCurrentIndex(0 if mode is RunMode.ONE_CLICK else 1)
@@ -1629,7 +1670,7 @@ class MainWindow(QMainWindow):
         self._load_project_view()
 
     def _save_scope(self, target: str) -> None:
-        if not self.current_manifest_path:
+        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
         checks = self.translation_scope_checks if target == "translation" else self.import_scope_checks
         if target == "import" and checks["filename"].isChecked():
@@ -1716,36 +1757,71 @@ class MainWindow(QMainWindow):
                 "characterization_data": characters,
             }
         )
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
-        manifest = load_manifest(self.current_manifest_path)
-        reset = False
-        for stage in STAGE_ORDER:
-            if stage is Stage.TRANSLATE:
-                reset = True
-            if reset:
-                record = manifest.version.stage(stage)
-                record.status = StageStatus.PENDING
-                record.error = ""
-        manifest_path_tmp = self.current_manifest_path.with_name("project.json.tmp")
-        manifest_path_tmp.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(manifest_path_tmp, self.current_manifest_path)
+        pipeline = Pipeline(
+            self.current_manifest_path,
+            self.settings,
+            "",
+            local_data_dir(),
+            glossary_api_key="",
+        )
+        pipeline.set_glossary(data)
         self._load_project_view()
         self.status_label.setText("术语已保存")
+
+    def _stop_font_scan_for_pipeline(self) -> None:
+        thread = self.font_scan_thread
+        if not thread or not thread.isRunning():
+            return
+        thread.requestInterruption()
+        if not thread.wait(5000):
+            raise RuntimeError("字体扫描在 5 秒内没有停止，流水线未启动。")
+        if self.font_scan_thread is thread:
+            self.font_scan_thread = None
+
+    def _set_pipeline_ui_locked(self, locked: bool) -> None:
+        enabled = not locked
+        for control in (
+            self.settings_button,
+            self.project_combo,
+            self.new_project_button,
+            self.add_version_button,
+            self.one_click,
+            self.step_mode,
+            self.start_button,
+            self.retry_button,
+            self.open_release_button,
+            self.open_font_release_button,
+            self.save_glossary_button,
+        ):
+            control.setEnabled(enabled)
+        for button in (*self.step_buttons.values(), *self.step_skip_buttons.values()):
+            button.setEnabled(enabled)
+        for checks in (self.translation_scope_checks, self.import_scope_checks):
+            for check in checks.values():
+                check.setEnabled(enabled)
+        self.translation_scope_button.setEnabled(enabled)
+        self.import_scope_button.setEnabled(enabled)
+        for index in range(1, self.tabs.count()):
+            self.tabs.setTabEnabled(index, enabled)
+        if locked:
+            self.tabs.setCurrentIndex(0)
+            self._set_font_controls_enabled(False)
+        self.stop_button.setEnabled(locked)
 
     def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
-        if stage is not None and switch_to_step:
-            self.active_step_stage = stage
-            self.step_mode.setChecked(True)
-            self._select_workflow_mode(RunMode.STEP)
         errors = validate_settings(self.settings) if stage is None else []
         if errors:
             QMessageBox.warning(self, "设置未完成", "\n".join(errors))
             return
         try:
+            self._stop_font_scan_for_pipeline()
+            if stage is not None and switch_to_step:
+                self.active_step_stage = stage
+                self.step_mode.setChecked(True)
+                self.workflow_stack.setCurrentIndex(1)
+                self._set_mode(RunMode.STEP)
             key = ""
             glossary_key = ""
             if stage is None or stage is Stage.TRANSLATE:
@@ -1762,22 +1838,11 @@ class MainWindow(QMainWindow):
             self.pipeline_thread = PipelineThread(self.pipeline, stage)
             self.pipeline_thread.log_line.connect(self._append_log)
             self.pipeline_thread.stage_progress.connect(self._stage_progress)
+            self.pipeline_thread.stage_state.connect(self._stage_state)
             self.pipeline_thread.result_ready.connect(self._pipeline_result)
             self.pipeline_thread.failed.connect(self._pipeline_failed)
             self.pipeline_thread.finished.connect(self._pipeline_finished)
-            self.start_button.setEnabled(False)
-            for button in self.step_buttons.values():
-                button.setEnabled(False)
-            for button in self.step_skip_buttons.values():
-                button.setEnabled(False)
-            self.retry_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            for checks in (self.translation_scope_checks, self.import_scope_checks):
-                for check in checks.values():
-                    check.setEnabled(False)
-            self.translation_scope_button.setEnabled(False)
-            self.import_scope_button.setEnabled(False)
-            self._set_font_controls_enabled(False)
+            self._set_pipeline_ui_locked(True)
             self.status_label.setText(
                 "正在应用字体"
                 if self.font_apply_active
@@ -1785,10 +1850,16 @@ class MainWindow(QMainWindow):
             )
             self.pipeline_thread.start()
         except Exception as exc:
+            self.pipeline_thread = None
+            self.pipeline = None
+            self._set_pipeline_ui_locked(False)
+            self._load_project_view()
             QMessageBox.critical(self, "无法启动", str(exc))
 
     def _append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
+        if message.startswith("日志文件:"):
+            self.open_logs_button.setEnabled(True)
 
     def _open_log_dir(self) -> None:
         if not self.current_manifest_path:
@@ -1831,7 +1902,26 @@ class MainWindow(QMainWindow):
         else:
             self.progress.setRange(0, total)
             self.progress.setValue(current)
-        self._load_project_view()
+
+    def _stage_state(self, event: object) -> None:
+        if not isinstance(event, PipelineStateEvent):
+            return
+        self._update_stage_status(
+            self.easy_stage_status[event.stage],
+            event.status,
+            event.detail,
+            event.warnings,
+        )
+        self._update_stage_status(
+            self.step_status_labels[event.stage],
+            event.status,
+            event.detail,
+            event.warnings,
+        )
+        if event.status is StageStatus.RUNNING:
+            self.easy_summary.setText(f"正在执行：{STAGE_LABELS[event.stage]}")
+        elif event.status is StageStatus.COMPLETED:
+            self.easy_summary.setText(f"已完成：{STAGE_LABELS[event.stage]}")
 
     def _pipeline_result(self, result: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
@@ -1840,7 +1930,6 @@ class MainWindow(QMainWindow):
             if self.font_apply_active
             else (f"已完成：{STAGE_LABELS[target]}" if target is not None else "已完成")
         )
-        self._load_project_view()
 
     def _pipeline_failed(self, detail: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
@@ -1851,21 +1940,15 @@ class MainWindow(QMainWindow):
         )
         if not self.font_apply_active:
             self.tabs.setCurrentIndex(0)
-        self._load_project_view()
         title = "字体应用错误" if self.font_apply_active else ("步骤执行错误" if target is not None else "流水线失败")
         QMessageBox.critical(self, title, detail.splitlines()[-1] if detail.splitlines() else detail)
 
     def _pipeline_finished(self) -> None:
-        self.stop_button.setEnabled(False)
-        for checks in (self.translation_scope_checks, self.import_scope_checks):
-            for check in checks.values():
-                check.setEnabled(True)
-        self.translation_scope_button.setEnabled(True)
-        self.import_scope_button.setEnabled(True)
         self.pipeline_thread = None
         self.pipeline = None
         self.font_apply_active = False
         self.font_context = None
+        self._set_pipeline_ui_locked(False)
         self._load_project_view()
 
     def _stop(self) -> None:
@@ -1906,7 +1989,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法重试", str(exc))
 
     def _open_release(self) -> None:
-        if not self.current_manifest_path:
+        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
         manifest = load_manifest(self.current_manifest_path)
         path = manifest.version.stage(Stage.RELEASE).artifacts.get("release", "")

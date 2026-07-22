@@ -125,9 +125,10 @@ class PipelineTests(unittest.TestCase):
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            for stage in STAGE_ORDER:
-                pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
-            pipeline.save()
+            with pipeline._mutation("test-setup"):
+                for stage in STAGE_ORDER:
+                    pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
+                pipeline.save()
             scheme = default_font_scheme()
             scheme["slots"][0] = {"mode": "keep"}
             pipeline.set_font_scheme(scheme)
@@ -284,6 +285,23 @@ class PipelineTests(unittest.TestCase):
             (pipeline.release_dir / "old.txt").write_text("keep", encoding="utf-8")
             with mock.patch.object(pipeline, "_build_font_release", side_effect=RuntimeError("font failed")):
                 with self.assertRaisesRegex(RuntimeError, "font failed"):
+                    pipeline._release()
+            self.assertEqual("keep", (pipeline.release_dir / "old.txt").read_text(encoding="utf-8"))
+
+    def test_busy_release_directory_keeps_previous_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
+            translated = make_game(root / "translated")
+            pipeline.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"] = str(translated)
+            pipeline.release_dir.mkdir(parents=True)
+            (pipeline.release_dir / "old.txt").write_text("keep", encoding="utf-8")
+            with mock.patch("pipeline.load_font_scheme", return_value=None), mock.patch(
+                "pipeline.replace_with_retry",
+                side_effect=PermissionError(13, "sharing violation"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "发布目录正在使用"):
                     pipeline._release()
             self.assertEqual("keep", (pipeline.release_dir / "old.txt").read_text(encoding="utf-8"))
 
