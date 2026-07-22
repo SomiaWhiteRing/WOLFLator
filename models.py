@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+MANIFEST_SCHEMA = 1
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -62,6 +65,17 @@ class ImportScope:
         return bool(getattr(self, category.value))
 
 
+def _require_fields(data: object, expected: set[str], label: str) -> None:
+    if not isinstance(data, dict):
+        raise ValueError(f"{label}不是对象。")
+    missing = expected - data.keys()
+    extra = data.keys() - expected
+    if missing or extra:
+        raise ValueError(
+            f"{label}字段不匹配: missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+
+
 @dataclass
 class AppSettings:
     wolf_tool_path: str = ""
@@ -97,13 +111,27 @@ class StageRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StageRecord":
+        _require_fields(
+            data,
+            {"status", "started_at", "finished_at", "input_hash", "error", "artifacts"},
+            "阶段记录",
+        )
+        string_fields = ("started_at", "finished_at", "input_hash", "error")
+        if any(not isinstance(data[name], str) for name in string_fields):
+            raise ValueError("阶段记录文本字段类型不匹配。")
+        artifacts = data["artifacts"]
+        if not isinstance(artifacts, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in artifacts.items()
+        ):
+            raise ValueError("阶段记录 artifacts 必须是字符串映射。")
         return cls(
-            status=StageStatus(data.get("status", StageStatus.PENDING.value)),
-            started_at=str(data.get("started_at", "")),
-            finished_at=str(data.get("finished_at", "")),
-            input_hash=str(data.get("input_hash", "")),
-            error=str(data.get("error", "")),
-            artifacts=dict(data.get("artifacts", {})),
+            status=StageStatus(data["status"]),
+            started_at=data["started_at"],
+            finished_at=data["finished_at"],
+            input_hash=data["input_hash"],
+            error=data["error"],
+            artifacts=artifacts,
         )
 
 
@@ -122,15 +150,31 @@ class VersionManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "VersionManifest":
-        item = cls(
-            version_id=str(data["version_id"]),
-            original_path=str(data["original_path"]),
-            created_at=str(data.get("created_at", utc_now())),
-            source_hash=str(data.get("source_hash", "")),
+        _require_fields(
+            data,
+            {"version_id", "original_path", "created_at", "source_hash", "stages"},
+            "版本清单",
         )
+        if any(
+            not isinstance(data[name], str)
+            for name in ("version_id", "original_path", "created_at", "source_hash")
+        ):
+            raise ValueError("版本清单文本字段类型不匹配。")
+        item = cls(
+            version_id=data["version_id"],
+            original_path=data["original_path"],
+            created_at=data["created_at"],
+            source_hash=data["source_hash"],
+        )
+        stages = data["stages"]
+        if not isinstance(stages, dict):
+            raise ValueError("版本清单 stages 不是对象。")
+        unknown = set(stages) - {stage.value for stage in STAGE_ORDER}
+        if unknown:
+            raise ValueError(f"版本清单包含未知阶段: {sorted(unknown)}")
         item.stages = {
             key: StageRecord.from_dict(value)
-            for key, value in dict(data.get("stages", {})).items()
+            for key, value in stages.items()
         }
         return item
 
@@ -139,6 +183,7 @@ class VersionManifest:
 class ProjectManifest:
     project_id: str
     name: str
+    schema: int = MANIFEST_SCHEMA
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     active_version: str = ""
@@ -165,22 +210,68 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
-        import_scope_data = dict(data.get("import_scope", {}))
-        translation_scope_data = dict(data.get("translation_scope", import_scope_data))
+        _require_fields(
+            data,
+            {
+                "project_id",
+                "name",
+                "schema",
+                "created_at",
+                "updated_at",
+                "active_version",
+                "run_mode",
+                "translation_scope",
+                "import_scope",
+                "versions",
+            },
+            "项目清单",
+        )
+        schema = data["schema"]
+        if schema != MANIFEST_SCHEMA:
+            raise ValueError(f"不支持的项目清单 schema: {schema}")
+        scope_fields = {"display", "external", "optional_name", "halfwidth", "filename"}
+        import_scope_data = data["import_scope"]
+        translation_scope_data = data["translation_scope"]
+        if not isinstance(import_scope_data, dict) or not isinstance(translation_scope_data, dict):
+            raise ValueError("项目范围不是对象。")
+        _require_fields(import_scope_data, scope_fields, "导入范围")
+        _require_fields(translation_scope_data, scope_fields, "翻译范围")
+        if any(
+            type(value) is not bool
+            for scope in (import_scope_data, translation_scope_data)
+            for value in scope.values()
+        ):
+            raise ValueError("项目范围值必须是布尔值。")
+        if any(
+            not isinstance(data[name], str)
+            for name in ("project_id", "name", "created_at", "updated_at", "active_version")
+        ):
+            raise ValueError("项目清单文本字段类型不匹配。")
         item = cls(
-            project_id=str(data["project_id"]),
-            name=str(data.get("name", data["project_id"])),
-            created_at=str(data.get("created_at", utc_now())),
-            updated_at=str(data.get("updated_at", utc_now())),
-            active_version=str(data.get("active_version", "")),
-            run_mode=RunMode(data.get("run_mode", RunMode.ONE_CLICK.value)),
+            project_id=data["project_id"],
+            name=data["name"],
+            schema=schema,
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            active_version=data["active_version"],
+            run_mode=RunMode(data["run_mode"]),
             translation_scope=ImportScope(**translation_scope_data),
             import_scope=ImportScope(**import_scope_data),
         )
+        versions = data["versions"]
+        if not isinstance(versions, dict):
+            raise ValueError("项目清单 versions 不是对象。")
+        if any(not isinstance(key, str) for key in versions):
+            raise ValueError("项目清单版本键不是字符串。")
         item.versions = {
             key: VersionManifest.from_dict(value)
-            for key, value in dict(data.get("versions", {})).items()
+            for key, value in versions.items()
         }
+        mismatched = [key for key, version in item.versions.items() if key != version.version_id]
+        if mismatched:
+            raise ValueError(f"版本键与 version_id 不一致: {mismatched}")
+        if item.active_version not in item.versions:
+            raise ValueError("项目活动版本不存在。")
         return item
 
 
@@ -207,9 +298,39 @@ class TranslationItem:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TranslationItem":
+        _require_fields(
+            data,
+            {
+                "key",
+                "original",
+                "translation",
+                "context",
+                "stage",
+                "code",
+                "flag",
+                "type",
+                "info",
+                "category",
+                "copy_category",
+                "control_signature",
+            },
+            "翻译条目",
+        )
+        string_fields = (
+            "key", "original", "translation", "context", "code", "flag", "type", "info"
+        )
+        if any(not isinstance(data[name], str) for name in string_fields):
+            raise ValueError("翻译条目文本字段类型不匹配。")
+        if type(data["stage"]) is not int:
+            raise ValueError("翻译条目 stage 不是整数。")
+        signature = data["control_signature"]
+        if not isinstance(signature, list) or not all(isinstance(token, str) for token in signature):
+            raise ValueError("翻译条目 control_signature 不是字符串数组。")
+        if data["copy_category"] is not None and not isinstance(data["copy_category"], str):
+            raise ValueError("翻译条目 copy_category 类型不匹配。")
         values = dict(data)
-        values["category"] = ImportCategory(values.get("category", ImportCategory.DISPLAY.value))
-        copy_category = values.get("copy_category")
+        values["category"] = ImportCategory(values["category"])
+        copy_category = values["copy_category"]
         values["copy_category"] = ImportCategory(copy_category) if copy_category else None
         return cls(**values)
 

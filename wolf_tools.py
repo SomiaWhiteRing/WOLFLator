@@ -29,6 +29,7 @@ EXPECTED_TARGET = "Chinese (Simplified)"
 SUPPORT_DIR = "WOLF_Translation_Support_Tool_Data"
 WORKBOOK_NAME = "WOLF_Translation_Text.xlsx"
 GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
+ITEMS_SCHEMA = 1
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
@@ -109,6 +110,16 @@ def _kill_process_tree(process: subprocess.Popen[str]) -> None:
         process.kill()
 
 
+def _emit_log(sink: Callable[[str], None] | None, message: str) -> None:
+    if not sink:
+        return
+    try:
+        sink(message)
+    except UnicodeEncodeError:
+        # ponytail: Preserve process execution on narrow consoles; UTF-8 file sinks keep the original text.
+        sink(message.encode("ascii", errors="backslashreplace").decode("ascii"))
+
+
 def run_process(
     command: list[str],
     *,
@@ -121,8 +132,7 @@ def run_process(
 ) -> ToolResult:
     detail = diagnostic_log or log
     safe_command = " ".join(f'"{arg}"' if " " in arg else arg for arg in command)
-    if log:
-        log(f"> {safe_command}")
+    _emit_log(log, f"> {safe_command}")
     started = time.monotonic()
     process = subprocess.Popen(
         command,
@@ -137,11 +147,11 @@ def run_process(
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         bufsize=1,
     )
-    if detail:
-        detail(
-            f"process.start pid={process.pid} cwd={Path(cwd).resolve() if cwd else Path.cwd()} "
-            f"timeout={timeout}s command={safe_command}"
-        )
+    _emit_log(
+        detail,
+        f"process.start pid={process.pid} cwd={Path(cwd).resolve() if cwd else Path.cwd()} "
+        f"timeout={timeout}s command={safe_command}",
+    )
     output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
 
@@ -162,14 +172,18 @@ def run_process(
     try:
         while process.poll() is None or len(finished_streams) < len(readers):
             if cancel_event and cancel_event.is_set():
-                if detail:
-                    detail(f"process.cancel pid={process.pid} elapsed={time.monotonic() - started:.3f}s")
+                _emit_log(
+                    detail,
+                    f"process.cancel pid={process.pid} elapsed={time.monotonic() - started:.3f}s",
+                )
                 _kill_process_tree(process)
                 raise CancelledError("任务已取消。")
             elapsed = time.monotonic() - started
             if elapsed > timeout:
-                if detail:
-                    detail(f"process.timeout pid={process.pid} elapsed={elapsed:.3f}s limit={timeout}s")
+                _emit_log(
+                    detail,
+                    f"process.timeout pid={process.pid} elapsed={elapsed:.3f}s limit={timeout}s",
+                )
                 _kill_process_tree(process)
                 raise TimeoutError(f"外部工具运行超过 {timeout} 秒。")
             try:
@@ -180,8 +194,7 @@ def run_process(
                 finished_streams.add(name)
                 continue
             captured[name].append(line)
-            if detail:
-                detail(f"process.{name} pid={process.pid} {line}")
+            _emit_log(detail, f"process.{name} pid={process.pid} {line}")
     finally:
         if process.poll() is None:
             _kill_process_tree(process)
@@ -194,16 +207,15 @@ def run_process(
     stdout = "\n".join(captured["stdout"])
     stderr = "\n".join(captured["stderr"])
     result = ToolResult(command, process.returncode or 0, stdout, stderr, time.monotonic() - started)
-    if detail:
-        detail(
-            f"process.exit pid={process.pid} code={result.return_code} duration={result.duration_seconds:.3f}s "
-            f"stdout_lines={len(captured['stdout'])} stderr_lines={len(captured['stderr'])}"
-        )
+    _emit_log(
+        detail,
+        f"process.exit pid={process.pid} code={result.return_code} duration={result.duration_seconds:.3f}s "
+        f"stdout_lines={len(captured['stdout'])} stderr_lines={len(captured['stderr'])}",
+    )
     if result.return_code != 0:
         error_detail = (stderr or stdout).strip()[-2000:]
         raise RuntimeError(f"外部工具退出码 {result.return_code}: {error_detail}")
-    if log:
-        log(f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
+    _emit_log(log, f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
     return result
 
 
@@ -241,10 +253,7 @@ class UberWolfRunner:
             return None
         game_exe = root / "Game.exe"
         if not game_exe.is_file():
-            candidates = list(root.glob("Game*.exe"))
-            if not candidates:
-                raise FileNotFoundError("工作副本中没有 Game.exe。")
-            game_exe = candidates[0]
+            raise FileNotFoundError("工作副本中没有 Game.exe。")
         result = run_process(
             [str(self.executable), str(game_exe)],
             cwd=self.executable.parent,
@@ -257,8 +266,7 @@ class UberWolfRunner:
         return result
 
 
-def _official_config_text(scope: ImportScope | None = None) -> str:
-    scope = scope or full_export_scope()
+def _official_config_text(scope: ImportScope) -> str:
     include_external = "1" if scope.external else "0"
     include_names = "1" if scope.optional_name else "0"
     values = {
@@ -285,7 +293,7 @@ def _official_config_text(scope: ImportScope | None = None) -> str:
     return "[System]\r\n" + "".join(f"{key}={value}\r\n" for key, value in values.items())
 
 
-def write_official_game_config(game_root: str | Path, scope: ImportScope | None = None) -> Path:
+def write_official_game_config(game_root: str | Path, scope: ImportScope) -> Path:
     support = Path(game_root) / SUPPORT_DIR
     support.mkdir(parents=True, exist_ok=True)
     path = support / GAME_CONFIG_NAME
@@ -309,9 +317,9 @@ def prepare_official_tool(source_exe: str | Path, cache_root: str | Path) -> Pat
 
 
 class OfficialToolRunner:
-    def __init__(self, executable: str | Path, scope: ImportScope | None = None):
+    def __init__(self, executable: str | Path, scope: ImportScope):
         self.executable = Path(executable)
-        self.scope = scope or full_export_scope()
+        self.scope = scope
 
     def run(
         self,
@@ -355,6 +363,10 @@ class OfficialToolRunner:
         return locate_workbook(game_root)
 
     def translate(self, game_root: str | Path, **kwargs) -> Path:
+        root = Path(game_root)
+        for path in root.glob("Translated*_Chinese (Simplified)"):
+            if path.is_dir():
+                shutil.rmtree(path)
         self.run("CREATE_FOLDER", game_root, language_index=0, **kwargs)
         self.run("TRANSLATE", game_root, language_index=0, **kwargs)
         return locate_translated_game(game_root)
@@ -377,17 +389,15 @@ def _header_map(worksheet) -> tuple[int, dict[str, int]]:
 
 def locate_workbook(game_root: str | Path) -> Path:
     support = Path(game_root) / SUPPORT_DIR
-    preferred = support / WORKBOOK_NAME
-    candidates = [preferred] if preferred.is_file() else sorted(support.glob("*.xlsx"))
-    for candidate in candidates:
-        try:
-            workbook = load_workbook(candidate, read_only=False, data_only=False)
-            _header_map(workbook.active)
-            workbook.close()
-            return candidate
-        except Exception:
-            continue
-    raise FileNotFoundError(f"{support} 中没有兼容的官方 XLSX。")
+    workbook_path = support / WORKBOOK_NAME
+    if not workbook_path.is_file():
+        raise FileNotFoundError(f"官方工具没有生成 {workbook_path}。")
+    workbook = load_workbook(workbook_path, read_only=False, data_only=False)
+    try:
+        _header_map(workbook.active)
+    finally:
+        workbook.close()
+    return workbook_path
 
 
 def _content_category(code: str, flag: str, type_name: str) -> ImportCategory:
@@ -616,10 +626,8 @@ def _copy_source(item: TranslationItem, by_code: dict[str, list[TranslationItem]
         visited.add(marker)
         candidates = by_code.get(source_code, [])
         exact = [candidate for candidate in candidates if candidate.original == current.original]
-        if exact:
+        if len(exact) == 1:
             current = exact[0]
-        elif len(candidates) == 1:
-            current = candidates[0]
         else:
             raise ValueError(f"COPY-FROM 找不到唯一来源: {current.code} -> {source_code}")
     return current
@@ -627,7 +635,7 @@ def _copy_source(item: TranslationItem, by_code: dict[str, list[TranslationItem]
 
 def selected_translation_requirements(
     items: list[TranslationItem],
-    scope: ImportScope | None = None,
+    scope: ImportScope,
 ) -> dict[str, set[ImportCategory]]:
     by_code: dict[str, list[TranslationItem]] = {}
     for item in items:
@@ -645,7 +653,7 @@ def selected_translation_requirements(
 
     requirements: dict[str, set[ImportCategory]] = {}
     for key, categories in groups.items():
-        if is_managed_translation(sources[key]) or scope is None:
+        if is_managed_translation(sources[key]):
             requirements[key] = categories
             continue
         # ponytail: COPY-FROM cannot give duplicate uses different translations. Keep the
@@ -660,7 +668,7 @@ def selected_translation_requirements(
 
 def selected_translation_items(
     items: list[TranslationItem],
-    scope: ImportScope | None = None,
+    scope: ImportScope,
 ) -> list[TranslationItem]:
     required = selected_translation_requirements(items, scope)
     return [item for item in items if item.key in required and not is_managed_translation(item)]
@@ -668,7 +676,7 @@ def selected_translation_items(
 
 def to_paratranz(
     items: list[TranslationItem],
-    scope: ImportScope | None = None,
+    scope: ImportScope,
 ) -> list[dict[str, object]]:
     output: list[dict[str, object]] = []
     for item in selected_translation_items(items, scope):
@@ -695,7 +703,7 @@ def to_paratranz(
 def merge_ainiee_output(
     items: list[TranslationItem],
     translated: list[dict[str, object]],
-    scope: ImportScope | None = None,
+    scope: ImportScope,
 ) -> list[TranslationItem]:
     expected = {item.key: item for item in selected_translation_items(items, scope)}
     actual: dict[str, dict[str, object]] = {}
@@ -713,7 +721,7 @@ def merge_ainiee_output(
         if not raw.strip():
             raise ValueError(f"AiNiee 没有生成译文: {item.code} / {item.original[:80]}")
         item.translation = restore_control_tokens(raw, item.control_signature)
-        item.stage = int(actual[key].get("stage", 1) or 1)
+        item.stage = 1
     for item in items:
         if item.category is ImportCategory.COPY:
             item.translation = ""
@@ -789,16 +797,7 @@ def _filename_target_exists(game_root: Path, translated_name: str) -> bool:
         return False
     data_root = game_root / "Data"
     direct = data_root.joinpath(*name.split("/"))
-    if direct.is_file():
-        return True
-    leaf = Path(name).name.casefold()
-    stem = Path(name).stem.casefold()
-    for candidate in data_root.rglob("*"):
-        if not candidate.is_file():
-            continue
-        if candidate.name.casefold() == leaf or (Path(name).suffix == "" and candidate.stem.casefold() == stem):
-            return True
-    return False
+    return direct.is_file()
 
 
 def write_scoped_workbook(
@@ -806,23 +805,19 @@ def write_scoped_workbook(
     output_path: str | Path,
     scope: ImportScope,
     game_root: str | Path,
-    items: list[TranslationItem] | None = None,
+    items: list[TranslationItem],
 ) -> Path:
     workbook = load_workbook(full_path)
     worksheet = workbook.active
     _header_row, headers = _header_map(worksheet)
-    requirements = selected_translation_requirements(items, scope) if items is not None else None
+    requirements = selected_translation_requirements(items, scope)
     missing_filenames: list[str] = []
     for row_index, values, ordinal in _iter_data_rows(worksheet):
         key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         category = _category(values["code"], values["flag"], values["type"])
         cell = worksheet.cell(row_index, headers["__target__"])
-        if requirements is None:
-            keep = scope.allows(category)
-            required_categories = {category} if keep else set()
-        else:
-            required_categories = requirements.get(key, set())
-            keep = bool(required_categories)
+        required_categories = requirements.get(key, set())
+        keep = bool(required_categories)
         if category is ImportCategory.COPY or not keep:
             cell.value = ""
             continue
@@ -840,9 +835,11 @@ def locate_translated_game(game_root: str | Path) -> Path:
     for path in Path(game_root).glob("Translated*_Chinese (Simplified)"):
         if (path / "Game.exe").is_file() and (path / "Data").is_dir():
             candidates.append(path)
-    if not candidates:
-        raise FileNotFoundError("官方工具返回成功，但未生成简体中文 Translated 目录。")
-    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            f"官方工具返回成功，但简体中文 Translated 目录数量为 {len(candidates)}。"
+        )
+    return candidates[0]
 
 
 def dump_items(path: str | Path, items: list[TranslationItem]) -> Path:
@@ -850,7 +847,11 @@ def dump_items(path: str | Path, items: list[TranslationItem]) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
     temporary.write_text(
-        json.dumps([item.to_dict() for item in items], ensure_ascii=False, indent=2),
+        json.dumps(
+            {"schema": ITEMS_SCHEMA, "items": [item.to_dict() for item in items]},
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     os.replace(temporary, output)
@@ -859,4 +860,10 @@ def dump_items(path: str | Path, items: list[TranslationItem]) -> Path:
 
 def load_items(path: str | Path) -> list[TranslationItem]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [TranslationItem.from_dict(item) for item in data]
+    if not isinstance(data, dict) or set(data) != {"schema", "items"}:
+        raise ValueError("翻译条目文件结构不匹配。")
+    if data["schema"] != ITEMS_SCHEMA:
+        raise ValueError(f"不支持的翻译条目 schema: {data['schema']}")
+    if not isinstance(data["items"], list):
+        raise ValueError("翻译条目 items 不是数组。")
+    return [TranslationItem.from_dict(item) for item in data["items"]]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -47,6 +46,7 @@ from ainiee import (
     install_supported_ainiee,
     locate_ainiee_source,
     prepare_managed_runtime,
+    remove_managed_ainiee,
     test_api,
 )
 from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus
@@ -449,11 +449,17 @@ class SettingsDialog(QDialog):
         if not path.exists() or os.path.commonpath([str(path), str(managed_root)]) != str(managed_root):
             QMessageBox.information(self, "未移除", "当前路径不是 WOLFLator 托管版本。")
             return
-        if QMessageBox.question(self, "移除 AiNiee", f"移除托管目录？\n{path}") != QMessageBox.Yes:
+        if QMessageBox.question(self, "移除 AiNiee", f"移除托管源码与隔离运行时？\n{path}") != QMessageBox.Yes:
             return
-        shutil.rmtree(path)
+        remove_managed_ainiee(
+            path,
+            managed_root,
+            local_data_dir() / "runtime" / "ainiee",
+        )
+        self.settings.ainiee_source = ""
+        self.store.save(self.settings)
         self.ainiee_path.clear()
-        self.activity.setText("已移除托管版本")
+        self.activity.setText("已移除托管版本与隔离运行时")
 
     def _current_settings(self):
         item = self.settings
@@ -890,17 +896,21 @@ class MainWindow(QMainWindow):
         self.project_combo.clear()
         self.project_combo.addItem("选择项目", "")
         root = Path(self.settings.projects_root)
+        invalid: list[str] = []
         if root.is_dir():
             for path in sorted(root.glob("*/project.json")):
                 try:
                     manifest = load_manifest(path)
                     self.project_combo.addItem(manifest.name, str(path))
-                except Exception:
-                    continue
+                except Exception as exc:
+                    invalid.append(f"{path.parent.name}: {exc}")
         index = self.project_combo.findData(selected)
         self.project_combo.setCurrentIndex(index if index >= 0 else 0)
         self.project_combo.blockSignals(False)
         self._project_changed(self.project_combo.currentIndex())
+        if invalid and not self.current_manifest_path:
+            self.status_label.setText(f"已拒绝 {len(invalid)} 个不兼容的项目清单，请重新创建项目")
+            self.status_label.setToolTip("\n".join(invalid[:10]))
 
     def _project_changed(self, _index: int) -> None:
         value = self.project_combo.currentData()
@@ -1073,6 +1083,7 @@ class MainWindow(QMainWindow):
             self.settings,
             "",
             local_data_dir(),
+            glossary_api_key="",
         )
         if target == "translation":
             pipeline.set_translation_scope(new_scope)
@@ -1235,6 +1246,7 @@ class MainWindow(QMainWindow):
                 self.settings,
                 "",
                 local_data_dir(),
+                glossary_api_key="",
                 log=self._append_log,
             )
             pipeline.skip_stage(stage)

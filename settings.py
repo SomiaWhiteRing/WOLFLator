@@ -126,14 +126,6 @@ class SettingsStore:
                 raw = str(raw or "")
             values[name] = raw
         item = AppSettings(**values)
-        if not self._settings.contains("glossary_api_base_url"):
-            item.glossary_api_base_url = item.api_base_url
-        if not self._settings.contains("glossary_api_model"):
-            item.glossary_api_model = item.api_model
-        if not self._settings.contains("glossary_api_key_blob"):
-            item.glossary_api_key_blob = item.api_key_blob
-        if not self._settings.contains("glossary_api_timeout"):
-            item.glossary_api_timeout = item.api_timeout
         if not item.ascii_runner_dir:
             item.ascii_runner_dir = default_ascii_runner_dir()
         if not item.projects_root:

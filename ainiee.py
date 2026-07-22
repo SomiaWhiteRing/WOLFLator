@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from itertools import count
 from pathlib import Path
 from typing import Callable, Iterable
@@ -25,10 +26,19 @@ AINIEE_COMMIT = "b8421fcb2b44d0cfac6411c4aeb9980ade26c972"
 AINIEE_TREE = "e4dea9321d0fc549836f56952602886d151312c1"
 AINIEE_ARCHIVE_URL = f"https://codeload.github.com/ShadowLoveElysia/AiNiee-Next/zip/{AINIEE_COMMIT}"
 AINIEE_ARCHIVE_ETAG = "2a9725a113eb2ddf20a6f911236efce048f4b91880fad16a0e4641399cf0ef25"
+AINIEE_ARCHIVE_SHA256 = "782ce8a8b32711aafbe1d3f82d2195b7eb2e5796afaa144c556e9f4924db0862"
+AINIEE_SOURCE_SHA256 = "4e3671dd2a0711a1f1ce1568a6adf9de8b1bd52677f2e7f95176db78ebb9793f"
+AINIEE_WEB_DIST_URL = f"https://github.com/ShadowLoveElysia/AiNiee-Next/releases/download/{AINIEE_VERSION}/web-dist.zip"
+AINIEE_WEB_DIST_SHA256 = "09872794c798fd8cecd23cb5bbb21a4943e0de3dac4b74063429b878ca6f4645"
+AINIEE_WEB_DIST_SIZE = 335_689
 AINIEE_EXECUTABLE_FILES = {"Tools/Skills/launcher.sh"}
 MAX_ARCHIVE_BYTES = 1_000_000_000
 SESSION_PROFILE = "WOLFLator_session"
+COMMON_PROMPT_ID = 100
+CONTROL_PLACEHOLDER_REGEX = r"[\uE100-\uF7FF]"
 REQUIRED_PATHS = ("ainiee_cli.py", "pyproject.toml", "uv.lock", "Resource")
+SOURCE_HASH_EXCLUDED = {".git", ".venv", "__pycache__", "output", "logs", "updatetemp"}
+_SESSION_CONFIG_LOCK = threading.Lock()
 RULE_DEFAULTS = {
     "pre_translation_data": [],
     "post_translation_data": [],
@@ -60,9 +70,43 @@ def _atomic_json(path: str | Path, value: object) -> Path:
     return output
 
 
+def _atomic_bytes(path: str | Path, value: bytes) -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_bytes(value)
+    os.replace(temporary, output)
+    return output
+
+
 def _check_cancel(cancel_event: threading.Event | None) -> None:
     if cancel_event and cancel_event.is_set():
         raise CancelledError("任务已取消。")
+
+
+def _source_code_hash(root: Path) -> str:
+    paths = [
+        path
+        for path in root.rglob("*.py")
+        if not SOURCE_HASH_EXCLUDED.intersection(path.relative_to(root).parts)
+    ]
+    paths.extend(
+        (
+            root / "pyproject.toml",
+            root / "uv.lock",
+            root / "Resource" / "Version" / "version.json",
+        )
+    )
+    digest = hashlib.sha256()
+    for source in sorted(set(paths), key=lambda item: item.relative_to(root).as_posix()):
+        if not source.is_file():
+            raise ValueError(f"AiNiee 兼容文件不存在: {source.relative_to(root)}")
+        relative = source.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def validate_ainiee_source(path: str | Path) -> Path:
@@ -70,11 +114,9 @@ def validate_ainiee_source(path: str | Path) -> Path:
     missing = [relative for relative in REQUIRED_PATHS if not (root / relative).exists()]
     if missing:
         raise ValueError(f"AiNiee 运行目录缺少: {', '.join(missing)}")
-    cli_text = (root / "ainiee_cli.py").read_text(encoding="utf-8", errors="replace")
-    required_flags = ("--rules-profile", "--type", "--api-key", "translate")
-    absent = [flag for flag in required_flags if flag not in cli_text]
-    if absent:
-        raise ValueError(f"AiNiee CLI 不兼容，缺少参数: {', '.join(absent)}")
+    actual = _source_code_hash(root)
+    if actual != AINIEE_SOURCE_SHA256:
+        raise ValueError(f"AiNiee 源码版本不兼容: {actual}")
     return root
 
 
@@ -87,26 +129,36 @@ def locate_ainiee_source(selected: str | Path) -> Path:
         base / "resources" / "ainiee-runtime",
         base / "Resources" / "ainiee-runtime",
     ]
-    for candidate in direct:
+    possible = {candidate.resolve() for candidate in direct}
+    if base.is_dir():
+        possible.update(
+            cli_path.parent.resolve()
+            for cli_path in base.rglob("ainiee_cli.py")
+            if len(cli_path.relative_to(base).parts) <= 6
+        )
+    compatible: list[Path] = []
+    for candidate in sorted(possible, key=str):
         try:
-            return validate_ainiee_source(candidate)
-        except (ValueError, OSError):
-            pass
-    for cli_path in base.rglob("ainiee_cli.py"):
-        try:
-            if len(cli_path.relative_to(base).parts) > 6:
-                continue
-            return validate_ainiee_source(cli_path.parent)
+            compatible.append(validate_ainiee_source(candidate))
         except (ValueError, OSError):
             continue
-    raise FileNotFoundError("所选位置中没有兼容的 AiNiee 运行目录。")
+    compatible = list(dict.fromkeys(compatible))
+    if len(compatible) != 1:
+        raise FileNotFoundError(
+            f"所选位置中兼容的 AiNiee 运行目录数量为 {len(compatible)}。"
+        )
+    return compatible[0]
 
 
 def _download(
     url: str,
     target: Path,
     *,
-    expected_etag: str,
+    allowed_hosts: set[str],
+    expected_etag: str = "",
+    expected_sha256: str = "",
+    expected_size: int = 0,
+    max_bytes: int = MAX_ARCHIVE_BYTES,
     cancel_event: threading.Event | None,
     progress: Callable[[int, int], None] | None,
 ) -> str:
@@ -115,27 +167,34 @@ def _download(
     received = 0
     with urllib.request.urlopen(request, timeout=60) as response, target.open("wb") as writer:
         final_host = (urllib.parse.urlparse(response.geturl()).hostname or "").lower()
-        if final_host != "codeload.github.com":
+        if final_host not in allowed_hosts:
             raise ValueError(f"AiNiee 下载被重定向到非官方主机: {final_host}")
         etag = str(response.headers.get("ETag", "")).strip().removeprefix("W/").strip('"')
-        if etag.lower() != expected_etag.lower():
+        if expected_etag and etag.lower() != expected_etag.lower():
             raise ValueError(f"AiNiee 源码包 ETag 不匹配: {etag}")
         total = int(response.headers.get("Content-Length", "0") or 0)
-        if total > MAX_ARCHIVE_BYTES:
-            raise ValueError("AiNiee 源码包超过允许大小。")
+        if total > max_bytes:
+            raise ValueError("AiNiee 下载包超过允许大小。")
+        if expected_size and total and total != expected_size:
+            raise ValueError(f"AiNiee 下载包大小不匹配: {total}")
         while True:
             _check_cancel(cancel_event)
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
             received += len(chunk)
-            if received > MAX_ARCHIVE_BYTES:
-                raise ValueError("AiNiee 源码包超过允许大小。")
+            if received > max_bytes:
+                raise ValueError("AiNiee 下载包超过允许大小。")
             digest.update(chunk)
             writer.write(chunk)
             if progress:
                 progress(received, total)
-    return digest.hexdigest()
+    actual_sha256 = digest.hexdigest()
+    if expected_size and received != expected_size:
+        raise ValueError(f"AiNiee 下载包大小不匹配: {received}")
+    if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+        raise ValueError(f"AiNiee 下载包 SHA-256 不匹配: {actual_sha256}")
+    return actual_sha256
 
 
 def _git_tree_from_zip(archive: Path) -> str:
@@ -185,7 +244,7 @@ def _git_tree_from_zip(archive: Path) -> str:
     return tree_hash(tree)
 
 
-def _safe_extract(archive: Path, destination: Path) -> Path:
+def _extract_zip_checked(archive: Path, destination: Path, *, max_uncompressed: int) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     destination_real = destination.resolve()
     with zipfile.ZipFile(archive) as package:
@@ -199,16 +258,108 @@ def _safe_extract(archive: Path, destination: Path) -> Path:
             if file_type == 0o120000:
                 raise ValueError(f"AiNiee 压缩包包含符号链接: {name}")
             total_uncompressed += member.file_size
-            if total_uncompressed > MAX_ARCHIVE_BYTES * 3:
+            if total_uncompressed > max_uncompressed:
                 raise ValueError("AiNiee 压缩包解压体积异常。")
             target = (destination / Path(name)).resolve()
             if os.path.commonpath([str(destination_real), str(target)]) != str(destination_real):
                 raise ValueError(f"AiNiee 压缩包路径逃逸: {name}")
         package.extractall(destination)
+
+
+def _safe_extract(archive: Path, destination: Path) -> Path:
+    _extract_zip_checked(archive, destination, max_uncompressed=MAX_ARCHIVE_BYTES * 3)
     roots = [path for path in destination.iterdir() if path.is_dir()]
     if len(roots) != 1:
         raise ValueError("AiNiee 源码包根目录结构异常。")
     return validate_ainiee_source(roots[0])
+
+
+def _safe_extract_web_dist(archive: Path, destination: Path) -> Path:
+    _extract_zip_checked(archive, destination, max_uncompressed=20 * 1024 * 1024)
+    dist = destination / "dist"
+    if not (dist / "index.html").is_file() or not (dist / "assets").is_dir():
+        raise ValueError("AiNiee web-dist.zip 结构不兼容。")
+    extra_roots = [path.name for path in destination.iterdir() if path.name != "dist"]
+    if extra_roots:
+        raise ValueError(f"AiNiee web-dist.zip 包含意外根路径: {extra_roots}")
+    return dist
+
+
+def _web_dist_ready(root: Path) -> bool:
+    assets = root / "Tools" / "WebServer" / "dist" / "assets"
+    return (assets.parent / "index.html").is_file() and assets.is_dir() and any(assets.iterdir())
+
+
+def _ensure_web_dist(
+    root: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    if _web_dist_ready(root):
+        return
+    web_root = root / "Tools" / "WebServer"
+    web_root.mkdir(parents=True, exist_ok=True)
+    part = web_root / "web-dist.zip.part"
+    extracting = web_root / ".web-dist.extracting"
+    staged = web_root / ".dist.ready"
+    if log:
+        log(f"正在安装 AiNiee-Next {AINIEE_VERSION} 官方 Web 资源...")
+    try:
+        part.unlink(missing_ok=True)
+        for path in (extracting, staged):
+            if path.exists():
+                shutil.rmtree(path)
+        _download(
+            AINIEE_WEB_DIST_URL,
+            part,
+            allowed_hosts={"github.com", "release-assets.githubusercontent.com"},
+            expected_sha256=AINIEE_WEB_DIST_SHA256,
+            expected_size=AINIEE_WEB_DIST_SIZE,
+            max_bytes=20 * 1024 * 1024,
+            cancel_event=cancel_event,
+            progress=progress,
+        )
+        extracted = _safe_extract_web_dist(part, extracting)
+        shutil.move(str(extracted), staged)
+        target = web_root / "dist"
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(staged, target)
+    finally:
+        part.unlink(missing_ok=True)
+        for path in (extracting, staged):
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def _validate_managed_package(path: Path) -> Path:
+    root = validate_ainiee_source(path)
+    metadata_path = root / "wolflator-package.json"
+    if not metadata_path.is_file():
+        raise ValueError("AiNiee 托管包缺少安装元数据。")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected = {
+        "version": AINIEE_VERSION,
+        "commit": AINIEE_COMMIT,
+        "source_url": AINIEE_ARCHIVE_URL,
+        "tree": AINIEE_TREE,
+        "archive_etag": AINIEE_ARCHIVE_ETAG,
+        "archive_sha256": AINIEE_ARCHIVE_SHA256,
+        "web_dist_url": AINIEE_WEB_DIST_URL,
+        "web_dist_sha256": AINIEE_WEB_DIST_SHA256,
+    }
+    mismatched = {
+        key: {"expected": value, "actual": metadata.get(key)}
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatched:
+        raise ValueError(f"AiNiee 托管包元数据不匹配: {mismatched}")
+    if not _web_dist_ready(root):
+        raise ValueError("AiNiee 托管包缺少 Web 资源。")
+    return root
 
 
 def install_supported_ainiee(
@@ -223,7 +374,7 @@ def install_supported_ainiee(
     packages.mkdir(parents=True, exist_ok=True)
     final = packages / AINIEE_VERSION
     if final.exists() and not repair:
-        return validate_ainiee_source(final)
+        return _validate_managed_package(final)
     part = packages / f"{AINIEE_VERSION}.zip.part"
     extract_dir = packages / f".{AINIEE_VERSION}.extracting"
     if log:
@@ -235,7 +386,9 @@ def install_supported_ainiee(
         archive_sha256 = _download(
             AINIEE_ARCHIVE_URL,
             part,
+            allowed_hosts={"codeload.github.com"},
             expected_etag=AINIEE_ARCHIVE_ETAG,
+            expected_sha256=AINIEE_ARCHIVE_SHA256,
             cancel_event=cancel_event,
             progress=progress,
         )
@@ -243,6 +396,12 @@ def install_supported_ainiee(
         if archive_tree != AINIEE_TREE:
             raise ValueError(f"AiNiee 源码树不匹配: {archive_tree}")
         source_root = _safe_extract(part, extract_dir)
+        _ensure_web_dist(
+            source_root,
+            cancel_event=cancel_event,
+            progress=progress,
+            log=log,
+        )
         metadata = {
             "version": AINIEE_VERSION,
             "commit": AINIEE_COMMIT,
@@ -250,6 +409,8 @@ def install_supported_ainiee(
             "tree": AINIEE_TREE,
             "archive_etag": AINIEE_ARCHIVE_ETAG,
             "archive_sha256": archive_sha256,
+            "web_dist_url": AINIEE_WEB_DIST_URL,
+            "web_dist_sha256": AINIEE_WEB_DIST_SHA256,
             "installed_at": time.time(),
         }
         _atomic_json(source_root / "wolflator-package.json", metadata)
@@ -262,7 +423,7 @@ def install_supported_ainiee(
         os.replace(staged, final)
         if log:
             log(f"AiNiee 已安装到 {final}")
-        return validate_ainiee_source(final)
+        return _validate_managed_package(final)
     finally:
         part.unlink(missing_ok=True)
         if extract_dir.exists():
@@ -270,21 +431,21 @@ def install_supported_ainiee(
 
 
 def _runtime_fingerprint(source: Path) -> str:
-    digest = hashlib.sha256()
-    for relative in ("ainiee_cli.py", "pyproject.toml", "uv.lock", "Resource/Version/version.json"):
-        path = source / relative
-        digest.update(relative.encode("ascii"))
-        digest.update(path.read_bytes() if path.is_file() else b"")
-    return digest.hexdigest()[:20]
+    return _source_code_hash(source)[:20]
 
 
-def create_managed_runtime(source: str | Path, runtime_root: str | Path) -> Path:
+def create_managed_runtime(
+    source: str | Path,
+    runtime_root: str | Path,
+    *,
+    refresh: bool = False,
+) -> Path:
     source_root = locate_ainiee_source(source)
     fingerprint = _runtime_fingerprint(source_root)
     root = Path(runtime_root)
     final = root / fingerprint
     marker = final / ".wolflator-runtime.json"
-    if marker.is_file():
+    if marker.is_file() and not refresh:
         try:
             data = json.loads(marker.read_text(encoding="utf-8"))
             if data.get("fingerprint") == fingerprint:
@@ -292,6 +453,17 @@ def create_managed_runtime(source: str | Path, runtime_root: str | Path) -> Path
         except Exception:
             pass
     root.mkdir(parents=True, exist_ok=True)
+    for candidate in root.iterdir():
+        candidate_marker = candidate / ".wolflator-runtime.json"
+        if candidate == final or not candidate_marker.is_file():
+            continue
+        try:
+            data = json.loads(candidate_marker.read_text(encoding="utf-8"))
+            same_source = Path(str(data["source"])).resolve() == source_root
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            same_source = False
+        if same_source:
+            shutil.rmtree(candidate)
     temporary = root / f".{fingerprint}.copying"
     if temporary.exists():
         shutil.rmtree(temporary)
@@ -315,18 +487,12 @@ def _managed_runtime_path(source: str | Path, runtime_root: str | Path) -> tuple
 
 def locate_uv() -> Path:
     override = os.environ.get("WOLFLATOR_UV", "")
-    candidates = [Path(override)] if override else []
-    try:
-        candidates.append(verified_vendor_file("uv.exe", "uv", "exe_sha256"))
-    except (FileNotFoundError, ValueError):
-        pass
-    discovered = shutil.which("uv")
-    if discovered:
-        candidates.append(Path(discovered))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError("未找到 uv.exe。开发环境请运行 scripts/fetch_vendor.ps1。")
+    if override:
+        candidate = Path(override)
+        if not candidate.is_file():
+            raise FileNotFoundError(f"WOLFLATOR_UV 指向的文件不存在: {candidate}")
+        return candidate
+    return verified_vendor_file("uv.exe", "uv", "exe_sha256")
 
 
 def sync_runtime(
@@ -359,9 +525,35 @@ def prepare_managed_runtime(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
 ) -> Path:
-    runtime = create_managed_runtime(source, runtime_root)
+    runtime = create_managed_runtime(source, runtime_root, refresh=force_sync)
+    _ensure_web_dist(runtime, cancel_event=cancel_event, log=log)
     sync_runtime(runtime, force=force_sync, cancel_event=cancel_event, log=log)
     return runtime
+
+
+def remove_managed_ainiee(
+    source: str | Path,
+    packages_root: str | Path,
+    runtime_root: str | Path,
+) -> None:
+    source_root = Path(source).resolve()
+    packages = Path(packages_root).resolve()
+    if source_root == packages or os.path.commonpath((source_root, packages)) != str(packages):
+        raise ValueError("拒绝移除 WOLFLator 托管目录以外的 AiNiee。")
+    runtimes = Path(runtime_root)
+    if runtimes.is_dir():
+        for candidate in runtimes.iterdir():
+            marker = candidate / ".wolflator-runtime.json"
+            if not marker.is_file():
+                continue
+            try:
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                same_source = Path(str(metadata["source"])).resolve() == source_root
+            except (KeyError, OSError, ValueError, json.JSONDecodeError):
+                same_source = False
+            if same_source:
+                shutil.rmtree(candidate)
+    shutil.rmtree(source_root)
 
 
 def require_managed_runtime(source: str | Path, runtime_root: str | Path) -> Path:
@@ -374,6 +566,7 @@ def require_managed_runtime(source: str | Path, runtime_root: str | Path) -> Pat
             metadata.get("fingerprint") == fingerprint
             and (runtime / ".venv").is_dir()
             and synced_lock == sha256_file(runtime / "uv.lock")
+            and _web_dist_ready(runtime)
         )
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         ready = False
@@ -398,22 +591,84 @@ def cleanup_session_profiles(runtime: str | Path) -> None:
             path.unlink(missing_ok=True)
 
 
+def _rules_with_control_protection(rules: dict[str, object]) -> dict[str, object]:
+    result = dict(RULE_DEFAULTS)
+    result.update(rules)
+    exclusions = [dict(item) for item in result.get("exclusion_list_data", []) if isinstance(item, dict)]
+    if not any(item.get("regex") == CONTROL_PLACEHOLDER_REGEX for item in exclusions):
+        exclusions.append(
+            {
+                "markers": "",
+                "info": "WOLFLator control placeholder",
+                "regex": CONTROL_PLACEHOLDER_REGEX,
+            }
+        )
+    # AiNiee uses this as the master switch for every rules-profile feature.
+    result["prompt_dictionary_switch"] = True
+    result["exclusion_list_switch"] = True
+    result["exclusion_list_data"] = exclusions
+    return result
+
+
+@contextmanager
+def _active_session_profile(
+    root: Path,
+    profile: dict[str, object],
+    rules_name: str,
+    rules: dict[str, object],
+):
+    with _SESSION_CONFIG_LOCK:
+        profiles = root / "Resource" / "profiles"
+        rules_profiles = root / "Resource" / "rules_profiles"
+        config_path = root / "Resource" / "config.json"
+        profiles.mkdir(parents=True, exist_ok=True)
+        rules_profiles.mkdir(parents=True, exist_ok=True)
+        original = config_path.read_bytes() if config_path.is_file() else None
+        root_config = json.loads(original.decode("utf-8-sig")) if original else {}
+        if not isinstance(root_config, dict):
+            raise ValueError("AiNiee Resource/config.json 不是 JSON 对象。")
+        restore = original
+        if str(root_config.get("active_profile", "")).startswith("WOLFLator_session"):
+            root_config["active_profile"] = "default"
+            restore = json.dumps(root_config, ensure_ascii=False, indent=2).encode("utf-8")
+
+        cleanup_session_profiles(root)
+        profile_path = profiles / f"{SESSION_PROFILE}.json"
+        try:
+            _atomic_json(profile_path, profile)
+            _atomic_json(rules_profiles / f"{rules_name}.json", rules)
+            session_root = dict(root_config)
+            session_root["active_profile"] = SESSION_PROFILE
+            session_root["active_rules_profile"] = rules_name
+            _atomic_json(config_path, session_root)
+            yield
+        finally:
+            profile_path.unlink(missing_ok=True)
+            if restore is None:
+                config_path.unlink(missing_ok=True)
+            else:
+                _atomic_bytes(config_path, restore)
+
+
 def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
     base_url = settings.api_base_url.rstrip("/")
+    host = (urllib.parse.urlsplit(base_url).hostname or "").lower()
+    is_deepseek = host == "api.deepseek.com" or settings.api_model.lower().startswith("deepseek-")
+    platform_tag = "deepseek" if is_deepseek else "custom_openai"
     platform = {
-        "tag": "custom_openai",
-        "group": "custom",
-        "name": "WOLFLator OpenAI Compatible",
+        "tag": platform_tag,
+        "group": "online" if is_deepseek else "custom",
+        "name": "DeepSeek" if is_deepseek else "WOLFLator OpenAI Compatible",
         "api_url": base_url,
         "api_key": api_key,
         "api_format": "OpenAI",
-        "icon": "custom",
+        "icon": "deepseek" if is_deepseek else "custom",
         "rpm_limit": max(1, settings.api_rpm),
         "tpm_limit": max(1, settings.api_tpm),
         "model": settings.api_model,
         "model_datas": [settings.api_model],
         "top_p": 1.0,
-        "temperature": 0.2,
+        "temperature": 1.3 if is_deepseek else 0.2,
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
         "think_switch": False,
@@ -426,9 +681,9 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "interface_language": "zh_CN",
         "source_language": "Japanese",
         "target_language": "Chinese",
-        "target_platform": "custom_openai",
-        "api_settings": {"translate": "custom_openai", "polish": "custom_openai"},
-        "platforms": {"custom_openai": platform},
+        "target_platform": platform_tag,
+        "api_settings": {"translate": platform_tag, "polish": platform_tag},
+        "platforms": {platform_tag: platform},
         "base_url": base_url,
         "model": settings.api_model,
         "api_key": api_key,
@@ -439,6 +694,12 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "enable_api_failover": False,
         "enable_session_logging": True,
         "show_detailed_logs": True,
+        "translation_prompt_selection": {"last_selected_id": COMMON_PROMPT_ID},
+        "sdk_request_mode": "openai",
+        "use_openai_sdk": True,
+        "auto_set_output_path": False,
+        "response_conversion_toggle": False,
+        "auto_process_text_code_segment": True,
     }
 
 
@@ -485,16 +746,11 @@ def run_translation(
     diagnostic_log: Callable[[str], None] | None = None,
 ) -> list[dict[str, object]]:
     root = validate_ainiee_source(runtime)
-    cleanup_session_profiles(root)
-    profiles = root / "Resource" / "profiles"
-    rules_profiles = root / "Resource" / "rules_profiles"
-    profiles.mkdir(parents=True, exist_ok=True)
-    rules_profiles.mkdir(parents=True, exist_ok=True)
     rules_name = _rules_name(project_id)
-    profile_path = profiles / f"{SESSION_PROFILE}.json"
-    _atomic_json(profile_path, _session_profile(settings, api_key))
-    _atomic_json(rules_profiles / f"{rules_name}.json", rules)
+    managed_rules = _rules_with_control_protection(rules)
     output = Path(output_dir)
+    if output.exists():
+        shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
     if diagnostic_log:
         diagnostic_log(
@@ -502,7 +758,10 @@ def run_translation(
             f"input_bytes={Path(input_json).stat().st_size} output={output.resolve()} "
             f"profile={SESSION_PROFILE} rules_profile={rules_name}"
         )
-    try:
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    with _active_session_profile(root, _session_profile(settings, api_key), rules_name, managed_rules):
         try:
             run_process(
                 [
@@ -515,10 +774,6 @@ def run_translation(
                     str(Path(input_json).resolve()),
                     "-o",
                     str(output.resolve()),
-                    "-p",
-                    SESSION_PROFILE,
-                    "--rules-profile",
-                    rules_name,
                     "-s",
                     "Japanese",
                     "-t",
@@ -532,28 +787,26 @@ def run_translation(
                 cancel_event=cancel_event,
                 log=log,
                 diagnostic_log=diagnostic_log,
+                env=child_env,
             )
         except Exception:
             _report_ainiee_logs(output, diagnostic_log, include_tail=True)
             raise
         _report_ainiee_logs(output, diagnostic_log, include_tail=False)
-        expected_name = f"{Path(input_json).stem}_translated.json"
-        candidates = list(output.rglob(expected_name))
+        expected_name = Path(input_json).name
+        result_path = output / expected_name
         if diagnostic_log:
             diagnostic_log(
-                f"ainiee.translate.outputs expected={expected_name} candidates={len(candidates)} "
-                f"paths={json.dumps([str(path) for path in candidates], ensure_ascii=False)}"
+                f"ainiee.translate.output expected={result_path} exists={result_path.is_file()}"
             )
-        if not candidates:
+        if not result_path.is_file():
             raise RuntimeError(f"AiNiee 返回成功，但没有生成 {expected_name}。")
-        data = json.loads(max(candidates, key=lambda p: p.stat().st_mtime_ns).read_text(encoding="utf-8-sig"))
-        if not isinstance(data, list):
-            raise ValueError("AiNiee 输出不是 Paratranz 数组。")
+        data = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+            raise ValueError("AiNiee 输出不是 Paratranz 对象数组。")
         if diagnostic_log:
             diagnostic_log(f"ainiee.translate.complete rows={len(data)}")
         return data
-    finally:
-        profile_path.unlink(missing_ok=True)
 
 
 class ApiError(RuntimeError):
@@ -792,14 +1045,11 @@ def _json_list(text: str) -> list[dict[str, object]]:
             lines.pop()
         clean = "\n".join(lines).strip()
     data = json.loads(clean)
-    if isinstance(data, dict):
-        for value in data.values():
-            if isinstance(value, list):
-                data = value
-                break
     if not isinstance(data, list):
         raise ValueError("术语模型没有返回 JSON 数组。")
-    return [row for row in data if isinstance(row, dict)]
+    if not all(isinstance(row, dict) for row in data):
+        raise ValueError("术语模型返回的数组包含非对象项。")
+    return data
 
 
 def _repair_invalid_json_escapes(text: str) -> tuple[str, int]:

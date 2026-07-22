@@ -34,24 +34,34 @@ class FailingPipeline(FakePipeline):
 
 
 class PipelineTests(unittest.TestCase):
-    def test_legacy_manifest_seeds_translation_scope_from_import_scope(self):
+    def test_manifest_rejects_missing_translation_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-            data["import_scope"]["external"] = True
             data.pop("translation_scope")
             Path(manifest_path).write_text(json.dumps(data), encoding="utf-8")
-            loaded = load_manifest(manifest_path)
-            self.assertTrue(loaded.import_scope.external)
-            self.assertTrue(loaded.translation_scope.external)
+            with self.assertRaisesRegex(ValueError, "translation_scope"):
+                load_manifest(manifest_path)
+
+    def test_manifest_rejects_non_boolean_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            data["translation_scope"]["display"] = "true"
+            Path(manifest_path).write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "必须是布尔值"):
+                load_manifest(manifest_path)
 
     def test_run_stage_executes_only_selected_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             executed = []
-            pipeline = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             pipeline.executed = executed
             self.assertEqual("completed", pipeline.run_stage(Stage.GLOSSARY))
             self.assertEqual([Stage.GLOSSARY], executed)
@@ -64,9 +74,16 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
-            self.assertEqual("completed", FakePipeline(manifest_path, AppSettings(), "", root / "cache").run())
+            self.assertEqual(
+                "completed",
+                FakePipeline(
+                    manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+                ).run(),
+            )
             executed = []
-            pipeline = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             pipeline.executed = executed
             self.assertEqual("completed", pipeline.run_stage(Stage.EXTRACT))
             self.assertEqual([Stage.EXTRACT], executed)
@@ -79,13 +96,17 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             pipeline.skip_stage(Stage.COPY)
             skipped = load_manifest(manifest_path).version.stage(Stage.COPY)
             self.assertEqual(StageStatus.COMPLETED, skipped.status)
             self.assertEqual("true", skipped.artifacts["skipped"])
             executed = []
-            pipeline = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             pipeline.executed = executed
             self.assertEqual("completed", pipeline.run())
             self.assertEqual(list(Stage), executed)
@@ -148,19 +169,25 @@ class PipelineTests(unittest.TestCase):
             root = Path(directory)
             game = make_game(root / "game")
             manifest_path = create_project(root / "projects", game)
-            pipeline = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             pipeline.set_run_mode(RunMode.STEP)
             pipeline.run()
             (game / "changed.txt").write_text("changed", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "新的源版本"):
-                FakePipeline(manifest_path, AppSettings(), "", root / "cache").run()
+                FakePipeline(
+                    manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+                ).run()
 
     def test_import_scope_change_only_rebuilds_import_and_release(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             game = make_game(root / "game")
             manifest_path = create_project(root / "projects", game)
-            first = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            first = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             self.assertEqual("completed", first.run())
             first.set_import_scope(ImportScope(external=True))
             changed = load_manifest(manifest_path)
@@ -168,7 +195,9 @@ class PipelineTests(unittest.TestCase):
             for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:
                 self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
             executed = []
-            second = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            second = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             second.executed = executed
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]), executed)
@@ -177,7 +206,9 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
-            first = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            first = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             self.assertEqual("completed", first.run())
             first.set_translation_scope(ImportScope(optional_name=True))
             changed = load_manifest(manifest_path)
@@ -185,7 +216,9 @@ class PipelineTests(unittest.TestCase):
             for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]:
                 self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
             executed = []
-            second = FakePipeline(manifest_path, AppSettings(), "", root / "cache")
+            second = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
             second.executed = executed
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]), executed)

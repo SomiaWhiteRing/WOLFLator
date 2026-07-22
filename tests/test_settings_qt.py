@@ -35,20 +35,20 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(item.ainiee_source, dialog.ainiee_path.text())
             dialog.close()
 
-    def test_legacy_api_settings_seed_dedicated_glossary_settings(self):
+    def test_missing_glossary_settings_do_not_inherit_translation_api(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.ini")
-            encrypted = protect_secret("legacy-secret")
-            store._settings.setValue("api_base_url", "https://legacy.example/v1")
-            store._settings.setValue("api_model", "legacy-model")
+            encrypted = protect_secret("translation-secret")
+            store._settings.setValue("api_base_url", "https://translation.example/v1")
+            store._settings.setValue("api_model", "translation-model")
             store._settings.setValue("api_key_blob", encrypted)
             store._settings.setValue("api_timeout", 75)
             store._settings.sync()
             item = store.load()
-            self.assertEqual("https://legacy.example/v1", item.glossary_api_base_url)
-            self.assertEqual("legacy-model", item.glossary_api_model)
-            self.assertEqual("legacy-secret", store.glossary_api_key(item))
-            self.assertEqual(75, item.glossary_api_timeout)
+            self.assertEqual("", item.glossary_api_base_url)
+            self.assertEqual("", item.glossary_api_model)
+            self.assertEqual("", store.glossary_api_key(item))
+            self.assertEqual(120, item.glossary_api_timeout)
             self.assertEqual(3, item.glossary_api_threads)
             self.assertEqual(500_000, item.glossary_chunk_chars)
             self.assertEqual(393_216, item.glossary_api_max_tokens)
@@ -127,6 +127,30 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(all(button.text() == "跳过" for button in window.step_skip_buttons.values()))
                 window.step_mode.click()
                 self.assertEqual(1, window.workflow_stack.currentIndex())
+                window.close()
+
+    def test_incompatible_project_manifest_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            manifest_path = create_project(root / "projects", game)
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data.pop("schema")
+            manifest_path.write_text(json.dumps(data), encoding="utf-8")
+            store = SettingsStore(root / "settings.ini")
+            store.save(
+                AppSettings(
+                    projects_root=str(root / "projects"),
+                    last_project=str(manifest_path),
+                )
+            )
+            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
+                window = MainWindow()
+                self.assertIn("已拒绝 1 个不兼容的项目清单", window.status_label.text())
+                self.assertIn("schema", window.status_label.toolTip())
                 window.close()
 
     def test_step_mode_uses_per_stage_progress_and_keeps_completed_stage_runnable(self):

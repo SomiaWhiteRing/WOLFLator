@@ -103,6 +103,8 @@ def create_project(projects_root: str | Path, game_path: str | Path, name: str =
 
 def load_manifest(path: str | Path) -> ProjectManifest:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("项目清单根节点不是对象。")
     return ProjectManifest.from_dict(data)
 
 
@@ -131,7 +133,7 @@ class Pipeline:
         api_key: str,
         cache_root: str | Path,
         *,
-        glossary_api_key: str | None = None,
+        glossary_api_key: str,
         log: Callable[[str], None] | None = None,
         progress: Callable[[int, int, Stage], None] | None = None,
     ):
@@ -139,7 +141,7 @@ class Pipeline:
         self.project_dir = self.manifest_path.parent
         self.settings = settings
         self.api_key = api_key
-        self.glossary_api_key = api_key if glossary_api_key is None else glossary_api_key
+        self.glossary_api_key = glossary_api_key
         self.cache_root = Path(cache_root)
         self._log_sink = log or (lambda _message: None)
         self._log_lock = threading.Lock()
@@ -444,12 +446,12 @@ class Pipeline:
         index = keys.index(self.manifest.active_version)
         return self.manifest.versions[keys[index - 1]] if index > 0 else None
 
-    def _official_runner(self, scope: ImportScope | None = None) -> OfficialToolRunner:
+    def _official_runner(self, scope: ImportScope) -> OfficialToolRunner:
         executable = prepare_official_tool(
             self.settings.wolf_tool_path,
             self.cache_root / "tools" / "wolf-official",
         )
-        return OfficialToolRunner(executable, scope or full_export_scope())
+        return OfficialToolRunner(executable, scope)
 
     def _copy(self) -> dict[str, str]:
         original = _validate_game(self.manifest.version.original_path)

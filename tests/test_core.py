@@ -20,9 +20,14 @@ import ainiee
 from models import AppSettings, ImportCategory, ImportScope, ToolResult
 from wolf_tools import (
     CancelledError,
+    SUPPORT_DIR,
     _official_config_text,
     apply_managed_translations,
     classify_optional_name_delta,
+    dump_items,
+    full_export_scope,
+    load_items,
+    locate_workbook,
     merge_ainiee_output,
     name_baseline_scope,
     protect_control_tokens,
@@ -87,7 +92,7 @@ class WorkbookTests(unittest.TestCase):
                 [item.category for item in items],
             )
             self.assertNotEqual(items[-1].key, items[-2].key)
-            payload = to_paratranz(items)
+            payload = to_paratranz(items, full_export_scope())
             self.assertEqual(7, len(payload))
             protected = payload[0]["original"]
             self.assertIn(chr(0xE100), protected)
@@ -115,7 +120,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual("", merged[2].translation)
 
     def test_official_config_exports_all_and_fonts_use_managed_defaults(self):
-        config = _official_config_text()
+        config = _official_config_text(full_export_scope())
         self.assertIn("Tool_A_Get_CommonEvent_Name=1\r\n", config)
         self.assertIn("Tool_A_Get_DB_DataName=1\r\n", config)
         self.assertIn("Tool_A_Get_TXT=1\r\n", config)
@@ -193,18 +198,18 @@ class WorkbookTests(unittest.TestCase):
             root = Path(directory)
             source = make_workbook(root / "source.xlsx")
             items = read_translation_items(source)
-            payload = to_paratranz(items)
+            payload = to_paratranz(items, full_export_scope())
             output = []
             for row in payload:
                 translation = "译文"
                 if chr(0xE100) in row["original"]:
                     translation += chr(0xE100)
                 output.append({**row, "translation": translation, "stage": 1})
-            merge_ainiee_output(items, output)
+            merge_ainiee_output(items, output, full_export_scope())
             full = write_full_workbook(source, root / "full.xlsx", items)
             game = root / "game"
             (game / "Data").mkdir(parents=True)
-            scoped = write_scoped_workbook(full, root / "scoped.xlsx", ImportScope(), game)
+            scoped = write_scoped_workbook(full, root / "scoped.xlsx", ImportScope(), game, items)
             workbook = load_workbook(scoped)
             sheet = workbook.active
             values = [sheet.cell(row, 7).value for row in range(2, 10)]
@@ -232,11 +237,53 @@ class WorkbookTests(unittest.TestCase):
             full = write_full_workbook(source, root / "full.xlsx", items)
             game = root / "game"
             (game / "Data" / "Picture").mkdir(parents=True)
+            (game / "Data" / "Other").mkdir(parents=True)
+            (game / "Data" / "Other" / "face.png").write_bytes(b"wrong path")
             scope = ImportScope(filename=True)
             with self.assertRaisesRegex(ValueError, "没有对应真实文件"):
-                write_scoped_workbook(full, root / "bad.xlsx", scope, game)
+                write_scoped_workbook(full, root / "bad.xlsx", scope, game, items)
             (game / "Data" / "Picture" / "face.png").write_bytes(b"png")
-            write_scoped_workbook(full, root / "good.xlsx", scope, game)
+            write_scoped_workbook(full, root / "good.xlsx", scope, game, items)
+
+    def test_workbook_locator_requires_official_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            support = root / SUPPORT_DIR
+            support.mkdir()
+            make_workbook(support / "plausible-but-wrong.xlsx")
+            with self.assertRaisesRegex(FileNotFoundError, "WOLF_Translation_Text.xlsx"):
+                locate_workbook(root)
+
+    def test_copy_source_requires_matching_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["COMMON-1", "", "Event", "Message", "", "原文甲", ""])
+            sheet.append(["COMMON-2", "COPY-FROM-COMMON-1", "Event", "Copy", "", "原文乙", ""])
+            workbook.save(path)
+            with self.assertRaisesRegex(ValueError, "找不到唯一来源"):
+                to_paratranz(read_translation_items(path), full_export_scope())
+
+    def test_item_file_requires_versioned_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items = read_translation_items(make_workbook(root / "source.xlsx"))
+            versioned = dump_items(root / "items.json", items)
+            self.assertEqual(len(items), len(load_items(versioned)))
+            old = root / "old-items.json"
+            old.write_text(
+                json.dumps([item.to_dict() for item in items], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "结构不匹配"):
+                load_items(old)
+            malformed = json.loads(versioned.read_text(encoding="utf-8"))
+            malformed["items"][0]["stage"] = "1"
+            versioned.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "stage 不是整数"):
+                load_items(versioned)
 
     def test_incremental_ambiguity_is_not_guessed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -312,17 +359,48 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn("first-line", app_log)
         self.assertNotIn("stderr-line", app_log)
 
+    def test_narrow_console_cannot_abort_process_logging(self):
+        messages = []
+
+        def gbk_sink(message: str) -> None:
+            message.encode("gbk")
+            messages.append(message)
+
+        result = run_process(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff\\n')"],
+            timeout=10,
+            diagnostic_log=gbk_sink,
+        )
+        self.assertEqual(0, result.return_code)
+        self.assertTrue(any(r"\ufffd" in message for message in messages))
+
 
 class AiNieeTests(unittest.TestCase):
     def make_runtime(self, root: Path) -> Path:
         (root / "Resource" / "profiles").mkdir(parents=True)
         (root / "Resource" / "rules_profiles").mkdir(parents=True)
-        (root / "ainiee_cli.py").write_text(
-            "# translate --rules-profile --type --api-key\n", encoding="utf-8"
+        (root / "Resource" / "Version").mkdir(parents=True)
+        (root / "Resource" / "Version" / "version.json").write_text(
+            '{"version":"test"}', encoding="utf-8"
         )
+        assets = root / "Tools" / "WebServer" / "dist" / "assets"
+        assets.mkdir(parents=True)
+        (assets.parent / "index.html").write_text("<html></html>", encoding="utf-8")
+        (assets / "index.js").write_text("", encoding="utf-8")
+        (root / "ainiee_cli.py").write_text("# test runtime\n", encoding="utf-8")
         (root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
         (root / "uv.lock").write_text("lock", encoding="utf-8")
+        patcher = mock.patch.object(ainiee, "AINIEE_SOURCE_SHA256", ainiee._source_code_hash(root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return root
+
+    def test_source_validation_rejects_changed_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_runtime(Path(directory) / "runtime")
+            (root / "ainiee_cli.py").write_text("# changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "源码版本不兼容"):
+                ainiee.validate_ainiee_source(root)
 
     def test_safe_extract_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -332,6 +410,17 @@ class AiNieeTests(unittest.TestCase):
                 package.writestr("../outside.txt", "bad")
             with self.assertRaisesRegex(ValueError, "越界路径"):
                 ainiee._safe_extract(archive, root / "out")
+
+    def test_web_dist_extract_requires_official_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "web-dist.zip"
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("dist/index.html", "<html></html>")
+                package.writestr("dist/assets/index.js", "")
+            dist = ainiee._safe_extract_web_dist(archive, root / "out")
+            self.assertTrue((dist / "index.html").is_file())
+            self.assertTrue((dist / "assets" / "index.js").is_file())
 
     def test_dependencies_are_prepared_before_runtime_is_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -347,9 +436,63 @@ class AiNieeTests(unittest.TestCase):
                 self.assertEqual(runtime, ainiee.require_managed_runtime(source, root / "runtimes"))
                 self.assertEqual(1, run.call_count)
 
+                (runtime / "stale-runtime-file").write_text("stale", encoding="utf-8")
+                refreshed = ainiee.prepare_managed_runtime(
+                    source,
+                    root / "runtimes",
+                    force_sync=True,
+                )
+                self.assertEqual(runtime, refreshed)
+                self.assertFalse((refreshed / "stale-runtime-file").exists())
+                self.assertEqual(2, run.call_count)
+
             (runtime / ".uv-sync").unlink()
             with self.assertRaisesRegex(RuntimeError, "请打开设置"):
                 ainiee.require_managed_runtime(source, root / "runtimes")
+
+    def test_source_locator_rejects_multiple_compatible_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_runtime(root / "first")
+            self.make_runtime(root / "second")
+            with self.assertRaisesRegex(FileNotFoundError, "数量为 2"):
+                ainiee.locate_ainiee_source(root)
+
+    def test_managed_package_requires_install_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = self.make_runtime(Path(directory) / "source")
+            with self.assertRaisesRegex(ValueError, "缺少安装元数据"):
+                ainiee._validate_managed_package(source)
+
+    def test_remove_managed_package_also_removes_its_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packages = root / "packages"
+            source = self.make_runtime(packages / "V2.7.5")
+            runtimes = root / "runtimes"
+            owned = runtimes / "owned"
+            unrelated = runtimes / "unrelated"
+            owned.mkdir(parents=True)
+            unrelated.mkdir()
+            (owned / ".wolflator-runtime.json").write_text(
+                json.dumps({"source": str(source.resolve())}),
+                encoding="utf-8",
+            )
+            (unrelated / ".wolflator-runtime.json").write_text(
+                json.dumps({"source": str((root / "other").resolve())}),
+                encoding="utf-8",
+            )
+            ainiee.remove_managed_ainiee(source, packages, runtimes)
+            self.assertFalse(source.exists())
+            self.assertFalse(owned.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_glossary_json_requires_an_array_of_objects(self):
+        self.assertEqual([{"original": "猫"}], ainiee._json_list('[{"original":"猫"}]'))
+        with self.assertRaisesRegex(ValueError, "JSON 数组"):
+            ainiee._json_list('{"data":[]}')
+        with self.assertRaisesRegex(ValueError, "非对象项"):
+            ainiee._json_list('[{}, "bad"]')
 
     def test_api_test_leaves_room_for_reasoning_tokens(self):
         settings = AppSettings(api_base_url="https://example.com/v1", api_model="reasoning-model")
@@ -360,6 +503,36 @@ class AiNieeTests(unittest.TestCase):
         self.assertEqual(
             "你接下来要扮演我的女朋友，名字叫欣雨，请你以女朋友的方式回复我。",
             chat.call_args.kwargs["system_prompt"],
+        )
+
+    def test_translation_profile_uses_verified_deepseek_settings(self):
+        settings = AppSettings(
+            api_base_url="https://api.deepseek.com/v1",
+            api_model="deepseek-v4-flash",
+            api_threads=4,
+        )
+        profile = ainiee._session_profile(settings, "secret")
+        platform = profile["platforms"]["deepseek"]
+        self.assertEqual("deepseek", profile["target_platform"])
+        self.assertEqual({"last_selected_id": 100}, profile["translation_prompt_selection"])
+        self.assertEqual("openai", profile["sdk_request_mode"])
+        self.assertTrue(profile["use_openai_sdk"])
+        self.assertFalse(profile["auto_set_output_path"])
+        self.assertFalse(profile["response_conversion_toggle"])
+        self.assertTrue(profile["auto_process_text_code_segment"])
+        self.assertFalse(platform["think_switch"])
+        self.assertEqual("deepseek-v4-flash", platform["model"])
+
+    def test_empty_dictionary_still_enables_control_protection(self):
+        rules = ainiee._rules_with_control_protection(
+            {"prompt_dictionary_switch": False, "prompt_dictionary_data": []}
+        )
+        self.assertTrue(rules["prompt_dictionary_switch"])
+        self.assertEqual([], rules["prompt_dictionary_data"])
+        self.assertTrue(rules["exclusion_list_switch"])
+        self.assertIn(
+            ainiee.CONTROL_PLACEHOLDER_REGEX,
+            [item["regex"] for item in rules["exclusion_list_data"]],
         )
 
     def test_api_test_uses_dedicated_glossary_settings(self):
@@ -631,17 +804,77 @@ class AiNieeTests(unittest.TestCase):
             input_path.write_text("[]", encoding="utf-8")
             settings = AppSettings(api_base_url="https://example.com/v1", api_model="model")
             fake_result = ToolResult([], 0)
+            output = root / "output"
+            output.mkdir()
+            (output / "input_translated.json").write_text("[]", encoding="utf-8")
             with mock.patch.object(ainiee, "run_process", return_value=fake_result) as run, mock.patch.object(
                 ainiee, "locate_uv", return_value=Path(sys.executable)
             ):
                 with self.assertRaisesRegex(RuntimeError, "没有生成"):
                     ainiee.run_translation(
-                        runtime, input_path, root / "output", dict(ainiee.RULE_DEFAULTS), "project", settings, "secret"
+                        runtime, input_path, output, dict(ainiee.RULE_DEFAULTS), "project", settings, "secret"
                     )
             self.assertEqual(
                 ["run", "--frozen", "--no-sync", "ainiee_cli.py"],
                 run.call_args.args[0][1:5],
             )
+            self.assertNotIn("-p", run.call_args.args[0])
+            self.assertNotIn("--rules-profile", run.call_args.args[0])
+            self.assertFalse((runtime / "Resource" / "profiles" / "WOLFLator_session.json").exists())
+
+    def test_translation_activates_profiles_restores_config_and_reads_v275_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = self.make_runtime(root / "runtime")
+            config_path = runtime / "Resource" / "config.json"
+            original_config = b'{"active_profile":"default","active_rules_profile":"default","keep":1}\n'
+            config_path.write_bytes(original_config)
+            input_path = root / "input.json"
+            input_path.write_text('[{"key":"k","original":"x","translation":"","stage":0}]', encoding="utf-8")
+            output = root / "output"
+            settings = AppSettings(
+                api_base_url="https://api.deepseek.com/v1",
+                api_model="deepseek-v4-flash",
+            )
+
+            def fake_process(command, *, cwd, **_kwargs):
+                self.assertNotIn("-p", command)
+                self.assertNotIn("--rules-profile", command)
+                self.assertEqual("1", _kwargs["env"]["PYTHONUTF8"])
+                self.assertEqual("utf-8", _kwargs["env"]["PYTHONIOENCODING"])
+                active = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual("WOLFLator_session", active["active_profile"])
+                self.assertEqual("WOLFLator_project", active["active_rules_profile"])
+                profile = json.loads(
+                    (runtime / "Resource" / "profiles" / "WOLFLator_session.json").read_text(encoding="utf-8")
+                )
+                rules = json.loads(
+                    (runtime / "Resource" / "rules_profiles" / "WOLFLator_project.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual("secret", profile["platforms"]["deepseek"]["api_key"])
+                self.assertEqual([], rules["prompt_dictionary_data"])
+                self.assertTrue(rules["prompt_dictionary_switch"])
+                self.assertTrue(rules["exclusion_list_switch"])
+                output.mkdir(parents=True, exist_ok=True)
+                (output / input_path.name).write_text(
+                    '[{"key":"k","original":"x","translation":"译文"}]', encoding="utf-8"
+                )
+                return ToolResult(command, 0)
+
+            with mock.patch.object(ainiee, "run_process", side_effect=fake_process), mock.patch.object(
+                ainiee, "locate_uv", return_value=Path(sys.executable)
+            ):
+                translated = ainiee.run_translation(
+                    runtime,
+                    input_path,
+                    output,
+                    {"prompt_dictionary_data": []},
+                    "project",
+                    settings,
+                    "secret",
+                )
+            self.assertEqual("译文", translated[0]["translation"])
+            self.assertEqual(original_config, config_path.read_bytes())
             self.assertFalse((runtime / "Resource" / "profiles" / "WOLFLator_session.json").exists())
 
     def test_translation_failure_includes_ainiee_session_log_tail(self):
