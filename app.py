@@ -63,7 +63,7 @@ from fonts import (
     required_characters,
     resolve_scheme_files,
 )
-from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus
+from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus, default_export_scope
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
 from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
@@ -1027,9 +1027,14 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(QLabel("范围类型"))
         self.scope_mode_group = QButtonGroup(self)
         self.scope_mode_group.setExclusive(True)
+        self.export_scope_button = QPushButton("导出范围")
         self.translation_scope_button = QPushButton("翻译范围")
         self.import_scope_button = QPushButton("导入范围")
-        for button in (self.translation_scope_button, self.import_scope_button):
+        for button in (
+            self.export_scope_button,
+            self.translation_scope_button,
+            self.import_scope_button,
+        ):
             button.setCheckable(True)
             button.setObjectName("segment")
             self.scope_mode_group.addButton(button)
@@ -1038,12 +1043,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(mode_row)
 
         self.scope_stack = QStackedWidget()
+        self.export_scope_checks = self._scope_panel(self.scope_stack, "export")
         self.translation_scope_checks = self._scope_panel(self.scope_stack, "translation")
         self.import_scope_checks = self._scope_panel(self.scope_stack, "import")
         layout.addWidget(self.scope_stack, 1)
-        self.translation_scope_button.setChecked(True)
-        self.translation_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(0))
-        self.import_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(1))
+        self.export_scope_button.setChecked(True)
+        self.export_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(0))
+        self.translation_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(1))
+        self.import_scope_button.clicked.connect(lambda: self.scope_stack.setCurrentIndex(2))
         return page
 
     def _scope_panel(self, stack: QStackedWidget, target: str) -> dict[str, QCheckBox]:
@@ -1057,7 +1064,9 @@ class MainWindow(QMainWindow):
             "halfwidth": QCheckBox("纯半角字符串"),
             "filename": QCheckBox("文件名引用"),
         }
-        checks["display"].setChecked(True)
+        defaults = default_export_scope() if target == "export" else ImportScope()
+        for name, check in checks.items():
+            check.setChecked(bool(getattr(defaults, name)))
         for key, check in checks.items():
             check.toggled.connect(lambda _checked=False, scope_target=target: self._save_scope(scope_target))
             panel_layout.addWidget(check)
@@ -1613,6 +1622,7 @@ class MainWindow(QMainWindow):
             self.retry_button.setToolTip("重试失败阶段")
             self.retry_button.setEnabled(not running and bool(failed_stages))
         for scope, checks in (
+            (manifest.export_scope, self.export_scope_checks),
             (manifest.translation_scope, self.translation_scope_checks),
             (manifest.import_scope, self.import_scope_checks),
         ):
@@ -1672,7 +1682,11 @@ class MainWindow(QMainWindow):
     def _save_scope(self, target: str) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
-        checks = self.translation_scope_checks if target == "translation" else self.import_scope_checks
+        checks = {
+            "export": self.export_scope_checks,
+            "translation": self.translation_scope_checks,
+            "import": self.import_scope_checks,
+        }[target]
         if target == "import" and checks["filename"].isChecked():
             answer = QMessageBox.warning(
                 self,
@@ -1692,7 +1706,9 @@ class MainWindow(QMainWindow):
             local_data_dir(),
             glossary_api_key="",
         )
-        if target == "translation":
+        if target == "export":
+            pipeline.set_export_scope(new_scope)
+        elif target == "translation":
             pipeline.set_translation_scope(new_scope)
         else:
             pipeline.set_import_scope(new_scope)
@@ -1796,9 +1812,14 @@ class MainWindow(QMainWindow):
             control.setEnabled(enabled)
         for button in (*self.step_buttons.values(), *self.step_skip_buttons.values()):
             button.setEnabled(enabled)
-        for checks in (self.translation_scope_checks, self.import_scope_checks):
+        for checks in (
+            self.export_scope_checks,
+            self.translation_scope_checks,
+            self.import_scope_checks,
+        ):
             for check in checks.values():
                 check.setEnabled(enabled)
+        self.export_scope_button.setEnabled(enabled)
         self.translation_scope_button.setEnabled(enabled)
         self.import_scope_button.setEnabled(enabled)
         for index in range(1, self.tabs.count()):

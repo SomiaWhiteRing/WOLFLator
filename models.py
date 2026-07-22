@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MANIFEST_SCHEMA = 1
+MANIFEST_SCHEMA = 2
 
 
 def utc_now() -> str:
@@ -63,6 +63,10 @@ class ImportScope:
         if category is ImportCategory.COPY:
             return False
         return bool(getattr(self, category.value))
+
+
+def default_export_scope() -> ImportScope:
+    return ImportScope(display=True, external=False, optional_name=True, halfwidth=True, filename=True)
 
 
 def _require_fields(data: object, expected: set[str], label: str) -> None:
@@ -193,6 +197,7 @@ class ProjectManifest:
     updated_at: str = field(default_factory=utc_now)
     active_version: str = ""
     run_mode: RunMode = RunMode.ONE_CLICK
+    export_scope: ImportScope = field(default_factory=default_export_scope)
     translation_scope: ImportScope = field(default_factory=ImportScope)
     import_scope: ImportScope = field(default_factory=ImportScope)
     versions: dict[str, VersionManifest] = field(default_factory=dict)
@@ -215,35 +220,45 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
+        schema = data.get("schema")
+        if schema not in (1, MANIFEST_SCHEMA):
+            raise ValueError(f"不支持的项目清单 schema: {schema}")
+        fields = {
+            "project_id",
+            "name",
+            "schema",
+            "created_at",
+            "updated_at",
+            "active_version",
+            "run_mode",
+            "translation_scope",
+            "import_scope",
+            "versions",
+        }
+        if schema == MANIFEST_SCHEMA:
+            fields.add("export_scope")
         _require_fields(
             data,
-            {
-                "project_id",
-                "name",
-                "schema",
-                "created_at",
-                "updated_at",
-                "active_version",
-                "run_mode",
-                "translation_scope",
-                "import_scope",
-                "versions",
-            },
+            fields,
             "项目清单",
         )
-        schema = data["schema"]
-        if schema != MANIFEST_SCHEMA:
-            raise ValueError(f"不支持的项目清单 schema: {schema}")
         scope_fields = {"display", "external", "optional_name", "halfwidth", "filename"}
+        export_scope_data = (
+            data["export_scope"] if schema == MANIFEST_SCHEMA else dataclasses.asdict(default_export_scope())
+        )
         import_scope_data = data["import_scope"]
         translation_scope_data = data["translation_scope"]
-        if not isinstance(import_scope_data, dict) or not isinstance(translation_scope_data, dict):
+        if any(
+            not isinstance(scope, dict)
+            for scope in (export_scope_data, import_scope_data, translation_scope_data)
+        ):
             raise ValueError("项目范围不是对象。")
+        _require_fields(export_scope_data, scope_fields, "导出范围")
         _require_fields(import_scope_data, scope_fields, "导入范围")
         _require_fields(translation_scope_data, scope_fields, "翻译范围")
         if any(
             type(value) is not bool
-            for scope in (import_scope_data, translation_scope_data)
+            for scope in (export_scope_data, import_scope_data, translation_scope_data)
             for value in scope.values()
         ):
             raise ValueError("项目范围值必须是布尔值。")
@@ -255,11 +270,12 @@ class ProjectManifest:
         item = cls(
             project_id=data["project_id"],
             name=data["name"],
-            schema=schema,
+            schema=MANIFEST_SCHEMA,
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             active_version=data["active_version"],
             run_mode=RunMode(data["run_mode"]),
+            export_scope=ImportScope(**export_scope_data),
             translation_scope=ImportScope(**translation_scope_data),
             import_scope=ImportScope(**import_scope_data),
         )

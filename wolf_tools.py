@@ -20,7 +20,7 @@ from typing import Callable, Iterable
 from openpyxl import load_workbook
 
 from fonts import FONT_CODES
-from models import ImportCategory, ImportScope, ToolResult, TranslationItem
+from models import ImportCategory, ImportScope, ToolResult, TranslationItem, default_export_scope
 from safe_io import (
     atomic_output_path,
     atomic_write_bytes,
@@ -48,11 +48,18 @@ COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
 
 
 def full_export_scope() -> ImportScope:
-    return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
+    return default_export_scope()
 
 
-def name_baseline_scope() -> ImportScope:
-    return ImportScope(display=True, external=True, optional_name=False, halfwidth=True, filename=True)
+def name_baseline_scope(scope: ImportScope | None = None) -> ImportScope:
+    source = scope or default_export_scope()
+    return ImportScope(
+        display=source.display,
+        external=source.external,
+        optional_name=False,
+        halfwidth=source.halfwidth,
+        filename=source.filename,
+    )
 
 
 class CancelledError(RuntimeError):

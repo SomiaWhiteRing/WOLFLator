@@ -118,7 +118,8 @@ class WorkbookTests(unittest.TestCase):
             )
             self.assertNotEqual(items[-1].key, items[-2].key)
             payload = to_paratranz(items, full_export_scope())
-            self.assertEqual(7, len(payload))
+            self.assertEqual(6, len(payload))
+            self.assertNotIn("外部テキスト", {row["original"] for row in payload})
             protected = payload[0]["original"]
             self.assertIn(chr(0xE100), protected)
             self.assertNotIn(r"\C[1]", protected)
@@ -216,15 +217,17 @@ class WorkbookTests(unittest.TestCase):
             self.assertIn("没有生成译文", errors[payload[1]["key"]])
             self.assertIn("缺少输出", errors[payload[2]["key"]])
 
-    def test_official_config_exports_all_and_font_rows_are_not_translated(self):
+    def test_official_config_excludes_external_files_and_font_rows_from_translation(self):
         config = _official_config_text(full_export_scope())
         self.assertIn("Tool_A_Get_CommonEvent_Name=1\r\n", config)
         self.assertIn("Tool_A_Get_DB_DataName=1\r\n", config)
-        self.assertIn("Tool_A_Get_TXT=1\r\n", config)
+        self.assertIn("Tool_A_Get_TXT=0\r\n", config)
+        self.assertIn("Tool_A_Get_CSV=0\r\n", config)
         baseline = _official_config_text(name_baseline_scope())
         self.assertIn("Tool_A_Get_CommonEvent_Name=0\r\n", baseline)
         self.assertIn("Tool_A_Get_DB_DataName=0\r\n", baseline)
-        self.assertIn("Tool_A_Get_TXT=1\r\n", baseline)
+        self.assertIn("Tool_A_Get_TXT=0\r\n", baseline)
+        self.assertIn("Tool_A_Get_CSV=0\r\n", baseline)
 
         with tempfile.TemporaryDirectory() as directory:
             source = make_workbook(Path(directory) / "source.xlsx")

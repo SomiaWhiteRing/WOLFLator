@@ -370,10 +370,18 @@ class PipelineTests(unittest.TestCase):
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            legacy = json.loads(json.dumps(data))
             data.pop("translation_scope")
             Path(manifest_path).write_text(json.dumps(data), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "translation_scope"):
                 load_manifest(manifest_path)
+            legacy["schema"] = 1
+            legacy.pop("export_scope")
+            Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = load_manifest(manifest_path)
+            self.assertEqual(2, migrated.schema)
+            self.assertFalse(migrated.export_scope.external)
+            self.assertTrue(migrated.export_scope.optional_name)
 
     def test_manifest_rejects_non_boolean_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -533,7 +541,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]), executed)
 
-    def test_translation_scope_change_keeps_full_export(self):
+    def test_translation_and_export_scope_changes_reset_expected_stages(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
@@ -553,6 +561,11 @@ class PipelineTests(unittest.TestCase):
             second.executed = executed
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]), executed)
+            second.set_export_scope(ImportScope(external=True))
+            changed = load_manifest(manifest_path)
+            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.UNPACK).status)
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
+                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
 
 
 if __name__ == "__main__":

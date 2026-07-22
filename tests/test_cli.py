@@ -134,6 +134,13 @@ class CliTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     0,
+                    cli.main(["scope", str(manifest), "--target", "export", "--external"]),
+                )
+            loaded = cli.load_manifest(manifest)
+            self.assertTrue(loaded.export_scope.external)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    0,
                     cli.main(["scope", str(manifest), "--target", "translation", "--optional-name"]),
                 )
             loaded = cli.load_manifest(manifest)

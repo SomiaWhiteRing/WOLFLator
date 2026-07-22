@@ -123,6 +123,7 @@ def _status(args: argparse.Namespace) -> int:
         "manifest": str(Path(args.manifest).resolve()),
         "active_version": manifest.active_version,
         "run_mode": manifest.run_mode.value,
+        "export_scope": manifest.export_scope.__dict__,
         "translation_scope": manifest.translation_scope.__dict__,
         "import_scope": manifest.import_scope.__dict__,
         "busy": busy,
@@ -274,17 +275,19 @@ def _retry(args: argparse.Namespace) -> int:
 def _scope(args: argparse.Namespace) -> int:
     with project_lock(args.manifest, f"set-{args.target}-scope"):
         pipeline = _pipeline(args)
-        current = (
-            pipeline.manifest.translation_scope
-            if args.target == "translation"
-            else pipeline.manifest.import_scope
-        )
+        current = {
+            "export": pipeline.manifest.export_scope,
+            "translation": pipeline.manifest.translation_scope,
+            "import": pipeline.manifest.import_scope,
+        }[args.target]
         values = {
             name: getattr(args, name) if getattr(args, name) is not None else getattr(current, name)
             for name in ("display", "external", "optional_name", "halfwidth", "filename")
         }
         scope = ImportScope(**values)
-        if args.target == "translation":
+        if args.target == "export":
+            pipeline.set_export_scope(scope)
+        elif args.target == "translation":
             pipeline.set_translation_scope(scope)
         else:
             pipeline.set_import_scope(scope)
@@ -340,11 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
     retry = subparsers.add_parser("retry", help="重置失败/取消阶段及其后续阶段")
     retry.add_argument("manifest", help="project.json")
 
-    scope = subparsers.add_parser("scope", help="查看或修改翻译范围或导入范围")
+    scope = subparsers.add_parser("scope", help="查看或修改导出、翻译或导入范围")
     scope.add_argument("manifest", help="project.json")
     scope.add_argument(
         "--target",
-        choices=("translation", "import"),
+        choices=("export", "translation", "import"),
         default="import",
         help="要修改的范围（默认 import）",
     )

@@ -378,6 +378,17 @@ class Pipeline:
                 record.error = ""
             self.save()
 
+    def set_export_scope(self, scope: ImportScope) -> None:
+        with self._mutation("set-export-scope"):
+            if self.manifest.export_scope == scope:
+                return
+            self.manifest.export_scope = scope
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
+                record = self.manifest.version.stage(stage)
+                record.status = StageStatus.PENDING
+                record.error = ""
+            self.save()
+
     def set_translation_scope(self, scope: ImportScope) -> None:
         with self._mutation("set-translation-scope"):
             if self.manifest.translation_scope == scope:
@@ -428,6 +439,7 @@ class Pipeline:
             extra["wolf_tool"] = str(tool.resolve()) if tool.exists() else str(tool)
             extra["wolf_tool_size"] = tool.stat().st_size if tool.is_file() else 0
             extra["export_schema"] = EXPORT_SCHEMA
+            extra["export_scope"] = self.manifest.export_scope.__dict__
         elif stage is Stage.GLOSSARY:
             extra.update(
                 {
@@ -492,7 +504,7 @@ class Pipeline:
                 record.status = StageStatus.PENDING
                 record.error = ""
         if invalid:
-            self.log("检测到工具、API、术语或导入范围变化，已重置受影响的下游阶段。")
+            self.log("检测到工具、API、术语或范围变化，已重置受影响的下游阶段。")
             self.save()
 
     def _check_source_unchanged(self) -> None:
@@ -598,8 +610,8 @@ class Pipeline:
         return {"data": str(self.work_dir / "Data"), "uberwolf": str(executable)}
 
     def _extract(self) -> dict[str, str]:
-        runner = self._official_runner(full_export_scope())
-        self.log("正在生成全量 WOLF 翻译工作簿...")
+        runner = self._official_runner(self.manifest.export_scope)
+        self.log("正在按导出范围生成 WOLF 翻译工作簿...")
         previous = self._previous_version()
         previous_full = None
         conflicts: list[dict[str, object]] = []
@@ -631,7 +643,7 @@ class Pipeline:
         shutil.copy2(workbook, extracted)
 
         self.log("正在生成名称分类基准工作簿...")
-        baseline_workbook = self._official_runner(name_baseline_scope()).extract(
+        baseline_workbook = self._official_runner(name_baseline_scope(self.manifest.export_scope)).extract(
             self.work_dir,
             cancel_event=self.cancel_event,
             log=self.log,
