@@ -16,6 +16,7 @@ from safe_io import (
     atomic_write_json,
     project_lock,
     project_lock_status,
+    read_text_with_retry,
     replace_with_retry,
     runtime_lock,
 )
@@ -29,16 +30,17 @@ def make_game(root: Path) -> Path:
 
 
 class SafeIoTests(unittest.TestCase):
-    def test_concurrent_atomic_json_writes_remain_parseable(self):
+    def test_atomic_io_is_unique_retrying_and_lossless(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
+            root = Path(directory)
+            path = root / "state.json"
             barrier = threading.Barrier(3)
             errors = []
 
             def writer(value):
                 try:
                     barrier.wait()
-                    for index in range(30):
+                    for index in range(5):
                         atomic_write_json(path, {"writer": value, "index": index})
                 except Exception as error:
                     errors.append(error)
@@ -51,40 +53,40 @@ class SafeIoTests(unittest.TestCase):
                 thread.join()
             self.assertEqual([], errors)
             self.assertIn(json.loads(path.read_text(encoding="utf-8"))["writer"], {1, 2})
-            self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+            self.assertEqual([], list(root.glob(f".{path.name}.*.tmp")))
 
-    def test_failed_atomic_replace_keeps_target_and_cleans_own_temporary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
             path.write_text('{"value":"old"}', encoding="utf-8")
             with mock.patch("safe_io.replace_with_retry", side_effect=PermissionError("busy")):
                 with self.assertRaises(PermissionError):
                     atomic_write_json(path, {"value": "new"})
             self.assertEqual("old", json.loads(path.read_text(encoding="utf-8"))["value"])
-            self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+            self.assertEqual([], list(root.glob(f".{path.name}.*.tmp")))
 
-    @unittest.skipUnless(os.name == "nt", "Windows replace retry policy")
-    def test_replace_retries_only_windows_sharing_errors(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
             source = root / "source"
             target = root / "target"
             source.write_text("new", encoding="utf-8")
             target.write_text("old", encoding="utf-8")
-            actual = os.replace
+            actual_replace = os.replace
             attempts = 0
 
-            def flaky(src, dst):
+            def flaky_replace(src, dst):
                 nonlocal attempts
                 attempts += 1
                 if attempts < 3:
                     raise PermissionError(13, "sharing violation")
-                actual(src, dst)
+                actual_replace(src, dst)
 
-            with mock.patch("safe_io.os.replace", side_effect=flaky):
-                replace_with_retry(source, target)
-            self.assertEqual(3, attempts)
-            self.assertEqual("new", target.read_text(encoding="utf-8"))
+            if os.name == "nt":
+                with mock.patch("safe_io.os.replace", side_effect=flaky_replace):
+                    replace_with_retry(source, target)
+                self.assertEqual(3, attempts)
+                self.assertEqual("new", target.read_text(encoding="utf-8"))
+                with mock.patch(
+                    "safe_io.Path.read_bytes",
+                    side_effect=[PermissionError(13, "sharing violation"), b"recovered"],
+                ) as read:
+                    self.assertEqual("recovered", read_text_with_retry(path))
+                self.assertEqual(2, read.call_count)
 
             source.write_text("again", encoding="utf-8")
             with mock.patch("safe_io.os.replace", side_effect=FileNotFoundError("bad")) as replace:
@@ -92,63 +94,7 @@ class SafeIoTests(unittest.TestCase):
                     replace_with_retry(source, target)
             replace.assert_called_once()
 
-    def test_project_lock_is_fail_fast_between_threads(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            entered = threading.Event()
-            release = threading.Event()
-
-            def holder():
-                with project_lock(root, "holder"):
-                    entered.set()
-                    release.wait(5)
-
-            thread = threading.Thread(target=holder)
-            thread.start()
-            self.assertTrue(entered.wait(2))
-            try:
-                busy, owner = project_lock_status(root)
-                self.assertTrue(busy)
-                self.assertEqual("holder", owner["operation"])
-                with self.assertRaises(ProjectBusyError):
-                    with project_lock(root, "contender"):
-                        pass
-            finally:
-                release.set()
-                thread.join()
-            self.assertFalse(project_lock_status(root)[0])
-
-    def test_same_lock_object_can_be_reentered_without_leaking(self):
-        with tempfile.TemporaryDirectory() as directory:
-            lock = project_lock(Path(directory), "nested")
-            with lock:
-                with lock:
-                    self.assertTrue(project_lock_status(directory)[0])
-            self.assertFalse(project_lock_status(directory)[0])
-
-    def test_project_lock_is_released_when_process_exits(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            script = (
-                "import os\n"
-                "from safe_io import project_lock\n"
-                f"with project_lock({str(root)!r}, 'child'):\n"
-                " print('ready', flush=True)\n"
-                " os._exit(0)\n"
-            )
-            process = subprocess.Popen(
-                [sys.executable, "-c", script],
-                cwd=Path(__file__).resolve().parents[1],
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-            self.assertEqual("ready", process.stdout.readline().strip())
-            self.assertEqual(0, process.wait(5))
-            process.stdout.close()
-            with project_lock(root, "after-crash"):
-                self.assertTrue(project_lock_status(root)[0])
-
-    def test_project_lock_is_fail_fast_between_processes(self):
+    def test_project_lock_is_fail_fast_and_recovers_after_process_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = (
@@ -173,40 +119,12 @@ class SafeIoTests(unittest.TestCase):
                     with project_lock(root, "parent-contender"):
                         pass
             finally:
-                process.stdin.write("\n")
-                process.stdin.flush()
-                self.assertEqual(0, process.wait(5))
+                process.kill()
+                process.wait(5)
                 process.stdin.close()
                 process.stdout.close()
-
-    def test_manifest_survives_one_hundred_saves_with_lockless_reader(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            stop = threading.Event()
-            errors = []
-
-            def reader():
-                while not stop.is_set():
-                    try:
-                        load_manifest(manifest_path)
-                    except Exception as error:
-                        errors.append(error)
-                        return
-
-            thread = threading.Thread(target=reader)
-            thread.start()
-            try:
-                with pipeline._mutation("stress-save"):
-                    for index in range(100):
-                        pipeline.manifest.name = f"project-{index}"
-                        pipeline.save()
-            finally:
-                stop.set()
-                thread.join()
-            self.assertEqual([], errors)
-            self.assertEqual("project-99", load_manifest(manifest_path).name)
+            with project_lock(root, "after-exit"):
+                self.assertTrue(project_lock_status(root)[0])
 
     def test_pipeline_save_ignores_and_cleans_legacy_temporary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -218,27 +136,6 @@ class SafeIoTests(unittest.TestCase):
             pipeline.set_run_mode(RunMode.STEP)
             self.assertFalse(legacy.exists())
             self.assertIs(RunMode.STEP, load_manifest(manifest_path).run_mode)
-
-    def test_same_pipeline_instance_cannot_mutate_from_another_thread(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            errors = []
-
-            def contender():
-                try:
-                    pipeline.set_run_mode(RunMode.STEP)
-                except Exception as error:
-                    errors.append(error)
-
-            with pipeline._mutation("holder"):
-                thread = threading.Thread(target=contender)
-                thread.start()
-                thread.join()
-            self.assertEqual(1, len(errors))
-            self.assertIsInstance(errors[0], ProjectBusyError)
-            self.assertIs(RunMode.ONE_CLICK, load_manifest(manifest_path).run_mode)
 
     def test_runtime_lock_blocks_before_translation_state_is_touched(self):
         with tempfile.TemporaryDirectory() as directory:

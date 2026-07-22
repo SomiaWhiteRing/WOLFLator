@@ -177,7 +177,7 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertIn("schema", window.status_label.toolTip())
                 window.close()
 
-    def test_step_mode_uses_per_stage_progress_and_keeps_completed_stage_runnable(self):
+    def test_step_mode_progress_and_running_ui_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             game = root / "game"
@@ -199,21 +199,6 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertEqual(1, window.progress.maximum())
                 self.assertTrue(window.step_buttons[Stage.COPY].isEnabled())
                 self.assertTrue(window.retry_button.isEnabled())
-                window.close()
-
-    def test_running_ui_is_locked_and_progress_does_not_reload_manifest(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            game = root / "game"
-            (game / "Data" / "BasicData").mkdir(parents=True)
-            (game / "Game.exe").write_bytes(b"game")
-            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
-            projects = root / "projects"
-            manifest_path = create_project(projects, game)
-            store = SettingsStore(root / "settings.ini")
-            store.save(AppSettings(projects_root=str(projects), last_project=str(manifest_path)))
-            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
-                window = MainWindow()
                 window._set_pipeline_ui_locked(True)
                 self.assertFalse(window.settings_button.isEnabled())
                 self.assertFalse(window.project_combo.isEnabled())

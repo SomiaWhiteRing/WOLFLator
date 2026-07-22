@@ -287,16 +287,6 @@ class PipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "font failed"):
                     pipeline._release()
             self.assertEqual("keep", (pipeline.release_dir / "old.txt").read_text(encoding="utf-8"))
-
-    def test_busy_release_directory_keeps_previous_release(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            translated = make_game(root / "translated")
-            pipeline.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"] = str(translated)
-            pipeline.release_dir.mkdir(parents=True)
-            (pipeline.release_dir / "old.txt").write_text("keep", encoding="utf-8")
             with mock.patch("pipeline.load_font_scheme", return_value=None), mock.patch(
                 "pipeline.replace_with_retry",
                 side_effect=PermissionError(13, "sharing violation"),

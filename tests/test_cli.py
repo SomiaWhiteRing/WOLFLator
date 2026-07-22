@@ -33,7 +33,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual("WOLFLator", QCoreApplication.applicationName())
             self.assertEqual("WOLFLator", QCoreApplication.organizationName())
 
-    def test_status_json_is_machine_readable(self):
+    def test_status_json_and_busy_project_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = create_project(root / "projects", make_game(root / "game"))
@@ -43,6 +43,36 @@ class CliTests(unittest.TestCase):
             result = json.loads(output.getvalue())
             self.assertEqual("game", result["project"])
             self.assertEqual("pending", result["stages"]["copy"]["status"])
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def holder():
+                with project_lock(manifest, "test-holder"):
+                    entered.set()
+                    release.wait(5)
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(0, cli.main(["status", str(manifest), "--json"]))
+                status = json.loads(output.getvalue())
+                self.assertTrue(status["busy"])
+                self.assertEqual("test-holder", status["lock"]["operation"])
+
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    self.assertEqual(
+                        3,
+                        cli.main(["run", str(manifest), "--stage", "copy"]),
+                    )
+                self.assertIn("test-holder", errors.getvalue())
+            finally:
+                release.set()
+                thread.join()
 
     def test_project_create_uses_persisted_projects_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,41 +169,6 @@ class CliTests(unittest.TestCase):
             ), redirect_stderr(errors):
                 self.assertEqual(1, cli.main(["run", str(manifest)]))
             self.assertIn("runtime missing", errors.getvalue())
-
-    def test_busy_project_status_works_and_mutation_returns_three(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest = create_project(root / "projects", make_game(root / "game"))
-            entered = threading.Event()
-            release = threading.Event()
-
-            def holder():
-                with project_lock(manifest, "test-holder"):
-                    entered.set()
-                    release.wait(5)
-
-            thread = threading.Thread(target=holder)
-            thread.start()
-            self.assertTrue(entered.wait(2))
-            try:
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    self.assertEqual(0, cli.main(["status", str(manifest), "--json"]))
-                status = json.loads(output.getvalue())
-                self.assertTrue(status["busy"])
-                self.assertEqual("test-holder", status["lock"]["operation"])
-
-                errors = io.StringIO()
-                with redirect_stderr(errors):
-                    self.assertEqual(
-                        3,
-                        cli.main(["run", str(manifest), "--stage", "copy"]),
-                    )
-                self.assertIn("test-holder", errors.getvalue())
-            finally:
-                release.set()
-                thread.join()
-
 
 if __name__ == "__main__":
     unittest.main()
