@@ -49,9 +49,24 @@ from ainiee import (
     remove_managed_ainiee,
     test_api,
 )
+from fonts import (
+    FONT_SLOT_NAMES,
+    FontCandidate,
+    candidate_for_family,
+    coverage_fingerprint,
+    discover_font_candidates,
+    font_file_info,
+    load_font_scheme,
+    load_original_fonts,
+    materialize_candidate,
+    record_original_fonts,
+    required_characters,
+    resolve_scheme_files,
+)
 from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus
 from pipeline import Pipeline, add_version, create_project, load_manifest
 from settings import SettingsStore, local_data_dir, validate_settings
+from wolf_tools import final_display_texts, load_items, read_font_slots
 
 
 STAGE_LABELS = {
@@ -157,6 +172,95 @@ class ApiTestThread(QThread):
             self.succeeded.emit(test_api(self.settings, self.api_key, glossary=self.glossary))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class FontScanThread(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str, str)
+
+    def __init__(self, manifest_path: Path):
+        super().__init__()
+        self.manifest_path = manifest_path
+
+    def run(self) -> None:
+        try:
+            manifest = load_manifest(self.manifest_path)
+            record = manifest.version.stage(Stage.VALIDATE)
+            items_path = record.artifacts.get("items", "")
+            if record.status is not StageStatus.COMPLETED or not items_path or not Path(items_path).is_file():
+                raise RuntimeError("完成“校验译文”后才能检查和修改字体。")
+            items = load_items(items_path)
+            extract = manifest.version.stage(Stage.EXTRACT).artifacts
+            original_record = load_original_fonts(
+                self.manifest_path.parent, manifest.active_version
+            )
+            if original_record is None:
+                source_items = load_items(extract["items"])
+                record_original_fonts(
+                    self.manifest_path.parent,
+                    manifest.active_version,
+                    read_font_slots(source_items),
+                    manifest.version.source_hash,
+                    extract["workbook"],
+                )
+                original_record = load_original_fonts(
+                    self.manifest_path.parent, manifest.active_version
+                )
+            if original_record is None:
+                raise RuntimeError("无法建立当前版本的原字体记录。")
+            original_slots = list(original_record["slots"])
+            required = required_characters(final_display_texts(items, manifest.import_scope))
+            version_dir = self.manifest_path.parent / "versions" / manifest.active_version
+            game_root = version_dir / "work"
+            if not game_root.is_dir():
+                game_root = version_dir / "source"
+            if not game_root.is_dir():
+                game_root = Path(manifest.version.original_path)
+            candidates = discover_font_candidates(game_root, required)
+            scheme = load_font_scheme(self.manifest_path.parent)
+            if scheme is not None:
+                resolved = resolve_scheme_files(self.manifest_path.parent, scheme)
+                for slot, files in zip(scheme["slots"], resolved, strict=True):
+                    if slot["mode"] != "font":
+                        continue
+                    if any(
+                        candidate.source == slot["provenance"]
+                        and candidate.family.casefold() == str(slot["family"]).casefold()
+                        for candidate in candidates
+                    ):
+                        continue
+                    coverage: set[int] = set()
+                    aliases: set[str] = {str(slot["family"])}
+                    for path in files:
+                        families, codepoints = font_file_info(path)
+                        aliases.update(families)
+                        coverage.update(codepoints)
+                    candidates.append(
+                        FontCandidate(
+                            source=str(slot["provenance"]),
+                            family=str(slot["family"]),
+                            aliases=tuple(sorted(aliases, key=str.casefold)),
+                            files=tuple(files),
+                            missing=frozenset(
+                                character for character in required if ord(character) not in coverage
+                            ),
+                        )
+                    )
+            release_record = manifest.version.stage(Stage.RELEASE)
+            self.succeeded.emit(
+                {
+                    "manifest": str(self.manifest_path),
+                    "scheme": scheme,
+                    "original_slots": original_slots,
+                    "required": required,
+                    "candidates": candidates,
+                    "release_status": release_record.status.value,
+                    "font_warning_count": release_record.artifacts.get("font_warning_count", "0"),
+                    "font_warnings": release_record.artifacts.get("font_warnings", ""),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(self.manifest_path), str(exc))
 
 
 def _path_row(line_edit: QLineEdit, button_text: str, callback) -> QWidget:
@@ -608,6 +712,10 @@ class MainWindow(QMainWindow):
         self.settings = self.store.load()
         self.pipeline: Pipeline | None = None
         self.pipeline_thread: PipelineThread | None = None
+        self.font_scan_thread: FontScanThread | None = None
+        self.font_context: dict[str, object] | None = None
+        self.font_apply_active = False
+        self.font_application_ids: list[int] = []
         self.active_step_stage: Stage | None = None
         self.current_manifest_path: Path | None = None
         self.setWindowTitle("WOLFLator")
@@ -656,6 +764,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._workflow_tab(), "流程")
         self.tabs.addTab(self._glossary_tab(), "术语")
         self.tabs.addTab(self._scope_tab(), "范围")
+        self.tabs.addTab(self._font_tab(), "修改字体")
         layout.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -937,6 +1046,390 @@ class MainWindow(QMainWindow):
         stack.addWidget(panel)
         return checks
 
+    def _font_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        self.font_status = QLabel("选择项目后读取字体")
+        self.font_status.setObjectName("secondaryText")
+        header.addWidget(self.font_status, 1)
+        self.show_incompatible_fonts = QCheckBox("显示不兼容字体")
+        self.show_incompatible_fonts.toggled.connect(self._populate_font_choices)
+        header.addWidget(self.show_incompatible_fonts)
+        self.refresh_fonts_button = QToolButton()
+        self.refresh_fonts_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.refresh_fonts_button.setToolTip("刷新字体目录")
+        self.refresh_fonts_button.clicked.connect(lambda: self._refresh_font_tab(force=True))
+        header.addWidget(self.refresh_fonts_button)
+        layout.addLayout(header)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        for column, title in enumerate(("字体槽位", "原字体", "待应用字体", "字符覆盖", "预览")):
+            label = QLabel(title)
+            label.setObjectName("panelTitle")
+            grid.addWidget(label, 0, column)
+        self.font_original_labels: list[QLabel] = []
+        self.font_combos: list[QComboBox] = []
+        self.font_coverage_labels: list[QLabel] = []
+        self.font_preview_original: list[QLabel] = []
+        self.font_preview_selected: list[QLabel] = []
+        for index, slot_name in enumerate(FONT_SLOT_NAMES, start=1):
+            slot = QLabel(slot_name)
+            original = QLabel("-")
+            original.setObjectName("secondaryText")
+            combo = QComboBox()
+            combo.setMinimumWidth(230)
+            combo.currentIndexChanged.connect(self._update_font_rows)
+            coverage = QLabel("-")
+            coverage.setObjectName("secondaryText")
+            preview = QWidget()
+            preview_layout = QVBoxLayout(preview)
+            preview_layout.setContentsMargins(0, 0, 0, 0)
+            preview_layout.setSpacing(2)
+            original_preview = QLabel("")
+            selected_preview = QLabel("")
+            preview_layout.addWidget(original_preview)
+            preview_layout.addWidget(selected_preview)
+            grid.addWidget(slot, index, 0)
+            grid.addWidget(original, index, 1)
+            grid.addWidget(combo, index, 2)
+            grid.addWidget(coverage, index, 3)
+            grid.addWidget(preview, index, 4)
+            self.font_original_labels.append(original)
+            self.font_combos.append(combo)
+            self.font_coverage_labels.append(coverage)
+            self.font_preview_original.append(original_preview)
+            self.font_preview_selected.append(selected_preview)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 2)
+        grid.setColumnStretch(4, 2)
+        layout.addLayout(grid)
+
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("预览文本"))
+        self.font_preview_text = QLineEdit("你好，世界。漢字")
+        self.font_preview_text.textChanged.connect(self._update_font_rows)
+        preview_row.addWidget(self.font_preview_text, 1)
+        layout.addLayout(preview_row)
+        layout.addStretch(1)
+
+        actions = QHBoxLayout()
+        self.restore_fonts_button = QPushButton("恢复项目原字体")
+        self.restore_fonts_button.clicked.connect(self._restore_fonts)
+        self.save_fonts_button = QPushButton("保存方案")
+        self.save_fonts_button.clicked.connect(lambda: self._save_font_scheme())
+        self.apply_fonts_button = QPushButton("应用到发布目录")
+        self.apply_fonts_button.setObjectName("primaryButton")
+        self.apply_fonts_button.clicked.connect(self._apply_fonts)
+        self.open_font_release_button = QPushButton("打开发布目录")
+        self.open_font_release_button.clicked.connect(self._open_release)
+        actions.addWidget(self.restore_fonts_button)
+        actions.addStretch(1)
+        actions.addWidget(self.open_font_release_button)
+        actions.addWidget(self.save_fonts_button)
+        actions.addWidget(self.apply_fonts_button)
+        layout.addLayout(actions)
+        self._set_font_controls_enabled(False)
+        return page
+
+    def _set_font_controls_enabled(self, enabled: bool) -> None:
+        running = bool(self.pipeline_thread and self.pipeline_thread.isRunning())
+        for combo in getattr(self, "font_combos", []):
+            combo.setEnabled(enabled and not running)
+        for widget in (
+            getattr(self, "show_incompatible_fonts", None),
+            getattr(self, "refresh_fonts_button", None),
+            getattr(self, "restore_fonts_button", None),
+            getattr(self, "save_fonts_button", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled and not running)
+        can_apply = False
+        if enabled and not running and self.current_manifest_path:
+            manifest = load_manifest(self.current_manifest_path)
+            import_record = manifest.version.stage(Stage.IMPORT)
+            translated = import_record.artifacts.get("translated_game", "")
+            can_apply = import_record.status is StageStatus.COMPLETED and bool(
+                translated and Path(translated).is_dir()
+            )
+        if hasattr(self, "apply_fonts_button"):
+            self.apply_fonts_button.setEnabled(can_apply)
+
+    def _release_font_previews(self) -> None:
+        for font_id in self.font_application_ids:
+            QFontDatabase.removeApplicationFont(font_id)
+        self.font_application_ids.clear()
+
+    def _clear_font_view(self, message: str = "选择项目后读取字体") -> None:
+        self.font_context = None
+        self._release_font_previews()
+        if hasattr(self, "font_status"):
+            self.font_status.setText(message)
+            self.font_status.setToolTip("")
+            for label in self.font_original_labels + self.font_coverage_labels:
+                label.setText("-")
+                label.setToolTip("")
+            for combo in self.font_combos:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.blockSignals(False)
+            for label in self.font_preview_original + self.font_preview_selected:
+                label.clear()
+            self._set_font_controls_enabled(False)
+
+    def _refresh_font_tab(self, *, force: bool = False) -> None:
+        if not self.current_manifest_path:
+            self._clear_font_view()
+            return
+        current = str(self.current_manifest_path)
+        if not force and self.font_context and self.font_context.get("manifest") == current:
+            self._set_font_controls_enabled(True)
+            return
+        manifest = load_manifest(self.current_manifest_path)
+        validate_record = manifest.version.stage(Stage.VALIDATE)
+        if validate_record.status is not StageStatus.COMPLETED:
+            self._clear_font_view("完成“校验译文”后才能检查和修改字体")
+            return
+        self.font_context = None
+        self._set_font_controls_enabled(False)
+        self.font_status.setText("正在扫描游戏、随附和系统字体...")
+        if self.font_scan_thread and self.font_scan_thread.isRunning():
+            return
+        self.font_scan_thread = FontScanThread(self.current_manifest_path)
+        self.font_scan_thread.succeeded.connect(self._font_scan_succeeded)
+        self.font_scan_thread.failed.connect(self._font_scan_failed)
+        self.font_scan_thread.finished.connect(self._font_scan_finished)
+        self.font_scan_thread.start()
+
+    def _font_scan_succeeded(self, context: object) -> None:
+        if not isinstance(context, dict) or not self.current_manifest_path:
+            return
+        if context.get("manifest") != str(self.current_manifest_path):
+            return
+        self.font_context = context
+        self._release_font_previews()
+        for candidate in context["candidates"]:
+            if candidate.source == "system":
+                continue
+            for path in candidate.files:
+                font_id = QFontDatabase.addApplicationFont(str(path))
+                if font_id >= 0:
+                    self.font_application_ids.append(font_id)
+        warning_value = str(context.get("font_warning_count", "0"))
+        warning_count = int(warning_value) if warning_value.isdigit() else 0
+        if warning_count:
+            self.font_status.setText(f"已扫描 {len(context['candidates'])} 个字体；发布版有 {warning_count} 个缺字警告")
+            self.font_status.setToolTip(str(context.get("font_warnings", "")))
+        else:
+            self.font_status.setText(
+                f"已扫描 {len(context['candidates'])} 个字体，检查 {len(context['required'])} 个实际文本字符"
+            )
+            self.font_status.setToolTip("")
+        self._populate_font_choices()
+        self._set_font_controls_enabled(True)
+
+    def _font_scan_failed(self, manifest_path: str, error: str) -> None:
+        if self.current_manifest_path and manifest_path == str(self.current_manifest_path):
+            self._clear_font_view(error)
+
+    def _font_scan_finished(self) -> None:
+        scanned = self.font_scan_thread.manifest_path if self.font_scan_thread else None
+        self.font_scan_thread = None
+        if self.current_manifest_path and scanned != self.current_manifest_path:
+            self._refresh_font_tab(force=True)
+
+    def _populate_font_choices(self) -> None:
+        if not self.font_context:
+            return
+        candidates: list[FontCandidate] = self.font_context["candidates"]
+        show_all = self.show_incompatible_fonts.isChecked()
+        visible = [
+            candidate
+            for candidate in candidates
+            if show_all or candidate.source != "system" or len(candidate.missing) <= 10
+        ]
+        scheme = self.font_context.get("scheme")
+        slots = scheme["slots"] if isinstance(scheme, dict) else [{"mode": "keep"}] * 4
+        for index, combo in enumerate(self.font_combos):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("保持项目原字体", None)
+            labels: set[str] = set()
+            for candidate in visible:
+                label = candidate.label
+                suffix = 2
+                base = label
+                while label in labels:
+                    label = f"{base} ({suffix})"
+                    suffix += 1
+                labels.add(label)
+                combo.addItem(label, candidate)
+                combo.setItemData(combo.count() - 1, label, Qt.ToolTipRole)
+            selection = slots[index]
+            selected_index = 0
+            if selection["mode"] == "font":
+                for candidate_index in range(1, combo.count()):
+                    candidate = combo.itemData(candidate_index)
+                    if (
+                        candidate.source == selection["provenance"]
+                        and candidate.family.casefold() == str(selection["family"]).casefold()
+                    ):
+                        selected_index = candidate_index
+                        break
+                if selected_index == 0:
+                    candidate = next(
+                        (
+                            item
+                            for item in candidates
+                            if item.source == selection["provenance"]
+                            and item.family.casefold() == str(selection["family"]).casefold()
+                        ),
+                        None,
+                    )
+                    if candidate:
+                        combo.addItem(f"[当前方案] {candidate.family}", candidate)
+                        selected_index = combo.count() - 1
+            combo.setCurrentIndex(selected_index)
+            combo.blockSignals(False)
+        self._update_font_rows()
+
+    def _update_font_rows(self) -> None:
+        if not self.font_context:
+            return
+        required: set[str] = self.font_context["required"]
+        candidates: list[FontCandidate] = self.font_context["candidates"]
+        original_slots: list[str] = self.font_context["original_slots"]
+        sample = self.font_preview_text.text() or "字体预览"
+        for index, combo in enumerate(self.font_combos):
+            self.font_original_labels[index].setText(original_slots[index] or "未设置")
+            self.font_original_labels[index].setToolTip(original_slots[index])
+            selection = combo.currentData()
+            candidate = selection or candidate_for_family(candidates, original_slots[index])
+            family = selection.family if selection else original_slots[index]
+            if candidate is None:
+                text = "无法定位字体文件"
+                missing = required
+            else:
+                missing = set(candidate.missing)
+                text = (
+                    f"覆盖全部 {len(required)} 字"
+                    if not missing
+                    else "缺少 "
+                    + str(len(missing))
+                    + " 字："
+                    + f"U+{ord(min(missing, key=ord)):04X}"
+                    + (" 等" if len(missing) > 1 else "")
+                )
+            self.font_coverage_labels[index].setText(text)
+            self.font_coverage_labels[index].setToolTip(
+                "\n".join(
+                    f"U+{ord(character):04X}  {character}"
+                    for character in sorted(missing, key=ord)
+                )[:4000]
+            )
+            original_family = original_slots[index] or QApplication.font().family()
+            selected_family = family or QApplication.font().family()
+            self.font_preview_original[index].setText("原  " + sample)
+            self.font_preview_selected[index].setText("新  " + sample)
+            self.font_preview_original[index].setFont(QFont(original_family, 12))
+            self.font_preview_selected[index].setFont(QFont(selected_family, 12))
+
+    def _selected_font_candidates(self) -> list[FontCandidate | None]:
+        return [combo.currentData() for combo in self.font_combos]
+
+    def _store_font_scheme(self, *, refresh: bool) -> bool:
+        if not self.current_manifest_path or not self.font_context:
+            return False
+        selections = self._selected_font_candidates()
+        system_families = sorted(
+            {candidate.family for candidate in selections if candidate and candidate.source == "system"}
+        )
+        if system_families:
+            answer = QMessageBox.question(
+                self,
+                "系统字体授权确认",
+                "将把以下系统字体复制到项目和发布目录：\n"
+                + "\n".join(system_families)
+                + "\n\n请确认你有权随译版分发这些字体。",
+            )
+            if answer != QMessageBox.Yes:
+                return False
+        missing_count = 0
+        required: set[str] = self.font_context["required"]
+        candidates: list[FontCandidate] = self.font_context["candidates"]
+        original_slots: list[str] = self.font_context["original_slots"]
+        for index, candidate in enumerate(selections):
+            effective = candidate or candidate_for_family(candidates, original_slots[index])
+            missing_count += len(effective.missing) if effective else len(required)
+        if missing_count:
+            answer = QMessageBox.warning(
+                self,
+                "字体仍有缺字",
+                f"四个字体槽合计缺少 {missing_count} 个字符覆盖。发布可以继续，但游戏可能依赖字体回退。",
+                QMessageBox.Ok | QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Ok:
+                return False
+        slots = [
+            {"mode": "keep"}
+            if candidate is None
+            else materialize_candidate(self.current_manifest_path.parent, candidate)
+            for candidate in selections
+        ]
+        scheme: dict[str, object] = {
+            "schema": 1,
+            "origin": "user",
+            "slots": slots,
+            "coverage_ack": None,
+        }
+        if missing_count:
+            scheme["coverage_ack"] = {
+                "fingerprint": coverage_fingerprint(required, scheme),
+                "missing_count": missing_count,
+            }
+        pipeline = Pipeline(
+            self.current_manifest_path,
+            self.settings,
+            "",
+            local_data_dir(),
+            glossary_api_key="",
+        )
+        pipeline.set_font_scheme(scheme)
+        if self.pipeline:
+            self.pipeline.manifest = pipeline.manifest
+        self.status_label.setText("字体方案已保存")
+        self.font_context = None
+        if refresh:
+            self._load_project_view()
+            self._refresh_font_tab(force=True)
+        return True
+
+    def _save_font_scheme(self) -> None:
+        try:
+            self._store_font_scheme(refresh=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法保存字体方案", str(exc))
+
+    def _restore_fonts(self) -> None:
+        for combo in self.font_combos:
+            combo.setCurrentIndex(0)
+        self._save_font_scheme()
+
+    def _apply_fonts(self) -> None:
+        try:
+            if not self._store_font_scheme(refresh=False):
+                return
+            self.font_apply_active = True
+            self._start(Stage.RELEASE, switch_to_step=False)
+        except Exception as exc:
+            self.font_apply_active = False
+            QMessageBox.critical(self, "无法应用字体", str(exc))
+
     def _open_settings(self, _checked=False, first_run: bool = False) -> None:
         dialog = SettingsDialog(self.store, self)
         if dialog.exec() == QDialog.Accepted:
@@ -969,6 +1462,7 @@ class MainWindow(QMainWindow):
 
     def _project_changed(self, _index: int) -> None:
         value = self.project_combo.currentData()
+        self.font_context = None
         self.current_manifest_path = Path(value) if value else None
         if not self.current_manifest_path:
             self._clear_project_view()
@@ -1006,6 +1500,7 @@ class MainWindow(QMainWindow):
         self.easy_summary.setText("选择项目后即可开始")
         self.start_button.setText("开始翻译")
         self.start_button.setEnabled(False)
+        self._clear_font_view()
 
     def _load_project_view(self) -> None:
         if not self.current_manifest_path:
@@ -1029,10 +1524,14 @@ class MainWindow(QMainWindow):
         for stage in STAGE_ORDER:
             record = manifest.version.stage(stage)
             skipped = record.artifacts.get("skipped") == "true"
-            warning_value = record.artifacts.get("official_warning_count", "0")
-            warning_count = int(warning_value) if warning_value.isdigit() else 0
+            official_warning = record.artifacts.get("official_warning_count", "0")
+            font_warning = record.artifacts.get("font_warning_count", "0")
+            warning_count = sum(
+                int(value) if value.isdigit() else 0 for value in (official_warning, font_warning)
+            )
             detail = "已手动跳过" if skipped else record.error or record.artifacts.get(
-                "official_warnings", next(iter(record.artifacts.values()), "")
+                "official_warnings",
+                record.artifacts.get("font_warnings", next(iter(record.artifacts.values()), "")),
             )
             easy_status = StageStatus.PENDING if skipped else record.status
             self._update_stage_status(
@@ -1083,6 +1582,7 @@ class MainWindow(QMainWindow):
                 check.setChecked(bool(getattr(scope, name)))
                 check.blockSignals(False)
         self._load_glossary()
+        self._refresh_font_tab()
 
     def _new_project(self) -> None:
         errors = validate_settings(self.settings)
@@ -1234,10 +1734,10 @@ class MainWindow(QMainWindow):
         self._load_project_view()
         self.status_label.setText("术语已保存")
 
-    def _start(self, stage: Stage | None = None) -> None:
+    def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
-        if stage is not None:
+        if stage is not None and switch_to_step:
             self.active_step_stage = stage
             self.step_mode.setChecked(True)
             self._select_workflow_mode(RunMode.STEP)
@@ -1277,8 +1777,11 @@ class MainWindow(QMainWindow):
                     check.setEnabled(False)
             self.translation_scope_button.setEnabled(False)
             self.import_scope_button.setEnabled(False)
+            self._set_font_controls_enabled(False)
             self.status_label.setText(
-                f"正在执行：{STAGE_LABELS[stage]}" if stage is not None else "运行中"
+                "正在应用字体"
+                if self.font_apply_active
+                else (f"正在执行：{STAGE_LABELS[stage]}" if stage is not None else "运行中")
             )
             self.pipeline_thread.start()
         except Exception as exc:
@@ -1332,15 +1835,24 @@ class MainWindow(QMainWindow):
 
     def _pipeline_result(self, result: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
-        self.status_label.setText(f"已完成：{STAGE_LABELS[target]}" if target is not None else "已完成")
+        self.status_label.setText(
+            "字体已应用"
+            if self.font_apply_active
+            else (f"已完成：{STAGE_LABELS[target]}" if target is not None else "已完成")
+        )
         self._load_project_view()
 
     def _pipeline_failed(self, detail: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
-        self.status_label.setText(f"出现错误：{STAGE_LABELS[target]}" if target is not None else "出现错误")
-        self.tabs.setCurrentIndex(0)
+        self.status_label.setText(
+            "字体应用错误"
+            if self.font_apply_active
+            else (f"出现错误：{STAGE_LABELS[target]}" if target is not None else "出现错误")
+        )
+        if not self.font_apply_active:
+            self.tabs.setCurrentIndex(0)
         self._load_project_view()
-        title = "步骤执行错误" if target is not None else "流水线失败"
+        title = "字体应用错误" if self.font_apply_active else ("步骤执行错误" if target is not None else "流水线失败")
         QMessageBox.critical(self, title, detail.splitlines()[-1] if detail.splitlines() else detail)
 
     def _pipeline_finished(self) -> None:
@@ -1352,6 +1864,8 @@ class MainWindow(QMainWindow):
         self.import_scope_button.setEnabled(True)
         self.pipeline_thread = None
         self.pipeline = None
+        self.font_apply_active = False
+        self.font_context = None
         self._load_project_view()
 
     def _stop(self) -> None:
@@ -1412,6 +1926,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "仍在停止", "外部进程尚未完全退出，请稍后再次关闭窗口。")
                 event.ignore()
                 return
+        if self.font_scan_thread and self.font_scan_thread.isRunning():
+            self.font_scan_thread.requestInterruption()
+            self.font_scan_thread.wait(5000)
+            if self.font_scan_thread.isRunning():
+                event.ignore()
+                return
+        self._release_font_previews()
         event.accept()
 
 

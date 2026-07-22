@@ -25,7 +25,9 @@ $requiredRuntimeFiles = @(
     "WOLFLator.exe",
     "_internal\vendor\UberWolfCli.exe",
     "_internal\vendor\uv.exe",
-    "_internal\vendor\manifest.json"
+    "_internal\vendor\manifest.json",
+    "_internal\vendor\fonts\FusionPixel\fusion-pixel-12px-proportional-zh_hans.ttf",
+    "_internal\vendor\fonts\FusionPixel\OFL.txt"
 )
 foreach ($relative in $requiredRuntimeFiles) {
     if (!(Test-Path -LiteralPath (Join-Path $dist $relative))) {
@@ -34,7 +36,7 @@ foreach ($relative in $requiredRuntimeFiles) {
 }
 
 $hashLines = Get-ChildItem -LiteralPath $dist -Recurse -File |
-    Where-Object { $_.Extension -in @(".exe", ".dll", ".pyd") } |
+    Where-Object { $_.Extension -in @(".exe", ".dll", ".pyd", ".ttf") } |
     Sort-Object FullName |
     ForEach-Object {
         $relative = [IO.Path]::GetRelativePath($dist, $_.FullName).Replace("\", "/")

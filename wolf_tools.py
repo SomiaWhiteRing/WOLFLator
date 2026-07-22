@@ -19,6 +19,7 @@ from typing import Callable, Iterable
 
 from openpyxl import load_workbook
 
+from fonts import FONT_CODES
 from models import ImportCategory, ImportScope, ToolResult, TranslationItem
 
 
@@ -37,12 +38,6 @@ PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
 COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
-SIMPLIFIED_CHINESE_FONTS = {
-    "BASICDATA-3": "KaiTi",
-    "BASICDATA-4": "Microsoft YaHei",
-    "BASICDATA-5": "Microsoft YaHei",
-    "BASICDATA-6": "Microsoft YaHei",
-}
 
 
 def full_export_scope() -> ImportScope:
@@ -972,16 +967,8 @@ def read_translation_items(workbook_path: str | Path) -> list[TranslationItem]:
     return items
 
 
-def is_managed_translation(item: TranslationItem) -> bool:
-    return item.code.upper() in SIMPLIFIED_CHINESE_FONTS
-
-
-def apply_managed_translations(items: list[TranslationItem]) -> None:
-    for item in items:
-        translation = SIMPLIFIED_CHINESE_FONTS.get(item.code.upper())
-        if translation:
-            item.translation = translation
-            item.stage = 1
+def is_font_setting(item: TranslationItem) -> bool:
+    return item.code.upper() in FONT_CODES
 
 
 def _location_identities(items: list[TranslationItem]) -> list[tuple[str, str, int]]:
@@ -1065,8 +1052,7 @@ def selected_translation_requirements(
 
     requirements: dict[str, set[ImportCategory]] = {}
     for key, categories in groups.items():
-        if is_managed_translation(sources[key]):
-            requirements[key] = categories
+        if is_font_setting(sources[key]):
             continue
         # ponytail: COPY-FROM cannot give duplicate uses different translations. Keep the
         # whole group untouched until dangerous filename/half-width uses are explicitly enabled.
@@ -1083,7 +1069,7 @@ def selected_translation_items(
     scope: ImportScope,
 ) -> list[TranslationItem]:
     required = selected_translation_requirements(items, scope)
-    return [item for item in items if item.key in required and not is_managed_translation(item)]
+    return [item for item in items if item.key in required]
 
 
 def to_paratranz(
@@ -1199,8 +1185,9 @@ def reconcile_incremental(
             previous_by_original.setdefault(item.original, set()).add(item.translation)
     conflicts: list[dict[str, object]] = []
     for item in current:
-        if item.category is ImportCategory.COPY:
+        if item.category is ImportCategory.COPY or is_font_setting(item):
             item.translation = ""
+            item.stage = 0
             continue
         exact = previous_by_key.get(item.key)
         if exact:
@@ -1247,8 +1234,76 @@ def write_full_workbook(
     for row_index, values, ordinal in _iter_data_rows(worksheet):
         key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         category = _category(values["code"], values["flag"], values["type"])
-        worksheet.cell(row_index, headers["__target__"]).value = "" if category is ImportCategory.COPY else translations.get(key, "")
+        worksheet.cell(row_index, headers["__target__"]).value = (
+            ""
+            if category is ImportCategory.COPY or values["code"].upper() in FONT_CODES
+            else translations.get(key, "")
+        )
     return _save_workbook_atomic(workbook, output_path)
+
+
+def read_font_slots(items: list[TranslationItem], *, translated: bool = False) -> list[str]:
+    by_code: dict[str, list[TranslationItem]] = {code: [] for code in FONT_CODES}
+    for item in items:
+        code = item.code.upper()
+        if code in by_code:
+            by_code[code].append(item)
+    invalid = [code for code, matches in by_code.items() if len(matches) != 1]
+    if invalid:
+        raise ValueError("字体字段数量不正确: " + ", ".join(invalid))
+    return [
+        (by_code[code][0].translation if translated else by_code[code][0].original)
+        for code in FONT_CODES
+    ]
+
+
+def write_font_workbook(
+    template_path: str | Path,
+    output_path: str | Path,
+    slots: list[str],
+) -> Path:
+    if len(slots) != len(FONT_CODES) or not all(isinstance(value, str) for value in slots):
+        raise ValueError("字体工作簿必须提供四个字体槽位")
+    workbook = load_workbook(template_path)
+    worksheet = workbook.active
+    _header_row, headers = _header_map(worksheet)
+    found = Counter()
+    slot_by_code = dict(zip(FONT_CODES, slots, strict=True))
+    for row_index, values, _ordinal in _iter_data_rows(worksheet):
+        code = values["code"].upper()
+        cell = worksheet.cell(row_index, headers["__target__"])
+        cell.value = ""
+        if code in slot_by_code:
+            found[code] += 1
+            cell.value = slot_by_code[code]
+    invalid = [code for code in FONT_CODES if found[code] != 1]
+    if invalid:
+        workbook.close()
+        raise ValueError("字体工作簿字段数量不正确: " + ", ".join(invalid))
+    return _save_workbook_atomic(workbook, output_path)
+
+
+def final_display_texts(items: list[TranslationItem], scope: ImportScope) -> list[str]:
+    requirements = selected_translation_requirements(items, scope)
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
+    result: list[str] = []
+    for item in items:
+        if is_font_setting(item):
+            continue
+        intrinsic = _content_category(item.code, item.flag, item.type)
+        if intrinsic in {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}:
+            continue
+        if item.category is ImportCategory.COPY:
+            source = _copy_source(item, by_code)
+            text = source.translation if source.key in requirements and source.translation else item.original
+        else:
+            text = item.translation if item.key in requirements and item.translation else item.original
+        for token in _scan_control_tokens(text):
+            text = text.replace(token, "")
+        result.append(text)
+    return result
 
 
 def _filename_target_exists(game_root: Path, translated_name: str) -> bool:

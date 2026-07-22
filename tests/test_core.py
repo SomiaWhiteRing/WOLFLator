@@ -18,7 +18,21 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 import ainiee
-from models import AppSettings, ImportCategory, ImportScope, ToolResult
+from fonts import (
+    BUNDLED_FONT_FAMILY,
+    BUNDLED_FONT_SHA256,
+    FontError,
+    bundled_font_path,
+    default_font_scheme,
+    font_file_info,
+    load_font_scheme,
+    load_original_fonts,
+    record_original_fonts,
+    required_characters,
+    save_font_scheme,
+    validate_font_scheme,
+)
+from models import AppSettings, ImportCategory, ImportScope, ToolResult, TranslationItem
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
@@ -29,9 +43,9 @@ from wolf_tools import (
     _process_startupinfo,
     _silent_official_executable,
     _write_console_snapshot,
-    apply_managed_translations,
     classify_optional_name_delta,
     dump_items,
+    final_display_texts,
     full_export_scope,
     load_items,
     locate_workbook,
@@ -40,11 +54,13 @@ from wolf_tools import (
     parse_official_diagnostics,
     protect_control_tokens,
     read_translation_items,
+    read_font_slots,
     reconcile_incremental,
     restore_control_tokens,
     retryable_translation_errors,
     run_process,
     to_paratranz,
+    write_font_workbook,
     write_full_workbook,
     write_scoped_workbook,
 )
@@ -200,7 +216,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertIn("没有生成译文", errors[payload[1]["key"]])
             self.assertIn("缺少输出", errors[payload[2]["key"]])
 
-    def test_official_config_exports_all_and_fonts_use_managed_defaults(self):
+    def test_official_config_exports_all_and_font_rows_are_not_translated(self):
         config = _official_config_text(full_export_scope())
         self.assertIn("Tool_A_Get_CommonEvent_Name=1\r\n", config)
         self.assertIn("Tool_A_Get_DB_DataName=1\r\n", config)
@@ -211,10 +227,140 @@ class WorkbookTests(unittest.TestCase):
         self.assertIn("Tool_A_Get_TXT=1\r\n", baseline)
 
         with tempfile.TemporaryDirectory() as directory:
+            source = make_workbook(Path(directory) / "source.xlsx")
+            workbook = load_workbook(source)
+            workbook.active["A9"] = "BASICDATA-3"
+            workbook.save(source)
+            items = read_translation_items(source)
+            items[-1].translation = "旧版字体译文"
+            payload = to_paratranz(items, full_export_scope())
+            self.assertNotIn(items[-1].key, {row["key"] for row in payload})
+            full = write_full_workbook(source, Path(directory) / "full.xlsx", items)
+            self.assertIsNone(load_workbook(full).active["G9"].value)
+
+    def test_font_workbook_contains_only_four_font_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            for index, code in enumerate(("BASICDATA-3", "BASICDATA-4", "BASICDATA-5", "BASICDATA-6")):
+                sheet.append([code, "", "Basic Game Settings", f"Font {index}", "", f"原字体{index}", "旧译"])
+            sheet.append(["COMMON-1", "", "Event", "Message", "", "原文", "旧译"])
+            workbook.save(source)
+            slots = ["字体一", "字体二", "字体三", "字体四"]
+            output = write_font_workbook(source, root / "font.xlsx", slots)
+            sheet = load_workbook(output).active
+            self.assertEqual(slots, [sheet.cell(row, 7).value for row in range(2, 6)])
+            self.assertIsNone(sheet.cell(6, 7).value)
+            self.assertEqual([f"原字体{index}" for index in range(4)], read_font_slots(read_translation_items(output)))
+
+    def test_final_display_texts_follow_import_scope_and_strip_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
             items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
-            items[0].code = "BASICDATA-3"
-            apply_managed_translations(items)
-            self.assertEqual("KaiTi", items[0].translation)
+            items[0].translation = r"中文\C[1]"
+            items[1].translation = "主角"
+            texts = final_display_texts(items, ImportScope())
+            self.assertIn("中文", texts)
+            self.assertNotIn(r"中文\C[1]", texts)
+            self.assertIn("主人公", texts)
+            self.assertNotIn("Picture/顔.png", texts)
+
+
+class WorkbookAndFontTests(unittest.TestCase):
+    def test_original_fonts_are_immutable_per_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            workbook = project / "source.xlsx"
+            workbook.write_bytes(b"source")
+            first = ["主字体", "副字体一", "副字体二", "副字体三"]
+            path = record_original_fonts(project, "v1", first, "a" * 64, workbook)
+            self.assertEqual(first, load_original_fonts(project, "v1")["slots"])
+            self.assertEqual(path, record_original_fonts(project, "v1", first, "a" * 64, workbook))
+            with self.assertRaisesRegex(FontError, "请新建游戏版本"):
+                record_original_fonts(
+                    project,
+                    "v1",
+                    ["被修改", *first[1:]],
+                    "a" * 64,
+                    workbook,
+                )
+            second = ["新主字体", *first[1:]]
+            record_original_fonts(project, "v2", second, "b" * 64, workbook)
+            self.assertEqual(second, load_original_fonts(project, "v2")["slots"])
+
+    def test_bundled_font_and_default_scheme_are_verified(self):
+        path = bundled_font_path()
+        families, codepoints = font_file_info(path)
+        self.assertIn(BUNDLED_FONT_FAMILY, families)
+        self.assertIn(ord("中"), codepoints)
+        self.assertEqual(BUNDLED_FONT_SHA256, __import__("hashlib").sha256(path.read_bytes()).hexdigest())
+        with tempfile.TemporaryDirectory() as directory:
+            save_font_scheme(directory, default_font_scheme())
+            scheme = load_font_scheme(directory)
+            self.assertEqual([BUNDLED_FONT_FAMILY] * 4, [slot["family"] for slot in scheme["slots"]])
+
+    def test_font_scheme_rejects_project_path_escape(self):
+        scheme = default_font_scheme()
+        scheme["slots"][0] = {
+            "mode": "font",
+            "family": "Bad Font",
+            "provenance": "system",
+            "files": [
+                {
+                    "kind": "project",
+                    "path": "../bad.ttf",
+                    "filename": "bad.ttf",
+                    "sha256": "0" * 64,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(FontError, "越界"):
+            validate_font_scheme(directory, scheme, check_files=False)
+
+    def test_required_characters_keep_all_visible_codepoints(self):
+        self.assertEqual({"A", "中", "あ", "ア", "！"}, required_characters(["A中あア！\n\u200b"]))
+
+    def test_font_parser_rejects_truncated_and_unsupported_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            truncated = root / "bad.ttf"
+            truncated.write_bytes(b"\x00\x01")
+            with self.assertRaises(FontError):
+                font_file_info(truncated)
+            unsupported = root / "font.woff"
+            unsupported.write_bytes(b"font")
+            with self.assertRaisesRegex(FontError, "不支持"):
+                font_file_info(unsupported)
+
+    @unittest.skipUnless(Path(r"C:\Windows\Fonts\msyh.ttc").is_file(), "Windows YaHei TTC unavailable")
+    def test_ttc_parser_reads_multiple_family_aliases(self):
+        families, codepoints = font_file_info(Path(r"C:\Windows\Fonts\msyh.ttc"))
+        self.assertIn("Microsoft YaHei", families)
+        self.assertIn("微软雅黑", families)
+        self.assertIn(ord("中"), codepoints)
+
+    def test_copy_corpus_uses_the_final_imported_source_text(self):
+        source = TranslationItem(
+            key="source",
+            original="原文",
+            translation="最终译文",
+            code="COMMON-1",
+            category=ImportCategory.DISPLAY,
+        )
+        copied = TranslationItem(
+            key="copy",
+            original="原文",
+            code="COMMON-2",
+            flag="COPY-FROM-COMMON-1",
+            category=ImportCategory.COPY,
+            copy_category=ImportCategory.OPTIONAL_NAME,
+        )
+        self.assertEqual(
+            ["最终译文", "最终译文"],
+            final_display_texts([source, copied], ImportScope()),
+        )
 
     def test_full_baseline_delta_and_cross_category_copy_are_scope_safe(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -36,6 +36,8 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。
 官方工具始终生成全量 XLSX，并额外生成一份关闭名称项的内部基准表来精确分类；翻译范围和导入范围可独立切换，切换范围不需要重新导出。
 
+“修改字体”页独立管理 WOLF 的四个字体槽位。字体方案只会使发布阶段失效，不会重跑 AI；新项目默认随附的 Fusion Pixel 12px 简体中文字体，既有项目没有 `font.json` 时保持原字体。系统或游戏字体会按哈希复制到项目后再使用，实际发布前会按最终导入语料检查缺字。
+
 真实游戏 `gorigirlSGK1.00` 的阶段证据、已修复缺陷、恢复边界和下一次干净一键验收要求见 [2026-07-22 实机全流程归档](docs/qa/2026-07-22-gorigirlSGK1.00-e2e.md)。
 
 ## 构建 Windows 发行包
@@ -51,8 +53,11 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 ```text
 <项目目录>/<项目ID>/
   project.json
+  font.json        四槽位字体方案
+  fonts/           项目缓存的游戏或系统字体
   glossary.json
   versions/<版本ID>/
+    original-fonts.json  该源版本首次导出的四槽原字体快照
     source/       原始游戏副本
     work/         外部工具工作目录
     artifacts/    XLSX、Paratranz JSON 和校验结果

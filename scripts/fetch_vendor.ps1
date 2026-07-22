@@ -61,6 +61,12 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath $uvTarget).Hash.ToLowerInvarian
     throw "uv.exe SHA-256 mismatch after extraction."
 }
 
+$fusionPixel = Join-Path $vendor $manifest.fusion_pixel.file
+if (!(Test-Path -LiteralPath $fusionPixel) -or
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $fusionPixel).Hash.ToLowerInvariant() -ne $manifest.fusion_pixel.sha256) {
+    throw "Bundled Fusion Pixel font is missing or its SHA-256 does not match vendor/manifest.json."
+}
+
 $licenses = Join-Path $vendor "licenses"
 New-Item -ItemType Directory -Force -Path $licenses | Out-Null
 Get-PlainFile "https://raw.githubusercontent.com/Sinflower/UberWolf/v0.6.3/LICENSE" (Join-Path $licenses "UberWolf-MIT.txt")

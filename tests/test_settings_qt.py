@@ -133,8 +133,15 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(window.workflow_page.isAncestorOf(window.one_click))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.step_mode))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.log_view))
-                self.assertEqual(3, window.tabs.count())
+                self.assertEqual(4, window.tabs.count())
                 self.assertEqual("范围", window.tabs.tabText(2))
+                self.assertEqual("修改字体", window.tabs.tabText(3))
+                self.assertTrue(
+                    any(
+                        label.text() == "原字体"
+                        for label in window.tabs.widget(3).findChildren(QLabel)
+                    )
+                )
                 self.assertEqual(2, window.scope_stack.count())
                 self.assertTrue(window.tabs.widget(2).isAncestorOf(window.translation_scope_button))
                 self.assertTrue(window.tabs.widget(2).isAncestorOf(window.import_scope_button))

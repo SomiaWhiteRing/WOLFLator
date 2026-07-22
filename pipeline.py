@@ -19,6 +19,22 @@ from ainiee import (
     require_managed_runtime,
     run_translation,
 )
+from fonts import (
+    FONT_CODES,
+    FONT_SLOT_NAMES,
+    candidate_for_family,
+    coverage_fingerprint,
+    default_font_scheme,
+    discover_font_candidates,
+    font_file_info,
+    load_font_scheme,
+    load_original_fonts,
+    record_original_fonts,
+    required_characters,
+    resolve_scheme_files,
+    save_font_scheme,
+    scheme_hash,
+)
 from models import (
     STAGE_ORDER,
     AppSettings,
@@ -34,9 +50,9 @@ from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
     UberWolfRunner,
-    apply_managed_translations,
     classify_optional_name_delta,
     dump_items,
+    final_display_texts,
     full_export_scope,
     hash_directory,
     load_items,
@@ -46,12 +62,15 @@ from wolf_tools import (
     prepare_official_tool,
     prepare_uberwolf,
     read_translation_items,
+    read_font_slots,
     reconcile_incremental,
     retryable_translation_errors,
     selected_translation_items,
     selected_translation_requirements,
+    sha256_file,
     to_paratranz,
     write_full_workbook,
+    write_font_workbook,
     write_scoped_workbook,
     WORKBOOK_NAME,
     SUPPORT_DIR,
@@ -98,6 +117,7 @@ def create_project(projects_root: str | Path, game_path: str | Path, name: str =
     manifest = ProjectManifest(project_id=project_id, name=display_name, active_version=version_id)
     manifest.versions[version_id] = VersionManifest(version_id=version_id, original_path=str(game))
     project_dir.mkdir(parents=True)
+    save_font_scheme(project_dir, default_font_scheme())
     _atomic_json(project_dir / "project.json", manifest.to_dict())
     return project_dir / "project.json"
 
@@ -309,6 +329,13 @@ class Pipeline:
             record.error = ""
         self.save()
 
+    def set_font_scheme(self, scheme: dict[str, object]) -> None:
+        save_font_scheme(self.project_dir, scheme)
+        record = self.manifest.version.stage(Stage.RELEASE)
+        record.status = StageStatus.PENDING
+        record.error = ""
+        self.save()
+
     def _safe_remove(self, path: Path) -> None:
         resolved = path.resolve()
         if os.path.commonpath([str(self.project_dir), str(resolved)]) != str(self.project_dir):
@@ -356,6 +383,25 @@ class Pipeline:
             )
         elif stage is Stage.IMPORT:
             extra["import_scope"] = self.manifest.import_scope.__dict__
+        elif stage is Stage.RELEASE:
+            scheme = load_font_scheme(self.project_dir)
+            extra["font_scheme"] = scheme_hash(scheme)
+            original_fonts = self._original_font_record(required=False)
+            if original_fonts is not None:
+                extra["original_fonts"] = original_fonts
+            if scheme is not None:
+                resolved = resolve_scheme_files(self.project_dir, scheme)
+                extra["font_files"] = [
+                    sha256_file(path) for files in resolved for path in files
+                ]
+                items_path = self.manifest.version.stage(Stage.VALIDATE).artifacts.get("items", "")
+                if items_path and Path(items_path).is_file():
+                    corpus = final_display_texts(
+                        load_items(items_path), self.manifest.import_scope
+                    )
+                    extra["font_corpus_sha256"] = hashlib.sha256(
+                        json.dumps(corpus, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest()
         payload = json.dumps(
             {"input_hash": record.input_hash, "artifacts": record.artifacts, "extra": extra},
             ensure_ascii=False,
@@ -529,6 +575,13 @@ class Pipeline:
         baseline_items = read_translation_items(baseline)
         optional_name_rows = classify_optional_name_delta(items, baseline_items)
         items_path = dump_items(self.artifacts_dir / "items-extracted.json", items)
+        original_fonts = record_original_fonts(
+            self.project_dir,
+            self.manifest.active_version,
+            read_font_slots(items),
+            self.manifest.version.source_hash,
+            extracted,
+        )
         categories: dict[str, int] = {}
         for item in items:
             categories[item.category.value] = categories.get(item.category.value, 0) + 1
@@ -542,6 +595,7 @@ class Pipeline:
             "baseline_workbook": str(baseline),
             "items": str(items_path),
             "optional_name_rows": str(optional_name_rows),
+            "original_fonts": str(original_fonts),
         }
         if conflicts:
             conflicts_path = self.artifacts_dir / "incremental-conflicts.json"
@@ -569,7 +623,6 @@ class Pipeline:
     def _translate(self) -> dict[str, str]:
         extract = self.manifest.version.stage(Stage.EXTRACT).artifacts
         items = load_items(extract["items"])
-        apply_managed_translations(items)
         paratranz = to_paratranz(items, self.manifest.translation_scope)
         input_path = self.artifacts_dir / "ainiee-input.json"
         _atomic_json(input_path, paratranz)
@@ -783,6 +836,241 @@ class Pipeline:
             artifacts["official_console"] = str(console_path)
         return artifacts
 
+    def _font_coverage_warnings(
+        self,
+        scheme: dict[str, object],
+        original_slots: list[str],
+        required: set[str],
+        game_root: Path,
+    ) -> tuple[list[dict[str, object]], list[list[Path]]]:
+        resolved = resolve_scheme_files(self.project_dir, scheme)
+        candidates = (
+            discover_font_candidates(game_root, required)
+            if any(slot["mode"] == "keep" for slot in scheme["slots"])
+            else []
+        )
+        warnings: list[dict[str, object]] = []
+        coverage_files: list[list[Path]] = []
+        for index, slot in enumerate(scheme["slots"]):
+            family = original_slots[index] if slot["mode"] == "keep" else str(slot["family"])
+            files = resolved[index]
+            if slot["mode"] == "keep":
+                candidate = candidate_for_family(candidates, family) if family else None
+                files = list(candidate.files) if candidate else []
+            coverage_files.append(files)
+            coverage: set[int] = set()
+            for path in files:
+                coverage.update(font_file_info(path)[1])
+            missing = sorted(
+                (character for character in required if ord(character) not in coverage),
+                key=ord,
+            )
+            if missing:
+                warnings.append(
+                    {
+                        "slot": index,
+                        "slot_name": FONT_SLOT_NAMES[index],
+                        "family": family,
+                        "files": [str(path) for path in files],
+                        "missing_count": len(missing),
+                        "missing": missing,
+                    }
+                )
+        return warnings, coverage_files
+
+    def _original_font_record(self, *, required: bool = True) -> dict[str, object] | None:
+        record = load_original_fonts(self.project_dir, self.manifest.active_version)
+        if record is not None:
+            return record
+        extract = self.manifest.version.stage(Stage.EXTRACT).artifacts
+        items_path = extract.get("items", "")
+        workbook_path = extract.get("workbook", "")
+        if not items_path or not workbook_path or not Path(items_path).is_file() or not Path(workbook_path).is_file():
+            if required:
+                raise RuntimeError("当前版本缺少可用于记录原字体的导出产物。")
+            return None
+        source_items = load_items(items_path)
+        record_original_fonts(
+            self.project_dir,
+            self.manifest.active_version,
+            read_font_slots(source_items),
+            self.manifest.version.source_hash,
+            workbook_path,
+        )
+        return load_original_fonts(self.project_dir, self.manifest.active_version)
+
+    def _copy_font_files(
+        self,
+        destination: Path,
+        scheme: dict[str, object],
+        resolved: list[list[Path]],
+    ) -> list[dict[str, str]]:
+        copied: dict[str, dict[str, str]] = {}
+        for slot, files in zip(scheme["slots"], resolved, strict=True):
+            if slot["mode"] == "keep":
+                continue
+            for source in files:
+                digest = sha256_file(source)
+                previous = copied.get(source.name.casefold())
+                if previous and previous["sha256"] != digest:
+                    raise RuntimeError(f"两个字体文件同名但内容不同: {source.name}")
+                target = destination / source.name
+                if target.is_file() and sha256_file(target) != digest:
+                    raise RuntimeError(f"发布目录已有同名但内容不同的字体文件: {source.name}")
+                if not target.exists():
+                    shutil.copy2(source, target)
+                copied[source.name.casefold()] = {
+                    "filename": source.name,
+                    "sha256": digest,
+                    "family": str(slot["family"]),
+                }
+        return sorted(copied.values(), key=lambda item: item["filename"].casefold())
+
+    def _build_font_release(
+        self,
+        translated: Path,
+        temporary: Path,
+        scheme: dict[str, object],
+    ) -> dict[str, str]:
+        validated_items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
+        original_record = self._original_font_record()
+        if original_record is None:
+            raise RuntimeError("无法建立当前版本的原字体记录。")
+        original_slots = list(original_record["slots"])
+        desired_slots = [
+            original_slots[index] if slot["mode"] == "keep" else str(slot["family"])
+            for index, slot in enumerate(scheme["slots"])
+        ]
+        if not desired_slots[0].strip():
+            raise RuntimeError("项目原始主字体为空，无法建立可验证的字体方案。")
+        required = required_characters(final_display_texts(validated_items, self.manifest.import_scope))
+        warnings, resolved = self._font_coverage_warnings(
+            scheme, original_slots, required, translated
+        )
+        fingerprint = coverage_fingerprint(required, scheme)
+        self.detail(
+            f"font.coverage characters={len(required)} warnings={len(warnings)} "
+            f"fingerprint={fingerprint}"
+        )
+        warning_path = self.artifacts_dir / "font-warnings.json"
+        if warnings:
+            _atomic_json(
+                warning_path,
+                {
+                    "coverage_fingerprint": fingerprint,
+                    "acknowledged": (
+                        isinstance(scheme.get("coverage_ack"), dict)
+                        and scheme["coverage_ack"].get("fingerprint") == fingerprint
+                    ),
+                    "warnings": warnings,
+                },
+            )
+            self.log(f"字体方案缺少部分实际文本字符，共 {len(warnings)} 个槽位；发布继续。")
+        else:
+            warning_path.unlink(missing_ok=True)
+
+        font_base = self.version_dir / ".font-base"
+        if font_base.exists():
+            self._safe_remove(font_base)
+        shutil.copytree(translated, font_base)
+        copied_files: list[dict[str, str]] = []
+        console_path = self.artifacts_dir / "official-font-console.txt"
+        console_path.unlink(missing_ok=True)
+        try:
+            runner = self._official_runner(full_export_scope())
+            self.log("正在导出字体修改前的文本基线...")
+            baseline_workbook = runner.extract(
+                font_base,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+            )
+            baseline_items = read_translation_items(baseline_workbook)
+            font_workbook = write_font_workbook(
+                baseline_workbook,
+                self.artifacts_dir / "font-import.xlsx",
+                desired_slots,
+            )
+            support = font_base / SUPPORT_DIR
+            support.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(font_workbook, support / WORKBOOK_NAME)
+            self.log("正在通过官方工具应用四槽位字体方案...")
+            generated = runner.translate(
+                font_base,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+            )
+            copied_files = self._copy_font_files(generated, scheme, resolved)
+            verification_workbook = runner.extract(
+                generated,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+            )
+            verification_items = read_translation_items(verification_workbook)
+            actual_slots = read_font_slots(verification_items)
+            if actual_slots != desired_slots:
+                raise RuntimeError(
+                    "字体导入回读不一致: "
+                    + json.dumps({"expected": desired_slots, "actual": actual_slots}, ensure_ascii=False)
+                )
+            baseline_non_font = [
+                (item.code, item.flag, item.type, item.info, item.original)
+                for item in baseline_items
+                if item.code not in FONT_CODES
+            ]
+            verification_non_font = [
+                (item.code, item.flag, item.type, item.info, item.original)
+                for item in verification_items
+                if item.code not in FONT_CODES
+            ]
+            if verification_non_font != baseline_non_font:
+                raise RuntimeError("字体修改导致四个字体字段以外的导出文本发生变化。")
+            for item in copied_files:
+                target = generated / item["filename"]
+                if not target.is_file() or sha256_file(target) != item["sha256"]:
+                    raise RuntimeError(f"发布字体文件校验失败: {item['filename']}")
+            if runner.console_outputs:
+                console_path.write_text(
+                    "\n\n".join(
+                        f"===== {entry['mode']} TIMELINE =====\n{entry['timeline']}\n\n"
+                        f"===== {entry['mode']} FINAL SCREEN =====\n{entry['final']}"
+                        for entry in runner.console_outputs
+                    ),
+                    encoding="utf-8",
+                )
+            support = generated / SUPPORT_DIR
+            if support.exists():
+                shutil.rmtree(support)
+            os.replace(generated, temporary)
+        finally:
+            if font_base.exists():
+                self._safe_remove(font_base)
+
+        result_path = self.artifacts_dir / "font-result.json"
+        _atomic_json(
+            result_path,
+            {
+                "scheme_sha256": scheme_hash(scheme),
+                "coverage_fingerprint": fingerprint,
+                "required_character_count": len(required),
+                "original_slots": original_slots,
+                "applied_slots": desired_slots,
+                "copied_files": copied_files,
+            },
+        )
+        artifacts = {
+            "font_scheme_sha256": scheme_hash(scheme),
+            "font_result": str(result_path),
+            "font_warning_count": str(len(warnings)),
+        }
+        if warnings:
+            artifacts["font_warnings"] = str(warning_path)
+        if console_path.is_file():
+            artifacts["official_font_console"] = str(console_path)
+        return artifacts
+
     def _release(self) -> dict[str, str]:
         translated = Path(self.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"])
         if not (translated / "Game.exe").is_file() or not (translated / "Data").is_dir():
@@ -792,7 +1080,14 @@ class Pipeline:
         for path in (temporary, previous):
             if path.exists():
                 self._safe_remove(path)
-        shutil.copytree(translated, temporary)
+        scheme = load_font_scheme(self.project_dir)
+        font_artifacts = (
+            self._build_font_release(translated, temporary, scheme)
+            if scheme is not None
+            else {}
+        )
+        if scheme is None:
+            shutil.copytree(translated, temporary)
         try:
             if self.release_dir.exists():
                 os.replace(self.release_dir, previous)
@@ -805,7 +1100,7 @@ class Pipeline:
             raise
         self._check_source_unchanged()
         self.detail(f"release.complete path={self.release_dir}")
-        return {"release": str(self.release_dir)}
+        return {"release": str(self.release_dir), **font_artifacts}
 
     def _execute(self, stage: Stage) -> dict[str, str]:
         functions = {
