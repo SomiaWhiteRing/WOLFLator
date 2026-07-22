@@ -20,11 +20,12 @@ python cli.py ainiee-prepare                 # 安装固定版本并准备依赖
 python cli.py project-create "C:\Games\MyWolfGame"
 python cli.py run "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json"
 python cli.py status "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --json
+python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --target export --external --exclude-large-external --external-size-limit-kb 128
 python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --target translation --external
 python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --target import --external
 ```
 
-`run --stage translate` 可只执行单个阶段；`scope`、`skip`、`retry` 与图形界面中的对应操作一致。失败时命令返回非零退出码，并保留项目版本目录下的外部日志和完整 Python 堆栈。
+`run --stage translate` 可只执行单个阶段；`scope`、`retry` 与图形界面中的对应操作一致。失败时命令返回非零退出码，并保留项目版本目录下的外部日志和完整 Python 堆栈。
 
 首次启动需要指定：
 
@@ -34,7 +35,7 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 - 项目目录和纯 ASCII 的 UberWolf 执行目录。
 
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。
-官方工具始终生成全量 XLSX，并额外生成一份关闭名称项的内部基准表来精确分类；翻译范围和导入范围可独立切换，切换范围不需要重新导出。
+导出、翻译和导入范围彼此独立。新项目默认导出外部 TXT/CSV，并临时排除超过 128 KB 的文件；原游戏和工作副本不会被改动。官方工具额外生成一份关闭名称项及外部文件的内部基准表来精确分类。WOLF 官方工具不会读取 `.md`，这类剧情文件暂不包含在本功能中。
 
 “修改字体”页独立管理 WOLF 的四个字体槽位。字体方案只会使发布阶段失效，不会重跑 AI；新项目默认随附的 Fusion Pixel 12px 简体中文字体，既有项目没有 `font.json` 时保持原字体。系统或游戏字体会按哈希复制到项目后再使用，实际发布前会按最终导入语料检查缺字。
 

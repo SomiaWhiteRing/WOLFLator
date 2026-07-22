@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel
 
-from app import InstallThread, MainWindow, SettingsDialog
+from app import STAGE_RESULT_LABELS, InstallThread, MainWindow, SettingsDialog
+from fonts import FontCandidate
 from models import AppSettings, RunMode, Stage, StageStatus
 from pipeline import PipelineStateEvent, create_project, load_manifest
 from settings import SettingsStore, protect_secret, unprotect_secret
@@ -146,10 +147,59 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(window.tabs.widget(2).isAncestorOf(window.translation_scope_button))
                 self.assertTrue(window.tabs.widget(2).isAncestorOf(window.import_scope_button))
                 self.assertTrue(window.tabs.widget(2).isAncestorOf(window.export_scope_button))
+                self.assertFalse(window.external_filter_options.isHidden())
+                self.assertTrue(window.exclude_large_external_files.isChecked())
+                self.assertEqual(128, window.external_file_limit_kb.value())
+                window.exclude_large_external_files.setChecked(False)
+                self.assertFalse(window.external_file_limit_kb.isEnabled())
+                window.export_scope_checks["external"].setChecked(False)
+                self.assertTrue(window.external_filter_options.isHidden())
                 self.assertEqual(8, len(window.step_buttons))
-                self.assertEqual(8, len(window.step_skip_buttons))
+                self.assertEqual(8, len(window.step_result_buttons))
                 self.assertTrue(all(button.text() == "执行" for button in window.step_buttons.values()))
-                self.assertTrue(all(button.text() == "跳过" for button in window.step_skip_buttons.values()))
+                self.assertEqual(
+                    [STAGE_RESULT_LABELS[stage] for stage in Stage],
+                    [window.step_result_buttons[stage].text() for stage in Stage],
+                )
+                self.assertTrue(
+                    all(
+                        window.step_buttons[stage].width()
+                        == window.step_result_buttons[stage].width()
+                        for stage in Stage
+                    )
+                )
+                window._append_log("[WARNING] 字体缺字：主字体")
+                warning_block = window.log_view.document().lastBlock().previous()
+                self.assertEqual("警告  字体缺字：主字体", warning_block.text())
+                self.assertEqual(
+                    "#a24625",
+                    warning_block.begin().fragment().charFormat().foreground().color().name(),
+                )
+                window._append_log("[ERROR] 发布失败")
+                error_block = window.log_view.document().lastBlock().previous()
+                self.assertEqual("错误  发布失败", error_block.text())
+                self.assertEqual(
+                    "#b42318",
+                    error_block.begin().fragment().charFormat().foreground().color().name(),
+                )
+                candidate = FontCandidate(
+                    source="bundled",
+                    family="测试字体",
+                    aliases=("测试字体",),
+                    files=(),
+                    missing=frozenset({"∟"}),
+                )
+                window.font_context = {
+                    "required": {"∟"},
+                    "candidates": [candidate],
+                    "original_slots": ["测试字体"] * 4,
+                }
+                for combo in window.font_combos:
+                    combo.addItem(candidate.label, candidate)
+                window._update_font_rows()
+                self.assertEqual('缺少 1 字："∟"', window.font_coverage_labels[0].text())
+                self.assertEqual('缺少字符：\n"∟"', window.font_coverage_labels[0].toolTip())
+                self.assertNotIn("U+", window.font_coverage_labels[0].text())
                 window.step_mode.click()
                 self.assertEqual(1, window.workflow_stack.currentIndex())
                 window.close()

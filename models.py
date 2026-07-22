@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MANIFEST_SCHEMA = 2
+MANIFEST_SCHEMA = 3
+DEFAULT_EXTERNAL_FILE_LIMIT_KB = 128
+MAX_EXTERNAL_FILE_LIMIT_KB = 1_048_576
 
 
 def utc_now() -> str:
@@ -66,6 +68,10 @@ class ImportScope:
 
 
 def default_export_scope() -> ImportScope:
+    return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
+
+
+def legacy_export_scope() -> ImportScope:
     return ImportScope(display=True, external=False, optional_name=True, halfwidth=True, filename=True)
 
 
@@ -198,6 +204,8 @@ class ProjectManifest:
     active_version: str = ""
     run_mode: RunMode = RunMode.ONE_CLICK
     export_scope: ImportScope = field(default_factory=default_export_scope)
+    exclude_large_external_files: bool = True
+    external_file_limit_kb: int = DEFAULT_EXTERNAL_FILE_LIMIT_KB
     translation_scope: ImportScope = field(default_factory=ImportScope)
     import_scope: ImportScope = field(default_factory=ImportScope)
     versions: dict[str, VersionManifest] = field(default_factory=dict)
@@ -221,7 +229,7 @@ class ProjectManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
         schema = data.get("schema")
-        if schema not in (1, MANIFEST_SCHEMA):
+        if type(schema) is not int or schema not in (1, 2, MANIFEST_SCHEMA):
             raise ValueError(f"不支持的项目清单 schema: {schema}")
         fields = {
             "project_id",
@@ -235,8 +243,10 @@ class ProjectManifest:
             "import_scope",
             "versions",
         }
-        if schema == MANIFEST_SCHEMA:
+        if schema >= 2:
             fields.add("export_scope")
+        if schema == MANIFEST_SCHEMA:
+            fields.update({"exclude_large_external_files", "external_file_limit_kb"})
         _require_fields(
             data,
             fields,
@@ -244,7 +254,7 @@ class ProjectManifest:
         )
         scope_fields = {"display", "external", "optional_name", "halfwidth", "filename"}
         export_scope_data = (
-            data["export_scope"] if schema == MANIFEST_SCHEMA else dataclasses.asdict(default_export_scope())
+            data["export_scope"] if schema >= 2 else dataclasses.asdict(legacy_export_scope())
         )
         import_scope_data = data["import_scope"]
         translation_scope_data = data["translation_scope"]
@@ -267,6 +277,19 @@ class ProjectManifest:
             for name in ("project_id", "name", "created_at", "updated_at", "active_version")
         ):
             raise ValueError("项目清单文本字段类型不匹配。")
+        exclude_large_external_files = data.get("exclude_large_external_files", True)
+        external_file_limit_kb = data.get(
+            "external_file_limit_kb", DEFAULT_EXTERNAL_FILE_LIMIT_KB
+        )
+        if type(exclude_large_external_files) is not bool:
+            raise ValueError("大文件自动排除开关必须是布尔值。")
+        if (
+            type(external_file_limit_kb) is not int
+            or not 1 <= external_file_limit_kb <= MAX_EXTERNAL_FILE_LIMIT_KB
+        ):
+            raise ValueError(
+                f"外部文件大小上限必须是 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 的整数。"
+            )
         item = cls(
             project_id=data["project_id"],
             name=data["name"],
@@ -276,6 +299,8 @@ class ProjectManifest:
             active_version=data["active_version"],
             run_mode=RunMode(data["run_mode"]),
             export_scope=ImportScope(**export_scope_data),
+            exclude_large_external_files=exclude_large_external_files,
+            external_file_limit_kb=external_file_limit_kb,
             translation_scope=ImportScope(**translation_scope_data),
             import_scope=ImportScope(**import_scope_data),
         )

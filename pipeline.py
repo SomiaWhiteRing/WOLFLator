@@ -38,6 +38,7 @@ from fonts import (
     scheme_hash,
 )
 from models import (
+    MAX_EXTERNAL_FILE_LIMIT_KB,
     STAGE_ORDER,
     AppSettings,
     ImportScope,
@@ -48,7 +49,13 @@ from models import (
     VersionManifest,
     utc_now,
 )
-from safe_io import atomic_write_json, project_lock, read_text_with_retry, replace_with_retry
+from safe_io import (
+    atomic_output_path,
+    atomic_write_json,
+    project_lock,
+    read_text_with_retry,
+    replace_with_retry,
+)
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
@@ -71,6 +78,7 @@ from wolf_tools import (
     selected_translation_items,
     selected_translation_requirements,
     sha256_file,
+    temporary_external_filter_view,
     to_paratranz,
     write_full_workbook,
     write_font_workbook,
@@ -80,7 +88,7 @@ from wolf_tools import (
 )
 
 
-EXPORT_SCHEMA = 2
+EXPORT_SCHEMA = 3
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -136,7 +144,18 @@ def load_manifest(path: str | Path) -> ProjectManifest:
     data = json.loads(read_text_with_retry(path, encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("项目清单根节点不是对象。")
-    return ProjectManifest.from_dict(data)
+    manifest = ProjectManifest.from_dict(data)
+    reset = False
+    for stage in STAGE_ORDER:
+        record = manifest.version.stage(stage)
+        if record.artifacts.get("skipped") == "true":
+            reset = True
+            record.artifacts = {}
+        if reset:
+            record.status = StageStatus.PENDING
+            record.error = ""
+    # ponytail: removed skip markers vanish on the next ordinary manifest save.
+    return manifest
 
 
 def add_version(manifest_path: str | Path, game_path: str | Path) -> ProjectManifest:
@@ -323,7 +342,7 @@ class Pipeline:
             log_dir.mkdir(parents=True, exist_ok=True)
             path.write_text(header, encoding="utf-8-sig")
         except OSError as exc:
-            self._log_sink(f"无法创建外部日志: {exc}")
+            self._log_sink(f"[ERROR] 无法创建外部日志: {exc}")
             return
         self.log_path = path
         self.log(f"日志文件: {path}")
@@ -349,12 +368,20 @@ class Pipeline:
         except OSError as exc:
             failed_path = path
             self.log_path = None
-            self._log_sink(f"外部日志写入失败 ({failed_path}): {exc}")
+            self._log_sink(f"[ERROR] 外部日志写入失败 ({failed_path}): {exc}")
         return text
 
     def log(self, message: str) -> None:
         text = self._write_log_file(message, "INFO")
         self._log_sink(text)
+
+    def warning(self, message: str) -> None:
+        text = self._write_log_file(message, "WARNING")
+        self._log_sink(f"[WARNING] {text}")
+
+    def error(self, message: str) -> None:
+        text = self._write_log_file(message, "ERROR")
+        self._log_sink(f"[ERROR] {text}")
 
     def detail(self, message: str) -> None:
         self._write_log_file(message, "DETAIL")
@@ -378,11 +405,39 @@ class Pipeline:
                 record.error = ""
             self.save()
 
-    def set_export_scope(self, scope: ImportScope) -> None:
+    def set_export_scope(
+        self,
+        scope: ImportScope,
+        *,
+        exclude_large_external_files: bool | None = None,
+        external_file_limit_kb: int | None = None,
+    ) -> None:
         with self._mutation("set-export-scope"):
-            if self.manifest.export_scope == scope:
+            exclude = (
+                self.manifest.exclude_large_external_files
+                if exclude_large_external_files is None
+                else exclude_large_external_files
+            )
+            limit_kb = (
+                self.manifest.external_file_limit_kb
+                if external_file_limit_kb is None
+                else external_file_limit_kb
+            )
+            if type(exclude) is not bool:
+                raise ValueError("大文件自动排除开关必须是布尔值。")
+            if type(limit_kb) is not int or not 1 <= limit_kb <= MAX_EXTERNAL_FILE_LIMIT_KB:
+                raise ValueError(
+                    f"外部文件大小上限必须是 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 的整数。"
+                )
+            if (
+                self.manifest.export_scope == scope
+                and self.manifest.exclude_large_external_files == exclude
+                and self.manifest.external_file_limit_kb == limit_kb
+            ):
                 return
             self.manifest.export_scope = scope
+            self.manifest.exclude_large_external_files = exclude
+            self.manifest.external_file_limit_kb = limit_kb
             for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
                 record = self.manifest.version.stage(stage)
                 record.status = StageStatus.PENDING
@@ -440,6 +495,8 @@ class Pipeline:
             extra["wolf_tool_size"] = tool.stat().st_size if tool.is_file() else 0
             extra["export_schema"] = EXPORT_SCHEMA
             extra["export_scope"] = self.manifest.export_scope.__dict__
+            extra["exclude_large_external_files"] = self.manifest.exclude_large_external_files
+            extra["external_file_limit_kb"] = self.manifest.external_file_limit_kb
         elif stage is Stage.GLOSSARY:
             extra.update(
                 {
@@ -553,22 +610,6 @@ class Pipeline:
             record = self.manifest.version.stage(downstream)
             record.status = StageStatus.PENDING
             record.error = ""
-            if record.artifacts.get("skipped") == "true":
-                record.artifacts = {}
-
-    def _reset_skipped_for_one_click(self) -> None:
-        reset = False
-        for stage in STAGE_ORDER:
-            record = self.manifest.version.stage(stage)
-            if record.artifacts.get("skipped") == "true":
-                reset = True
-                record.artifacts = {}
-            if reset:
-                record.status = StageStatus.PENDING
-                record.error = ""
-        if reset:
-            self.log("一键模式将执行分步模式中手动跳过的阶段。")
-            self.save()
 
     def _previous_version(self) -> VersionManifest | None:
         keys = list(self.manifest.versions)
@@ -581,6 +622,48 @@ class Pipeline:
             self.cache_root / "tools" / "wolf-official",
         )
         return OfficialToolRunner(executable, scope)
+
+    def _run_scoped_export(self, runner: OfficialToolRunner, mode: str) -> Path:
+        operation = runner.update_excel if mode == "UPDATE_EXCEL" else runner.extract
+        kwargs = {
+            "cancel_event": self.cancel_event,
+            "log": self.log,
+            "diagnostic_log": self.detail,
+            "warning": self.warning,
+        }
+        if not (
+            self.manifest.export_scope.external
+            and self.manifest.exclude_large_external_files
+        ):
+            return operation(self.work_dir, **kwargs)
+
+        limit_kb = self.manifest.external_file_limit_kb
+        with temporary_external_filter_view(
+            self.work_dir,
+            self.version_dir,
+            limit_kb,
+            diagnostic_log=self.detail,
+        ) as (view, excluded):
+            total_bytes = sum(size for _path, size in excluded)
+            if excluded:
+                sample = "、".join(path for path, _size in excluded[:5])
+                suffix = " 等" if len(excluded) > 5 else ""
+                self.warning(
+                    f"已临时排除超过 {limit_kb} KB 的 TXT/CSV：{len(excluded)} 个，"
+                    f"共 {total_bytes / 1024 / 1024:.2f} MiB；{sample}{suffix}"
+                )
+                for relative, size in excluded:
+                    self.detail(
+                        f"external-filter.excluded path={relative} bytes={size}"
+                    )
+            else:
+                self.detail(f"external-filter.excluded none limit_kb={limit_kb}")
+            workbook = operation(view, **kwargs)
+            target = self.work_dir / SUPPORT_DIR / WORKBOOK_NAME
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with atomic_output_path(target) as temporary:
+                shutil.copy2(workbook, temporary)
+            return target
 
     def _copy(self) -> dict[str, str]:
         original = _validate_game(self.manifest.version.original_path)
@@ -621,23 +704,13 @@ class Pipeline:
             support = self.work_dir / SUPPORT_DIR
             support.mkdir(parents=True, exist_ok=True)
             shutil.copy2(previous_full, support / WORKBOOK_NAME)
-            workbook = runner.update_excel(
-                self.work_dir,
-                cancel_event=self.cancel_event,
-                log=self.log,
-                diagnostic_log=self.detail,
-            )
+            workbook = self._run_scoped_export(runner, "UPDATE_EXCEL")
             current_items = read_translation_items(workbook)
             current_items, conflicts = reconcile_incremental(read_translation_items(previous_full), current_items)
             write_full_workbook(workbook, workbook, current_items)
             self.log("已通过官方 UPDATE_EXCEL 迁移上一版本译文。")
         else:
-            workbook = runner.extract(
-                self.work_dir,
-                cancel_event=self.cancel_event,
-                log=self.log,
-                diagnostic_log=self.detail,
-            )
+            workbook = self._run_scoped_export(runner, "EXTRACT")
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         extracted = self.artifacts_dir / "source.xlsx"
         shutil.copy2(workbook, extracted)
@@ -648,6 +721,7 @@ class Pipeline:
             cancel_event=self.cancel_event,
             log=self.log,
             diagnostic_log=self.detail,
+            warning=self.warning,
         )
         baseline = self.artifacts_dir / "source-baseline.xlsx"
         shutil.copy2(baseline_workbook, baseline)
@@ -902,7 +976,7 @@ class Pipeline:
             _atomic_json(diagnostics_path, diagnostics)
             artifacts["official_warning_count"] = str(len(diagnostics))
             artifacts["official_warnings"] = str(diagnostics_path)
-            self.log(f"官方工具完成，但报告了 {len(diagnostics)} 条警告；详情已保存。")
+            self.warning(f"官方工具完成，但报告了 {len(diagnostics)} 条警告；详情已保存。")
         else:
             diagnostics_path.unlink(missing_ok=True)
         if runner.console_outputs:
@@ -1047,7 +1121,6 @@ class Pipeline:
                     "warnings": warnings,
                 },
             )
-            self.log(f"字体方案缺少部分实际文本字符，共 {len(warnings)} 个槽位；发布继续。")
         else:
             warning_path.unlink(missing_ok=True)
 
@@ -1066,6 +1139,7 @@ class Pipeline:
                 cancel_event=self.cancel_event,
                 log=self.log,
                 diagnostic_log=self.detail,
+                warning=self.warning,
             )
             baseline_items = read_translation_items(baseline_workbook)
             font_workbook = write_font_workbook(
@@ -1089,6 +1163,7 @@ class Pipeline:
                 cancel_event=self.cancel_event,
                 log=self.log,
                 diagnostic_log=self.detail,
+                warning=self.warning,
             )
             verification_items = read_translation_items(verification_workbook)
             actual_slots = read_font_slots(verification_items)
@@ -1149,6 +1224,15 @@ class Pipeline:
         }
         if warnings:
             artifacts["font_warnings"] = str(warning_path)
+            self.warning(f"字体方案有 {len(warnings)} 个槽位存在缺字；发布继续。")
+            for warning in warnings:
+                missing = list(warning["missing"])
+                sample = json.dumps("".join(missing[:24]), ensure_ascii=False)
+                suffix = "（仅显示前 24 个）" if len(missing) > 24 else ""
+                self.warning(
+                    f"字体缺字：{warning['slot_name']} / {warning['family']}，"
+                    f"缺少 {warning['missing_count']} 个字符，样例 {sample}{suffix}"
+                )
         if console_path.is_file():
             artifacts["official_font_console"] = str(console_path)
         return artifacts
@@ -1212,7 +1296,6 @@ class Pipeline:
     def _run_locked(self) -> str:
         self.cancel_event.clear()
         self._start_run_log("one-click")
-        self._reset_skipped_for_one_click()
         copy_record = self.manifest.version.stage(Stage.COPY)
         if copy_record.status is StageStatus.COMPLETED:
             self._check_source_unchanged()
@@ -1244,7 +1327,7 @@ class Pipeline:
                     len(STAGE_ORDER),
                     str(exc),
                 )
-                self.log(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}")
+                self.error(f"[{index}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}")
                 raise
             self.progress(index, len(STAGE_ORDER), stage)
             self._emit_state(stage, StageStatus.COMPLETED, index, len(STAGE_ORDER), "已完成")
@@ -1260,9 +1343,6 @@ class Pipeline:
         self.cancel_event.clear()
         self._start_run_log(stage.value)
         self._reset_downstream(stage)
-        record = self.manifest.version.stage(stage)
-        if record.artifacts.get("skipped") == "true":
-            record.artifacts = {}
         input_hash = self._stage_input_hash(stage)
         self._mark_running(stage, input_hash)
         self._emit_state(stage, StageStatus.RUNNING, 0, 1, "正在执行")
@@ -1279,7 +1359,7 @@ class Pipeline:
             )
             self._mark_failed(stage, exc)
             self._emit_state(stage, self.manifest.version.stage(stage).status, 0, 1, str(exc))
-            self.log(
+            self.error(
                 f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}"
             )
             raise
@@ -1288,20 +1368,6 @@ class Pipeline:
         self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"
-
-    def skip_stage(self, stage: Stage) -> None:
-        with self._mutation(f"{stage.value}-skip"):
-            self._start_run_log(f"{stage.value}-skip")
-            self._reset_downstream(stage)
-            record = self.manifest.version.stage(stage)
-            record.status = StageStatus.COMPLETED
-            record.started_at = ""
-            record.finished_at = utc_now()
-            record.input_hash = ""
-            record.error = ""
-            record.artifacts = {"skipped": "true"}
-            self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 已手动跳过")
-            self.save()
 
     def retry_failed(self) -> None:
         with self._mutation("retry-failed"):

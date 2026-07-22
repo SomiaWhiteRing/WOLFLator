@@ -119,6 +119,46 @@ class PipelineTests(unittest.TestCase):
                 [BUNDLED_FONT_FAMILY] * 4,
                 [slot["family"] for slot in scheme["slots"]],
             )
+            manifest = load_manifest(manifest_path)
+            self.assertTrue(manifest.export_scope.external)
+            self.assertTrue(manifest.exclude_large_external_files)
+            self.assertEqual(128, manifest.external_file_limit_kb)
+
+    def test_filtered_export_uses_temporary_view_and_returns_workbook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = Pipeline(
+                manifest_path,
+                AppSettings(),
+                "",
+                root / "cache",
+                glossary_api_key="",
+            )
+            (pipeline.work_dir / "Data").mkdir(parents=True)
+            (pipeline.work_dir / "Game.exe").write_bytes(b"game")
+            large = pipeline.work_dir / "Data" / "dump.TXT"
+            large.write_bytes(b"x" * (128 * 1024 + 1))
+            warnings = []
+            pipeline.warning = warnings.append
+            runner = mock.Mock()
+
+            def extract(view, **_kwargs):
+                view = Path(view)
+                self.assertNotEqual(pipeline.work_dir, view)
+                self.assertFalse((view / "Data" / "dump.TXT").exists())
+                workbook = view / "WOLF_Translation_Support_Tool_Data" / "WOLF_Translation_Text.xlsx"
+                workbook.parent.mkdir(parents=True)
+                workbook.write_bytes(b"xlsx")
+                return workbook
+
+            runner.extract.side_effect = extract
+            output = pipeline._run_scoped_export(runner, "EXTRACT")
+
+            self.assertEqual(b"xlsx", output.read_bytes())
+            self.assertEqual(b"x" * (128 * 1024 + 1), large.read_bytes())
+            self.assertTrue(any("已临时排除" in warning for warning in warnings))
+            self.assertFalse(any(pipeline.version_dir.glob(".wolflator-export-view-*")))
 
     def test_font_scheme_change_invalidates_only_release(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,12 +185,20 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
+            logs = []
+            pipeline = Pipeline(
+                manifest_path,
+                AppSettings(),
+                "",
+                root / "cache",
+                glossary_api_key="",
+                log=logs.append,
+            )
             items = [
                 TranslationItem(key=f"font-{index}", original=f"原字体{index}", code=f"BASICDATA-{index + 3}")
                 for index in range(4)
             ]
-            items.append(TranslationItem(key="text", original="原文", translation="中文", code="COMMON-1"))
+            items.append(TranslationItem(key="text", original="原文", translation="中文∟", code="COMMON-1"))
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts["items"] = str(items_path)
             workbook_path = pipeline.artifacts_dir / "source.xlsx"
@@ -219,7 +267,13 @@ class PipelineTests(unittest.TestCase):
                     translated, temporary, load_font_scheme(manifest_path.parent)
                 )
             self.assertTrue((temporary / BUNDLED_FONT_ID).is_file())
-            self.assertEqual("0", artifacts["font_warning_count"])
+            self.assertEqual("4", artifacts["font_warning_count"])
+            self.assertTrue(
+                any(
+                    line.startswith("[WARNING] 字体缺字：主字体") and '样例 "∟"' in line
+                    for line in logs
+                )
+            )
             result = json.loads(Path(artifacts["font_result"]).read_text(encoding="utf-8"))
             self.assertEqual([BUNDLED_FONT_FAMILY] * 4, result["applied_slots"])
             runner.translate.assert_called_once()
@@ -377,11 +431,26 @@ class PipelineTests(unittest.TestCase):
                 load_manifest(manifest_path)
             legacy["schema"] = 1
             legacy.pop("export_scope")
+            legacy.pop("exclude_large_external_files")
+            legacy.pop("external_file_limit_kb")
             Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
             migrated = load_manifest(manifest_path)
-            self.assertEqual(2, migrated.schema)
+            self.assertEqual(3, migrated.schema)
             self.assertFalse(migrated.export_scope.external)
             self.assertTrue(migrated.export_scope.optional_name)
+            self.assertTrue(migrated.exclude_large_external_files)
+            self.assertEqual(128, migrated.external_file_limit_kb)
+
+            schema_two = json.loads(json.dumps(migrated.to_dict()))
+            schema_two["schema"] = 2
+            schema_two["export_scope"]["external"] = True
+            schema_two.pop("exclude_large_external_files")
+            schema_two.pop("external_file_limit_kb")
+            Path(manifest_path).write_text(json.dumps(schema_two), encoding="utf-8")
+            migrated = load_manifest(manifest_path)
+            self.assertTrue(migrated.export_scope.external)
+            self.assertTrue(migrated.exclude_large_external_files)
+            self.assertEqual(128, migrated.external_file_limit_kb)
 
     def test_manifest_rejects_non_boolean_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -431,17 +500,26 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.EXTRACT).status)
             self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.GLOSSARY).status)
 
-    def test_one_click_executes_manually_skipped_stage(self):
+    def test_removed_skip_marker_is_normalized_before_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             pipeline = FakePipeline(
                 manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
             )
-            pipeline.skip_stage(Stage.COPY)
-            skipped = load_manifest(manifest_path).version.stage(Stage.COPY)
-            self.assertEqual(StageStatus.COMPLETED, skipped.status)
-            self.assertEqual("true", skipped.artifacts["skipped"])
+            with pipeline._mutation("legacy-skip-test"):
+                for stage in STAGE_ORDER:
+                    pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
+                pipeline.manifest.version.stage(Stage.COPY).artifacts = {"skipped": "true"}
+                pipeline.save()
+            normalized = load_manifest(manifest_path)
+            self.assertTrue(
+                all(
+                    normalized.version.stage(stage).status is StageStatus.PENDING
+                    for stage in STAGE_ORDER
+                )
+            )
+            self.assertEqual({}, normalized.version.stage(Stage.COPY).artifacts)
             executed = []
             pipeline = FakePipeline(
                 manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
@@ -449,6 +527,7 @@ class PipelineTests(unittest.TestCase):
             pipeline.executed = executed
             self.assertEqual("completed", pipeline.run())
             self.assertEqual(list(Stage), executed)
+            self.assertNotIn("skipped", manifest_path.read_text(encoding="utf-8"))
 
     def test_failure_is_persisted_and_retryable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -562,6 +641,20 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]), executed)
             second.set_export_scope(ImportScope(external=True))
+            changed = load_manifest(manifest_path)
+            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.UNPACK).status)
+            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
+                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
+            with second._mutation("test-reset"):
+                second.manifest = changed
+                for stage in STAGE_ORDER:
+                    second.manifest.version.stage(stage).status = StageStatus.COMPLETED
+                second.save()
+            second.set_export_scope(
+                changed.export_scope,
+                exclude_large_external_files=True,
+                external_file_limit_kb=64,
+            )
             changed = load_manifest(manifest_path)
             self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.UNPACK).status)
             for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:

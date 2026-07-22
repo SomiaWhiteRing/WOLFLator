@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QFont, QFontDatabase
+from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -63,7 +64,16 @@ from fonts import (
     required_characters,
     resolve_scheme_files,
 )
-from models import ImportScope, RunMode, STAGE_ORDER, Stage, StageStatus, default_export_scope
+from models import (
+    DEFAULT_EXTERNAL_FILE_LIMIT_KB,
+    MAX_EXTERNAL_FILE_LIMIT_KB,
+    ImportScope,
+    RunMode,
+    STAGE_ORDER,
+    Stage,
+    StageStatus,
+    default_export_scope,
+)
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
 from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
@@ -96,6 +106,26 @@ STAGE_DESCRIPTIONS = {
     Stage.VALIDATE: "校验键、译文与控制符",
     Stage.IMPORT: "按选定范围回填游戏",
     Stage.RELEASE: "生成可直接运行的发布目录",
+}
+STAGE_RESULT_LABELS = {
+    Stage.COPY: "工作副本",
+    Stage.UNPACK: "Data目录",
+    Stage.EXTRACT: "导出表格",
+    Stage.GLOSSARY: "查看术语",
+    Stage.TRANSLATE: "翻译结果",
+    Stage.VALIDATE: "译文表格",
+    Stage.IMPORT: "导入结果",
+    Stage.RELEASE: "启动游戏",
+}
+STAGE_RESULT_ARTIFACTS = {
+    Stage.COPY: "work",
+    Stage.UNPACK: "data",
+    Stage.EXTRACT: "workbook",
+    Stage.GLOSSARY: "glossary",
+    Stage.TRANSLATE: "ainiee_output",
+    Stage.VALIDATE: "full_workbook",
+    Stage.IMPORT: "translated_game",
+    Stage.RELEASE: "release",
 }
 
 
@@ -930,7 +960,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         self.step_status_labels: dict[Stage, QLabel] = {}
         self.step_buttons: dict[Stage, QPushButton] = {}
-        self.step_skip_buttons: dict[Stage, QPushButton] = {}
+        self.step_result_buttons: dict[Stage, QPushButton] = {}
         for index, stage in enumerate(STAGE_ORDER, start=1):
             row = QFrame()
             row.setObjectName("stageRow")
@@ -952,21 +982,23 @@ class MainWindow(QMainWindow):
             status.setAlignment(Qt.AlignCenter)
             status.setMinimumWidth(64)
             run_button = QPushButton("执行")
-            run_button.setFixedWidth(52)
+            run_button.setFixedWidth(80)
             run_button.clicked.connect(lambda _checked=False, target=stage: self._start(target))
-            skip_button = QPushButton("跳过")
-            skip_button.setFixedWidth(52)
-            skip_button.clicked.connect(lambda _checked=False, target=stage: self._skip_stage(target))
+            result_button = QPushButton(STAGE_RESULT_LABELS[stage])
+            result_button.setFixedWidth(80)
+            result_button.clicked.connect(
+                lambda _checked=False, target=stage: self._open_stage_result(target)
+            )
             row_layout.addWidget(number, 0, 0)
             row_layout.addWidget(title, 0, 1)
             row_layout.addWidget(description, 0, 2)
             row_layout.addWidget(status, 0, 3)
-            row_layout.addWidget(run_button, 0, 4)
-            row_layout.addWidget(skip_button, 0, 5)
+            row_layout.addWidget(result_button, 0, 4)
+            row_layout.addWidget(run_button, 0, 5)
             row_layout.setColumnStretch(2, 1)
             self.step_status_labels[stage] = status
             self.step_buttons[stage] = run_button
-            self.step_skip_buttons[stage] = skip_button
+            self.step_result_buttons[stage] = result_button
             layout.addWidget(row)
         layout.addStretch(1)
         return page
@@ -1070,13 +1102,52 @@ class MainWindow(QMainWindow):
         for key, check in checks.items():
             check.toggled.connect(lambda _checked=False, scope_target=target: self._save_scope(scope_target))
             panel_layout.addWidget(check)
+            if target == "export" and key == "external":
+                self.external_filter_options = QWidget()
+                filter_layout = QHBoxLayout(self.external_filter_options)
+                filter_layout.setContentsMargins(26, 0, 0, 8)
+                filter_layout.setSpacing(8)
+                self.exclude_large_external_files = QCheckBox("自动排除超过")
+                self.exclude_large_external_files.setChecked(True)
+                self.external_file_limit_kb = QSpinBox()
+                self.external_file_limit_kb.setRange(1, MAX_EXTERNAL_FILE_LIMIT_KB)
+                self.external_file_limit_kb.setValue(DEFAULT_EXTERNAL_FILE_LIMIT_KB)
+                self.external_file_limit_kb.setSuffix(" KB 的文件")
+                filter_layout.addWidget(self.exclude_large_external_files)
+                filter_layout.addWidget(self.external_file_limit_kb)
+                filter_layout.addStretch(1)
+                panel_layout.addWidget(self.external_filter_options)
+                check.toggled.connect(self._update_external_filter_controls)
+                self.exclude_large_external_files.toggled.connect(
+                    self._external_filter_changed
+                )
+                self.external_file_limit_kb.valueChanged.connect(
+                    lambda _value: self._save_scope("export")
+                )
             if target == "import" and key == "filename":
                 warning = QLabel("启用文件名导入前，发布副本中必须存在对应的目标文件。")
                 warning.setObjectName("warningText")
                 panel_layout.addWidget(warning)
         panel_layout.addStretch(1)
         stack.addWidget(panel)
+        if target == "export":
+            self.external_filter_options.setVisible(checks["external"].isChecked())
+            self.external_file_limit_kb.setEnabled(
+                checks["external"].isChecked()
+                and self.exclude_large_external_files.isChecked()
+            )
         return checks
+
+    def _update_external_filter_controls(self) -> None:
+        visible = self.export_scope_checks["external"].isChecked()
+        self.external_filter_options.setVisible(visible)
+        self.external_file_limit_kb.setEnabled(
+            visible and self.exclude_large_external_files.isChecked()
+        )
+
+    def _external_filter_changed(self, _checked: bool) -> None:
+        self._update_external_filter_controls()
+        self._save_scope("export")
 
     def _font_tab(self) -> QWidget:
         page = QWidget()
@@ -1357,21 +1428,26 @@ class MainWindow(QMainWindow):
                 missing = required
             else:
                 missing = set(candidate.missing)
+                ordered_missing = sorted(missing, key=ord)
                 text = (
                     f"覆盖全部 {len(required)} 字"
                     if not missing
-                    else "缺少 "
-                    + str(len(missing))
-                    + " 字："
-                    + f"U+{ord(min(missing, key=ord)):04X}"
-                    + (" 等" if len(missing) > 1 else "")
+                    else f"缺少 {len(missing)} 字："
+                    + json.dumps("".join(ordered_missing[:8]), ensure_ascii=False)
+                    + (" 等" if len(missing) > 8 else "")
                 )
+            ordered_missing = sorted(missing, key=ord)
+            tooltip_characters = ordered_missing[:256]
             self.font_coverage_labels[index].setText(text)
             self.font_coverage_labels[index].setToolTip(
-                "\n".join(
-                    f"U+{ord(character):04X}  {character}"
-                    for character in sorted(missing, key=ord)
-                )[:4000]
+                "缺少字符：\n"
+                + "\n".join(
+                    json.dumps("".join(tooltip_characters[offset : offset + 32]), ensure_ascii=False)
+                    for offset in range(0, len(tooltip_characters), 32)
+                )
+                + (f"\n其余 {len(ordered_missing) - 256} 字未显示" if len(ordered_missing) > 256 else "")
+                if missing
+                else ""
             )
             original_family = original_slots[index] or QApplication.font().family()
             selected_family = family or QApplication.font().family()
@@ -1537,7 +1613,7 @@ class MainWindow(QMainWindow):
             self._update_stage_status(self.easy_stage_status[stage], StageStatus.PENDING)
             self._update_stage_status(self.step_status_labels[stage], StageStatus.PENDING)
             self.step_buttons[stage].setEnabled(False)
-            self.step_skip_buttons[stage].setEnabled(False)
+            self.step_result_buttons[stage].setEnabled(False)
         self.terms_table.setRowCount(0)
         self.characters_table.setRowCount(0)
         self.progress.setValue(0)
@@ -1571,28 +1647,32 @@ class MainWindow(QMainWindow):
         failed_stages: list[Stage] = []
         for stage in STAGE_ORDER:
             record = manifest.version.stage(stage)
-            skipped = record.artifacts.get("skipped") == "true"
             official_warning = record.artifacts.get("official_warning_count", "0")
             font_warning = record.artifacts.get("font_warning_count", "0")
             warning_count = sum(
                 int(value) if value.isdigit() else 0 for value in (official_warning, font_warning)
             )
-            detail = "已手动跳过" if skipped else record.error or record.artifacts.get(
+            detail = record.error or record.artifacts.get(
                 "official_warnings",
                 record.artifacts.get("font_warnings", next(iter(record.artifacts.values()), "")),
             )
-            easy_status = StageStatus.PENDING if skipped else record.status
             self._update_stage_status(
-                self.easy_stage_status[stage], easy_status, detail, warning_count
+                self.easy_stage_status[stage], record.status, detail, warning_count
             )
             self._update_stage_status(
                 self.step_status_labels[stage], record.status, detail, warning_count
             )
             self.step_buttons[stage].setEnabled(not running)
-            self.step_skip_buttons[stage].setEnabled(not running)
+            result_path = self._stage_result_path(stage, record.artifacts)
+            self.step_result_buttons[stage].setEnabled(
+                not running
+                and record.status is StageStatus.COMPLETED
+                and result_path is not None
+                and result_path.exists()
+            )
             if record.status in {StageStatus.FAILED, StageStatus.CANCELLED}:
                 failed_stages.append(stage)
-            if record.status is StageStatus.COMPLETED and not skipped:
+            if record.status is StageStatus.COMPLETED:
                 completed += 1
             elif next_stage is None:
                 next_stage = stage
@@ -1630,6 +1710,13 @@ class MainWindow(QMainWindow):
                 check.blockSignals(True)
                 check.setChecked(bool(getattr(scope, name)))
                 check.blockSignals(False)
+        self.exclude_large_external_files.blockSignals(True)
+        self.exclude_large_external_files.setChecked(manifest.exclude_large_external_files)
+        self.exclude_large_external_files.blockSignals(False)
+        self.external_file_limit_kb.blockSignals(True)
+        self.external_file_limit_kb.setValue(manifest.external_file_limit_kb)
+        self.external_file_limit_kb.blockSignals(False)
+        self._update_external_filter_controls()
         self._load_glossary()
         self._refresh_font_tab()
 
@@ -1707,7 +1794,11 @@ class MainWindow(QMainWindow):
             glossary_api_key="",
         )
         if target == "export":
-            pipeline.set_export_scope(new_scope)
+            pipeline.set_export_scope(
+                new_scope,
+                exclude_large_external_files=self.exclude_large_external_files.isChecked(),
+                external_file_limit_kb=self.external_file_limit_kb.value(),
+            )
         elif target == "translation":
             pipeline.set_translation_scope(new_scope)
         else:
@@ -1810,7 +1901,7 @@ class MainWindow(QMainWindow):
             self.save_glossary_button,
         ):
             control.setEnabled(enabled)
-        for button in (*self.step_buttons.values(), *self.step_skip_buttons.values()):
+        for button in (*self.step_buttons.values(), *self.step_result_buttons.values()):
             button.setEnabled(enabled)
         for checks in (
             self.export_scope_checks,
@@ -1819,6 +1910,8 @@ class MainWindow(QMainWindow):
         ):
             for check in checks.values():
                 check.setEnabled(enabled)
+        self.exclude_large_external_files.setEnabled(enabled)
+        self.external_file_limit_kb.setEnabled(enabled)
         self.export_scope_button.setEnabled(enabled)
         self.translation_scope_button.setEnabled(enabled)
         self.import_scope_button.setEnabled(enabled)
@@ -1827,6 +1920,8 @@ class MainWindow(QMainWindow):
         if locked:
             self.tabs.setCurrentIndex(0)
             self._set_font_controls_enabled(False)
+        else:
+            self._update_external_filter_controls()
         self.stop_button.setEnabled(locked)
 
     def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:
@@ -1878,8 +1973,25 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法启动", str(exc))
 
     def _append_log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
-        if message.startswith("日志文件:"):
+        level = "INFO"
+        text = message
+        for prefix, candidate in (("[WARNING] ", "WARNING"), ("[ERROR] ", "ERROR")):
+            if message.startswith(prefix):
+                level = candidate
+                text = message[len(prefix) :]
+                break
+        labels = {"WARNING": "警告  ", "ERROR": "错误  "}
+        colors = {"INFO": "#24322c", "WARNING": "#a24625", "ERROR": "#b42318"}
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        text_format = QTextCharFormat()
+        text_format.setForeground(QColor(colors[level]))
+        if level != "INFO":
+            text_format.setFontWeight(QFont.Weight.DemiBold)
+        cursor.insertText(labels.get(level, "") + text + "\n", text_format)
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
+        if text.startswith("日志文件:"):
             self.open_logs_button.setEnabled(True)
 
     def _open_log_dir(self) -> None:
@@ -1898,24 +2010,34 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "日志目录", "当前版本还没有运行日志。")
 
-    def _skip_stage(self, stage: Stage) -> None:
+    @staticmethod
+    def _stage_result_path(stage: Stage, artifacts: dict[str, str]) -> Path | None:
+        value = artifacts.get(STAGE_RESULT_ARTIFACTS[stage], "")
+        if not value:
+            return None
+        path = Path(value)
+        return path / "Game.exe" if stage is Stage.RELEASE else path
+
+    def _open_stage_result(self, stage: Stage) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
         try:
-            pipeline = Pipeline(
-                self.current_manifest_path,
-                self.settings,
-                "",
-                local_data_dir(),
-                glossary_api_key="",
-                log=self._append_log,
-            )
-            pipeline.skip_stage(stage)
-            self.active_step_stage = stage
-            self.status_label.setText(f"已跳过：{STAGE_LABELS[stage]}")
-            self._load_project_view()
+            manifest = load_manifest(self.current_manifest_path)
+            record = manifest.version.stage(stage)
+            path = self._stage_result_path(stage, record.artifacts)
+            if record.status is not StageStatus.COMPLETED or path is None or not path.exists():
+                QMessageBox.information(self, "阶段结果", "该阶段当前没有可用结果。")
+                return
+            if stage is Stage.GLOSSARY:
+                self.tabs.setCurrentIndex(1)
+            elif stage is Stage.TRANSLATE:
+                subprocess.Popen(["explorer.exe", "/select,", str(path)])
+            elif stage is Stage.RELEASE:
+                os.startfile(str(path), cwd=str(path.parent))
+            else:
+                os.startfile(str(path))
         except Exception as exc:
-            QMessageBox.critical(self, "无法跳过", str(exc))
+            QMessageBox.critical(self, "无法打开阶段结果", str(exc))
 
     def _stage_progress(self, current: int, total: int, _stage: str) -> None:
         if total == 0:

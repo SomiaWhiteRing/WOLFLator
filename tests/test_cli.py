@@ -141,6 +141,24 @@ class CliTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     0,
+                    cli.main(
+                        [
+                            "scope",
+                            str(manifest),
+                            "--target",
+                            "export",
+                            "--no-exclude-large-external",
+                            "--external-size-limit-kb",
+                            "256",
+                        ]
+                    ),
+                )
+            loaded = cli.load_manifest(manifest)
+            self.assertFalse(loaded.exclude_large_external_files)
+            self.assertEqual(256, loaded.external_file_limit_kb)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    0,
                     cli.main(["scope", str(manifest), "--target", "translation", "--optional-name"]),
                 )
             loaded = cli.load_manifest(manifest)

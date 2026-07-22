@@ -14,13 +14,20 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 from openpyxl import load_workbook
 
 from fonts import FONT_CODES
-from models import ImportCategory, ImportScope, ToolResult, TranslationItem, default_export_scope
+from models import (
+    MAX_EXTERNAL_FILE_LIMIT_KB,
+    ImportCategory,
+    ImportScope,
+    ToolResult,
+    TranslationItem,
+)
 from safe_io import (
     atomic_output_path,
     atomic_write_bytes,
@@ -48,18 +55,96 @@ COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
 
 
 def full_export_scope() -> ImportScope:
-    return default_export_scope()
+    # ponytail: this is the complete internal WOLF structure, not the user-facing export default.
+    return ImportScope(display=True, external=False, optional_name=True, halfwidth=True, filename=True)
 
 
 def name_baseline_scope(scope: ImportScope | None = None) -> ImportScope:
-    source = scope or default_export_scope()
+    source = scope or full_export_scope()
     return ImportScope(
         display=source.display,
-        external=source.external,
+        external=False,
         optional_name=False,
         halfwidth=source.halfwidth,
         filename=source.filename,
     )
+
+
+@contextmanager
+def temporary_external_filter_view(
+    game_root: str | Path,
+    temporary_parent: str | Path,
+    limit_kb: int,
+    *,
+    diagnostic_log: Callable[[str], None] | None = None,
+) -> Iterator[tuple[Path, list[tuple[str, int]]]]:
+    source_root = Path(game_root).resolve()
+    source_data = source_root / "Data"
+    source_exe = source_root / "Game.exe"
+    if not source_exe.is_file() or not source_data.is_dir():
+        raise FileNotFoundError("过滤视图需要工作副本中的 Game.exe 和 Data 目录。")
+    if type(limit_kb) is not int or not 1 <= limit_kb <= MAX_EXTERNAL_FILE_LIMIT_KB:
+        raise ValueError(
+            f"外部文件大小上限必须是 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 的整数。"
+        )
+
+    parent = Path(temporary_parent).resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    prefix = ".wolflator-export-view-"
+    for stale in parent.glob(prefix + "*"):
+        if stale.is_symlink() or stale.is_file():
+            stale.unlink(missing_ok=True)
+        elif stale.is_dir():
+            shutil.rmtree(stale)
+
+    view = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    excluded: list[tuple[str, int]] = []
+    linked = 0
+    copied = 0
+
+    def link_or_copy(source: Path, target: Path) -> None:
+        nonlocal linked, copied
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+            linked += 1
+        except OSError:
+            shutil.copy2(source, target)
+            copied += 1
+
+    try:
+        link_or_copy(source_exe, view / "Game.exe")
+        (view / "Data").mkdir()
+        byte_limit = limit_kb * 1024
+        for source in source_data.rglob("*"):
+            relative = source.relative_to(source_root)
+            target = view / relative
+            if source.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not source.is_file():
+                continue
+            size = source.stat().st_size
+            if source.suffix.lower() in {".txt", ".csv"} and size > byte_limit:
+                excluded.append((str(relative), size))
+                continue
+            link_or_copy(source, target)
+
+        workbook = source_root / SUPPORT_DIR / WORKBOOK_NAME
+        if workbook.is_file():
+            target = view / SUPPORT_DIR / WORKBOOK_NAME
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(workbook, target)
+            copied += 1
+        _emit_log(
+            diagnostic_log,
+            f"external-filter.view path={view} limit_kb={limit_kb} "
+            f"excluded={len(excluded)} linked={linked} copied={copied}",
+        )
+        yield view, excluded
+    finally:
+        if view.exists():
+            shutil.rmtree(view)
 
 
 class CancelledError(RuntimeError):
@@ -407,6 +492,8 @@ def run_process(
     env: dict[str, str] | None = None,
     hide_window: bool = False,
     capture_console: bool = False,
+    slow_warning_after: float | None = None,
+    slow_warning: Callable[[float], None] | None = None,
 ) -> ToolResult:
     if capture_console and os.name != "nt":
         raise ValueError("控制台捕获仅支持 Windows。")
@@ -505,6 +592,7 @@ def run_process(
     for reader in readers:
         reader.start()
     finished_streams: set[str] = set()
+    slow_warning_sent = False
     try:
         while process.poll() is None or len(finished_streams) < len(readers):
             read_console_snapshot()
@@ -522,6 +610,15 @@ def run_process(
                 _kill_process_tree(process)
                 raise CancelledError("任务已取消。")
             elapsed = time.monotonic() - started
+            if (
+                not slow_warning_sent
+                and slow_warning is not None
+                and slow_warning_after is not None
+                and elapsed >= slow_warning_after
+                and process.poll() is None
+            ):
+                slow_warning_sent = True
+                slow_warning(elapsed)
             if elapsed > timeout:
                 _emit_log(
                     detail,
@@ -716,6 +813,7 @@ class OfficialToolRunner:
         cancel_event: threading.Event | None = None,
         log: Callable[[str], None] | None = None,
         diagnostic_log: Callable[[str], None] | None = None,
+        warning: Callable[[str], None] | None = None,
     ) -> ToolResult:
         root = Path(game_root).resolve()
         write_official_game_config(root, self.scope)
@@ -731,6 +829,13 @@ class OfficialToolRunner:
         if language_index is not None:
             command.append(str(language_index))
         command.extend(["-gamedata", str(root) + os.sep, "-mes_lang", "EN"])
+        slow_warning_callback = None
+        if mode in {"EXTRACT", "UPDATE_EXCEL"} and (warning or log):
+            sink = warning or log
+            slow_warning_callback = lambda _elapsed: sink(
+                f"官方工具 {mode} 已运行超过 5 分钟；"
+                "请检查“自动排除大文件”是否启用，或适当降低大小上限。"
+            )
         result = run_process(
             command,
             cwd=self.executable.parent,
@@ -739,6 +844,8 @@ class OfficialToolRunner:
             diagnostic_log=diagnostic_log,
             hide_window=True,
             capture_console=True,
+            slow_warning_after=300 if mode in {"EXTRACT", "UPDATE_EXCEL"} else None,
+            slow_warning=slow_warning_callback,
         )
         self.console_outputs.append(
             {
@@ -819,7 +926,9 @@ def _content_category(code: str, flag: str, type_name: str) -> ImportCategory:
         return ImportCategory.HALFWIDTH
     if upper_code.startswith("NAME-") or upper_code.endswith("-NAME"):
         return ImportCategory.OPTIONAL_NAME
-    if upper_code.startswith(("TXT-", "CSV-")) or "TXT" in upper_type or "CSV" in upper_type:
+    if upper_code.startswith(("TXT-", "CSV-", "TXTFILE-", "CSVFILE-")) or any(
+        marker in upper_type for marker in ("TXT", "CSV", "TEXT FILE")
+    ):
         return ImportCategory.EXTERNAL
     return ImportCategory.DISPLAY
 

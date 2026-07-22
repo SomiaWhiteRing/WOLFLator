@@ -37,6 +37,7 @@ from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
     SUPPORT_DIR,
+    _content_category,
     _console_delta,
     _official_config_text,
     _pe_import_name_offset,
@@ -59,6 +60,7 @@ from wolf_tools import (
     restore_control_tokens,
     retryable_translation_errors,
     run_process,
+    temporary_external_filter_view,
     to_paratranz,
     write_font_workbook,
     write_full_workbook,
@@ -98,6 +100,17 @@ def make_workbook(path: Path) -> Path:
 
 
 class WorkbookTests(unittest.TestCase):
+    def test_official_external_row_names_are_classified_as_external(self):
+        for code, type_name in (
+            ("TXTFILE-1", "Text File"),
+            ("CSVFILE-2", "CSV File"),
+            ("TXT-3", "TXT File"),
+        ):
+            self.assertEqual(
+                ImportCategory.EXTERNAL,
+                _content_category(code, "", type_name),
+            )
+
     def test_classification_stable_keys_and_controls(self):
         with tempfile.TemporaryDirectory() as directory:
             path = make_workbook(Path(directory) / "source.xlsx")
@@ -272,6 +285,37 @@ class WorkbookTests(unittest.TestCase):
 
 
 class WorkbookAndFontTests(unittest.TestCase):
+    def test_external_filter_view_excludes_only_files_over_the_kb_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            data = game / "Data" / "nested"
+            data.mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            exact = data / "exact.TXT"
+            large = data / "large.csv"
+            binary = data / "large.bin"
+            exact.write_bytes(b"x" * (128 * 1024))
+            large.write_bytes(b"y" * (128 * 1024 + 1))
+            binary.write_bytes(b"z" * (128 * 1024 + 1))
+            original = {path: path.read_bytes() for path in (exact, large, binary)}
+            stale = root / "version" / ".wolflator-export-view-stale"
+            stale.mkdir(parents=True)
+
+            with temporary_external_filter_view(game, root / "version", 128) as (view, excluded):
+                view_path = view
+                self.assertTrue((view / "Data" / "nested" / "exact.TXT").is_file())
+                self.assertFalse((view / "Data" / "nested" / "large.csv").exists())
+                self.assertTrue((view / "Data" / "nested" / "large.bin").is_file())
+                self.assertEqual(
+                    [(str(Path("Data") / "nested" / "large.csv"), 128 * 1024 + 1)],
+                    excluded,
+                )
+                self.assertFalse(stale.exists())
+
+            self.assertFalse(view_path.exists())
+            self.assertEqual(original, {path: path.read_bytes() for path in original})
+
     def test_original_fonts_are_immutable_per_version(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -612,6 +656,18 @@ class ControlTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_slow_process_warning_fires_once_without_stopping_process(self):
+        warnings = []
+        result = run_process(
+            [sys.executable, "-c", "import time; time.sleep(0.35)"],
+            timeout=5,
+            slow_warning_after=0.05,
+            slow_warning=warnings.append,
+        )
+        self.assertEqual(0, result.return_code)
+        self.assertEqual(1, len(warnings))
+        self.assertGreaterEqual(warnings[0], 0.05)
+
     def test_pe_import_name_offset_finds_named_import(self):
         offset = _pe_import_name_offset(
             sys.executable, "KERNEL32.dll", "GetProcAddress"

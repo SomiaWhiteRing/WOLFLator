@@ -17,7 +17,7 @@ from ainiee import (
     prepare_managed_runtime,
     test_api,
 )
-from models import STAGE_ORDER, AppSettings, ImportScope, Stage
+from models import MAX_EXTERNAL_FILE_LIMIT_KB, STAGE_ORDER, AppSettings, ImportScope, Stage
 from pipeline import Pipeline, add_version, create_project, load_manifest
 from safe_io import ResourceBusyError, project_lock, project_lock_status
 from settings import SettingsStore, local_data_dir, validate_settings
@@ -30,6 +30,18 @@ def _stage(value: str) -> Stage:
     except ValueError as exc:
         choices = ", ".join(stage.value for stage in STAGE_ORDER)
         raise argparse.ArgumentTypeError(f"未知阶段 {value!r}，可选值：{choices}") from exc
+
+
+def _external_file_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("外部文件大小上限必须是整数 KB。") from exc
+    if not 1 <= limit <= MAX_EXTERNAL_FILE_LIMIT_KB:
+        raise argparse.ArgumentTypeError(
+            f"外部文件大小上限必须在 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 之间。"
+        )
+    return limit
 
 
 def _settings_store(args: argparse.Namespace) -> SettingsStore:
@@ -258,13 +270,6 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _skip(args: argparse.Namespace) -> int:
-    pipeline = _pipeline(args)
-    pipeline.skip_stage(args.stage)
-    print(f"skipped={args.stage.value}")
-    return 0
-
-
 def _retry(args: argparse.Namespace) -> int:
     pipeline = _pipeline(args)
     pipeline.retry_failed()
@@ -273,6 +278,12 @@ def _retry(args: argparse.Namespace) -> int:
 
 
 def _scope(args: argparse.Namespace) -> int:
+    filter_requested = (
+        args.exclude_large_external is not None
+        or args.external_size_limit_kb is not None
+    )
+    if filter_requested and args.target != "export":
+        raise ValueError("大文件自动排除选项仅适用于 --target export。")
     with project_lock(args.manifest, f"set-{args.target}-scope"):
         pipeline = _pipeline(args)
         current = {
@@ -286,12 +297,32 @@ def _scope(args: argparse.Namespace) -> int:
         }
         scope = ImportScope(**values)
         if args.target == "export":
-            pipeline.set_export_scope(scope)
+            exclude = pipeline.manifest.exclude_large_external_files
+            if args.exclude_large_external is not None:
+                exclude = args.exclude_large_external
+            limit_kb = (
+                args.external_size_limit_kb
+                if args.external_size_limit_kb is not None
+                else pipeline.manifest.external_file_limit_kb
+            )
+            pipeline.set_export_scope(
+                scope,
+                exclude_large_external_files=exclude,
+                external_file_limit_kb=limit_kb,
+            )
         elif args.target == "translation":
             pipeline.set_translation_scope(scope)
         else:
             pipeline.set_import_scope(scope)
-    print(json.dumps({"target": args.target, **values}, ensure_ascii=False))
+    result = {"target": args.target, **values}
+    if args.target == "export":
+        result.update(
+            {
+                "exclude_large_external_files": exclude,
+                "external_file_limit_kb": limit_kb,
+            }
+        )
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
@@ -336,10 +367,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("manifest", help="project.json")
     run.add_argument("--stage", type=_stage, help="只运行一个阶段，例如 translate")
 
-    skip = subparsers.add_parser("skip", help="手动跳过一个阶段")
-    skip.add_argument("manifest", help="project.json")
-    skip.add_argument("stage", type=_stage)
-
     retry = subparsers.add_parser("retry", help="重置失败/取消阶段及其后续阶段")
     retry.add_argument("manifest", help="project.json")
 
@@ -357,6 +384,17 @@ def build_parser() -> argparse.ArgumentParser:
             action=argparse.BooleanOptionalAction,
             default=None,
         )
+    scope.add_argument(
+        "--exclude-large-external",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="导出时自动排除超过上限的 TXT/CSV",
+    )
+    scope.add_argument(
+        "--external-size-limit-kb",
+        type=_external_file_limit,
+        help="自动排除的大小上限（KB）",
+    )
     return parser
 
 
@@ -384,8 +422,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _status(args)
         if args.command == "run":
             return _run(args)
-        if args.command == "skip":
-            return _skip(args)
         if args.command == "retry":
             return _retry(args)
         if args.command == "scope":
