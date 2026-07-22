@@ -7,8 +7,10 @@ import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -129,6 +131,297 @@ def _emit_log(sink: Callable[[str], None] | None, message: str) -> None:
             raise
 
 
+def _process_startupinfo(hide_window: bool):
+    if not hide_window or os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
+
+
+def _pe_import_name_offset(path: str | Path, library: str, function: str) -> int:
+    data = Path(path).read_bytes()
+
+    def unpack(fmt: str, offset: int):
+        size = struct.calcsize(fmt)
+        if offset < 0 or offset + size > len(data):
+            raise ValueError("PE 结构越界。")
+        return struct.unpack_from(fmt, data, offset)
+
+    def text_at(offset: int) -> str:
+        end = data.find(b"\0", offset)
+        if offset < 0 or end < 0:
+            raise ValueError("PE 字符串越界。")
+        return data[offset:end].decode("ascii")
+
+    pe_offset = unpack("<I", 0x3C)[0]
+    if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ValueError("不是有效的 PE 文件。")
+    machine, section_count, _, _, _, optional_size, _ = unpack("<HHIIIHH", pe_offset + 4)
+    optional = pe_offset + 24
+    magic = unpack("<H", optional)[0]
+    if magic == 0x10B:
+        pointer_size = 4
+        directories = optional + 96
+    elif magic == 0x20B:
+        pointer_size = 8
+        directories = optional + 112
+    else:
+        raise ValueError(f"不支持的 PE 可选头：0x{magic:04x}")
+    import_rva = unpack("<I", directories + 8)[0]
+    sections = []
+    section_table = optional + optional_size
+    for index in range(section_count):
+        offset = section_table + index * 40
+        virtual_size, virtual_address, raw_size, raw_offset = unpack("<IIII", offset + 8)
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_offset))
+
+    def file_offset(rva: int) -> int:
+        for virtual_address, size, raw_offset in sections:
+            if virtual_address <= rva < virtual_address + size:
+                return raw_offset + rva - virtual_address
+        if 0 <= rva < len(data):
+            return rva
+        raise ValueError(f"PE RVA 无法映射：0x{rva:x}")
+
+    descriptor = file_offset(import_rva)
+    for descriptor_index in range(4096):
+        original_thunk, _, _, name_rva, first_thunk = unpack(
+            "<IIIII", descriptor + descriptor_index * 20
+        )
+        if not any((original_thunk, name_rva, first_thunk)):
+            break
+        if text_at(file_offset(name_rva)).casefold() != library.casefold():
+            continue
+        thunk_rva = original_thunk or first_thunk
+        thunk_offset = file_offset(thunk_rva)
+        thunk_format = "<I" if pointer_size == 4 else "<Q"
+        ordinal_mask = 0x80000000 if pointer_size == 4 else 0x8000000000000000
+        for thunk_index in range(65536):
+            value = unpack(thunk_format, thunk_offset + thunk_index * pointer_size)[0]
+            if value == 0:
+                break
+            if value & ordinal_mask:
+                continue
+            if text_at(file_offset(value) + 2) == function:
+                return file_offset(value) + 2
+        break
+    raise ValueError(f"PE 未导入 {library}!{function}。")
+
+
+def _silent_official_executable(path: str | Path) -> bytes:
+    data = bytearray(Path(path).read_bytes())
+    offset = _pe_import_name_offset(path, "USER32.dll", "MessageBeep")
+    original = b"MessageBeep\0"
+    if data[offset : offset + len(original)] != original:
+        raise ValueError("官方工具 MessageBeep 导入结构不匹配。")
+    data[offset : offset + len(original)] = b"IsWindow\0".ljust(len(original), b"\0")
+    return bytes(data)
+
+
+CONSOLE_CAPTURE_ARG = "--console-capture-worker"
+CONSOLE_CLOSE_PROMPT = "Press any key to close this window."
+
+
+def _console_capture_command(process_id: int, snapshot_path: Path) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable, CONSOLE_CAPTURE_ARG, str(process_id), str(snapshot_path)]
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        CONSOLE_CAPTURE_ARG,
+        str(process_id),
+        str(snapshot_path),
+    ]
+
+
+def _console_delta(previous: str, current: str) -> list[str]:
+    old_lines = previous.splitlines()
+    new_lines = current.splitlines()
+    common = 0
+    while common < min(len(old_lines), len(new_lines)) and old_lines[common] == new_lines[common]:
+        common += 1
+    return [line for line in new_lines[common:] if line]
+
+
+def _write_console_snapshot(path: Path, *, text: str = "", done: bool = False, error: str = "") -> None:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps({"text": text, "done": done, "error": error}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def console_capture_worker(process_id: int, snapshot_path: str | Path) -> int:
+    path = Path(snapshot_path)
+    if os.name != "nt":
+        _write_console_snapshot(path, done=True, error="控制台捕获仅支持 Windows。")
+        return 1
+    try:
+        return _console_capture_worker_windows(process_id, path)
+    except Exception as exc:
+        _write_console_snapshot(path, done=True, error=f"{type(exc).__name__}: {exc}")
+        return 1
+
+
+def _console_capture_worker_windows(process_id: int, snapshot_path: Path) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class Coord(ctypes.Structure):
+        _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+    class SmallRect(ctypes.Structure):
+        _fields_ = [
+            ("Left", wintypes.SHORT),
+            ("Top", wintypes.SHORT),
+            ("Right", wintypes.SHORT),
+            ("Bottom", wintypes.SHORT),
+        ]
+
+    class ConsoleInfo(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", Coord),
+            ("dwCursorPosition", Coord),
+            ("wAttributes", wintypes.WORD),
+            ("srWindow", SmallRect),
+            ("dwMaximumWindowSize", Coord),
+        ]
+
+    class CharUnion(ctypes.Union):
+        _fields_ = [("UnicodeChar", wintypes.WCHAR), ("AsciiChar", wintypes.CHAR)]
+
+    class KeyEvent(ctypes.Structure):
+        _anonymous_ = ("character",)
+        _fields_ = [
+            ("bKeyDown", wintypes.BOOL),
+            ("wRepeatCount", wintypes.WORD),
+            ("wVirtualKeyCode", wintypes.WORD),
+            ("wVirtualScanCode", wintypes.WORD),
+            ("character", CharUnion),
+            ("dwControlKeyState", wintypes.DWORD),
+        ]
+
+    class EventUnion(ctypes.Union):
+        _fields_ = [("KeyEvent", KeyEvent), ("padding", ctypes.c_byte * 16)]
+
+    class InputRecord(ctypes.Structure):
+        _anonymous_ = ("event",)
+        _fields_ = [("EventType", wintypes.WORD), ("event", EventUnion)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.AttachConsole.argtypes = [wintypes.DWORD]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.ReadConsoleOutputCharacterW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        Coord,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetConsoleScreenBufferInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ConsoleInfo),
+    ]
+    kernel32.WriteConsoleInputW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(InputRecord),
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+
+    kernel32.FreeConsole()
+    attached = False
+    for _ in range(100):
+        if kernel32.AttachConsole(process_id):
+            attached = True
+            break
+        time.sleep(0.1)
+    if not attached:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    access = 0x80000000 | 0x40000000
+    sharing = 0x00000001 | 0x00000002
+    output = kernel32.CreateFileW("CONOUT$", access, sharing, None, 3, 0, None)
+    input_handle = kernel32.CreateFileW("CONIN$", access, sharing, None, 3, 0, None)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if output == invalid_handle or input_handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    process_handle = kernel32.OpenProcess(0x00100000, False, process_id)
+    if not process_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    last_text = ""
+    try:
+        while True:
+            info = ConsoleInfo()
+            if not kernel32.GetConsoleScreenBufferInfo(output, ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            width = max(1, info.dwSize.X)
+            height = max(1, info.dwCursorPosition.Y + 1)
+            size = width * height
+            chars = ctypes.create_unicode_buffer(size + 1)
+            count = wintypes.DWORD()
+            if not kernel32.ReadConsoleOutputCharacterW(
+                output, chars, size, Coord(0, 0), ctypes.byref(count)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            raw = chars[: count.value]
+            lines = [raw[index : index + width].rstrip() for index in range(0, len(raw), width)]
+            while lines and not lines[-1]:
+                lines.pop()
+            text = "\n".join(lines)
+            if text != last_text:
+                _write_console_snapshot(snapshot_path, text=text)
+                last_text = text
+            if re.sub(r"\s+", "", CONSOLE_CLOSE_PROMPT) in re.sub(r"\s+", "", text):
+                records = (InputRecord * 2)()
+                for index, key_down in enumerate((True, False)):
+                    records[index].EventType = 0x0001
+                    records[index].KeyEvent.bKeyDown = key_down
+                    records[index].KeyEvent.wRepeatCount = 1
+                    records[index].KeyEvent.wVirtualKeyCode = 0x0D
+                    records[index].KeyEvent.wVirtualScanCode = 0x1C
+                    records[index].KeyEvent.UnicodeChar = "\r"
+                written = wintypes.DWORD()
+                if not kernel32.WriteConsoleInputW(
+                    input_handle, records, len(records), ctypes.byref(written)
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                _write_console_snapshot(snapshot_path, text=text, done=True)
+                return 0
+            if kernel32.WaitForSingleObject(process_handle, 0) == 0:
+                _write_console_snapshot(snapshot_path, text=text, done=True)
+                return 0
+            time.sleep(0.2)
+    finally:
+        for handle in (process_handle, input_handle, output):
+            kernel32.CloseHandle(handle)
+
+
 def run_process(
     command: list[str],
     *,
@@ -138,11 +431,21 @@ def run_process(
     log: Callable[[str], None] | None = None,
     diagnostic_log: Callable[[str], None] | None = None,
     env: dict[str, str] | None = None,
+    hide_window: bool = False,
+    capture_console: bool = False,
 ) -> ToolResult:
+    if capture_console and os.name != "nt":
+        raise ValueError("控制台捕获仅支持 Windows。")
     detail = diagnostic_log or log
     safe_command = " ".join(f'"{arg}"' if " " in arg else arg for arg in command)
     _emit_log(log, f"> {safe_command}")
     started = time.monotonic()
+    startupinfo = _process_startupinfo(hide_window or capture_console)
+    creationflags = (
+        getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        if capture_console
+        else getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
     process = subprocess.Popen(
         command,
         cwd=str(cwd) if cwd else None,
@@ -153,16 +456,64 @@ def run_process(
         encoding="utf-8",
         errors="replace",
         env=env,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        creationflags=creationflags,
+        startupinfo=startupinfo,
         bufsize=1,
     )
+    console_snapshot: Path | None = None
+    console_helper: subprocess.Popen[str] | None = None
+    console_text = ""
+    console_revision = 0
+    console_done = False
+    if capture_console:
+        descriptor, snapshot_name = tempfile.mkstemp(prefix="wolflator-console-", suffix=".json")
+        os.close(descriptor)
+        console_snapshot = Path(snapshot_name)
+        console_snapshot.unlink()
+        try:
+            console_helper = subprocess.Popen(
+                _console_capture_command(process.pid, console_snapshot),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            _kill_process_tree(process)
+            process.wait()
+            console_snapshot.unlink(missing_ok=True)
+            raise
     _emit_log(
         detail,
         f"process.start pid={process.pid} cwd={Path(cwd).resolve() if cwd else Path.cwd()} "
-        f"timeout={timeout}s command={safe_command}",
+        f"timeout={timeout}s window={'hidden-console' if capture_console else ('hidden' if startupinfo else 'default')} "
+        f"command={safe_command}",
     )
+    if console_helper:
+        _emit_log(detail, f"console.capture.start pid={process.pid} helper_pid={console_helper.pid}")
     output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+    def read_console_snapshot() -> None:
+        nonlocal console_text, console_revision, console_done
+        if console_snapshot is None or not console_snapshot.is_file():
+            return
+        try:
+            revision = console_snapshot.stat().st_mtime_ns
+            if revision == console_revision:
+                return
+            payload = json.loads(console_snapshot.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        console_revision = revision
+        error = str(payload.get("error", ""))
+        if error:
+            raise RuntimeError(f"官方工具控制台捕获失败：{error}")
+        current = str(payload.get("text", ""))
+        for line in _console_delta(console_text, current):
+            _emit_log(detail, f"process.console pid={process.pid} {line}")
+        console_text = current
+        console_done = bool(payload.get("done", False))
 
     def read_stream(name: str, stream) -> None:
         try:
@@ -180,6 +531,13 @@ def run_process(
     finished_streams: set[str] = set()
     try:
         while process.poll() is None or len(finished_streams) < len(readers):
+            read_console_snapshot()
+            if console_helper and console_helper.poll() is not None:
+                read_console_snapshot()
+                if not console_done and process.poll() is None:
+                    raise RuntimeError(
+                        f"官方工具控制台捕获进程异常退出：{console_helper.returncode}"
+                    )
             if cancel_event and cancel_event.is_set():
                 _emit_log(
                     detail,
@@ -213,16 +571,32 @@ def run_process(
         for stream in (process.stdout, process.stderr):
             if stream and not stream.closed:
                 stream.close()
+        if console_helper:
+            try:
+                console_helper.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                console_helper.terminate()
+                console_helper.wait(timeout=2)
+        try:
+            read_console_snapshot()
+        finally:
+            if console_snapshot:
+                console_snapshot.unlink(missing_ok=True)
+                for temporary in console_snapshot.parent.glob(f"{console_snapshot.name}.*.tmp"):
+                    temporary.unlink(missing_ok=True)
     stdout = "\n".join(captured["stdout"])
     stderr = "\n".join(captured["stderr"])
+    if console_helper and console_helper.returncode not in (None, 0):
+        raise RuntimeError(f"官方工具控制台捕获进程异常退出：{console_helper.returncode}")
     result = ToolResult(command, process.returncode or 0, stdout, stderr, time.monotonic() - started)
     _emit_log(
         detail,
         f"process.exit pid={process.pid} code={result.return_code} duration={result.duration_seconds:.3f}s "
-        f"stdout_lines={len(captured['stdout'])} stderr_lines={len(captured['stderr'])}",
+        f"stdout_lines={len(captured['stdout'])} stderr_lines={len(captured['stderr'])} "
+        f"console_lines={len(console_text.splitlines())}",
     )
     if result.return_code != 0:
-        error_detail = (stderr or stdout).strip()[-2000:]
+        error_detail = "\n".join(part for part in (console_text, stderr, stdout) if part).strip()[-2000:]
         raise RuntimeError(f"外部工具退出码 {result.return_code}: {error_detail}")
     _emit_log(log, f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
     return result
@@ -319,9 +693,15 @@ def prepare_official_tool(source_exe: str | Path, cache_root: str | Path) -> Pat
     target_dir = Path(cache_root) / fingerprint
     target_dir.mkdir(parents=True, exist_ok=True)
     target_exe = target_dir / source.name
-    for source_file, target_file in ((source, target_exe), (lib, target_dir / lib.name)):
-        if not target_file.exists() or sha256_file(source_file) != sha256_file(target_file):
-            shutil.copy2(source_file, target_file)
+    silent_executable = _silent_official_executable(source)
+    if not target_exe.is_file() or target_exe.read_bytes() != silent_executable:
+        temporary = target_exe.with_name(target_exe.name + ".tmp")
+        temporary.write_bytes(silent_executable)
+        shutil.copystat(source, temporary)
+        os.replace(temporary, target_exe)
+    target_lib = target_dir / lib.name
+    if not target_lib.exists() or sha256_file(lib) != sha256_file(target_lib):
+        shutil.copy2(lib, target_lib)
     return target_exe
 
 
@@ -342,6 +722,10 @@ class OfficialToolRunner:
     ) -> ToolResult:
         root = Path(game_root).resolve()
         write_official_game_config(root, self.scope)
+        _emit_log(
+            diagnostic_log,
+            "official.sound_suppression method=import-redirection source=MessageBeep target=IsWindow",
+        )
         command = [
             str(self.executable),
             "-mode",
@@ -350,12 +734,15 @@ class OfficialToolRunner:
         if language_index is not None:
             command.append(str(language_index))
         command.extend(["-gamedata", str(root) + os.sep, "-mes_lang", "EN"])
+        command.append("-wait")
         return run_process(
             command,
             cwd=self.executable.parent,
             cancel_event=cancel_event,
             log=log,
             diagnostic_log=diagnostic_log,
+            hide_window=True,
+            capture_console=True,
         )
 
     def extract(self, game_root: str | Path, **kwargs) -> Path:
@@ -779,9 +1166,13 @@ def merge_ainiee_output(
     for key, item in expected.items():
         item.translation = _validated_ainiee_translation(item, actual[key])
         item.stage = 1
+    usage_categories = selected_translation_requirements(items, full_export_scope())
+    unsafe_categories = {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}
     for item in items:
         if item.category is ImportCategory.COPY:
             item.translation = ""
+        elif item.translation and not (usage_categories.get(item.key, set()) & unsafe_categories):
+            item.translation = item.translation.replace("・", "·")
     return items
 
 
@@ -924,3 +1315,9 @@ def load_items(path: str | Path) -> list[TranslationItem]:
     if not isinstance(data["items"], list):
         raise ValueError("翻译条目 items 不是数组。")
     return [TranslationItem.from_dict(item) for item in data["items"]]
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == CONSOLE_CAPTURE_ARG:
+        raise SystemExit(console_capture_worker(int(sys.argv[2]), sys.argv[3]))
+    raise SystemExit(2)

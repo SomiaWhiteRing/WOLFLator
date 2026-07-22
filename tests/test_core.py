@@ -2,6 +2,7 @@ import http.server
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,8 +21,14 @@ import ainiee
 from models import AppSettings, ImportCategory, ImportScope, ToolResult
 from wolf_tools import (
     CancelledError,
+    OfficialToolRunner,
     SUPPORT_DIR,
+    _console_delta,
     _official_config_text,
+    _pe_import_name_offset,
+    _process_startupinfo,
+    _silent_official_executable,
+    _write_console_snapshot,
     apply_managed_translations,
     classify_optional_name_delta,
     dump_items,
@@ -147,6 +154,36 @@ class WorkbookTests(unittest.TestCase):
             translated = [{**row, "translation": "译文", "stage": 1} for row in payload]
             with self.assertRaisesRegex(ValueError, "COMMON-1.*占位序列"):
                 merge_ainiee_output(items, translated, ImportScope())
+
+    def test_middle_dot_normalization_skips_filename_and_halfwidth_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["DISPLAY-1", "", "Event", "Message", "", r"表示・文\C[1]", ""])
+            sheet.append(["DISPLAY-2", "", "Event", "Message", "", "画像・名", ""])
+            sheet.append(
+                ["FILE-COPY", "<FILENAME>\nCOPY-FROM-DISPLAY-2", "Image", "File", "", "画像・名", ""]
+            )
+            sheet.append(["FILE-1", "<FILENAME>", "Image", "File", "", "画像・名.png", ""])
+            sheet.append(["HALF-1", "<HALF-WIDTH CHARACTERS ONLY>", "Event", "Code", "", "A・B", ""])
+            workbook.save(path)
+
+            items = read_translation_items(path)
+            payload = to_paratranz(items, full_export_scope())
+            translated = []
+            for row in payload:
+                controls = "".join(char for char in row["original"] if 0xE100 <= ord(char) <= 0xF7FF)
+                translated.append({**row, "translation": "中・文" + controls, "stage": 1})
+
+            merged = merge_ainiee_output(items, translated, full_export_scope())
+            by_code = {item.code: item.translation for item in merged}
+            self.assertEqual(r"中·文\C[1]", by_code["DISPLAY-1"])
+            self.assertEqual("中・文", by_code["DISPLAY-2"])
+            self.assertEqual("", by_code["FILE-COPY"])
+            self.assertEqual("中・文", by_code["FILE-1"])
+            self.assertEqual("中・文", by_code["HALF-1"])
 
     def test_retryable_errors_include_only_missing_empty_and_invalid_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -360,6 +397,78 @@ class ControlTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_pe_import_name_offset_finds_named_import(self):
+        offset = _pe_import_name_offset(
+            sys.executable, "KERNEL32.dll", "GetProcAddress"
+        )
+        self.assertEqual(b"GetProcAddress\0", Path(sys.executable).read_bytes()[offset : offset + 15])
+        with self.assertRaisesRegex(ValueError, "未导入"):
+            _pe_import_name_offset(sys.executable, "KERNEL32.dll", "DefinitelyMissing")
+
+    def test_silent_official_executable_does_not_modify_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "official.exe"
+            original = b"prefix-MessageBeep\0-suffix"
+            source.write_bytes(original)
+            with mock.patch("wolf_tools._pe_import_name_offset", return_value=7):
+                silent = _silent_official_executable(source)
+            self.assertEqual(original, source.read_bytes())
+            self.assertEqual(b"prefix-IsWindow\0\0\0\0-suffix", silent)
+
+    def test_console_delta_keeps_appends_and_rewritten_progress(self):
+        self.assertEqual(["third"], _console_delta("first\nsecond", "first\nsecond\nthird"))
+        self.assertEqual(
+            ["Process 2 / 10", "done"],
+            _console_delta("header\nProcess 1 / 10", "header\nProcess 2 / 10\ndone"),
+        )
+
+    def test_console_snapshot_retries_windows_replace_sharing_violation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            real_replace = os.replace
+            attempts = 0
+
+            def flaky_replace(source, target):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError(5, "sharing violation")
+                return real_replace(source, target)
+
+            with mock.patch("wolf_tools.os.replace", side_effect=flaky_replace):
+                _write_console_snapshot(path, text="captured")
+            self.assertEqual(3, attempts)
+            self.assertEqual("captured", json.loads(path.read_text(encoding="utf-8"))["text"])
+
+    def test_hidden_process_startupinfo_uses_windows_hide_flag(self):
+        startupinfo = _process_startupinfo(True)
+        if os.name == "nt":
+            self.assertIsNotNone(startupinfo)
+            self.assertTrue(startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW)
+            self.assertEqual(subprocess.SW_HIDE, startupinfo.wShowWindow)
+        else:
+            self.assertIsNone(startupinfo)
+        self.assertIsNone(_process_startupinfo(False))
+
+    def test_official_runner_waits_and_captures_hidden_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "official.exe"
+            executable.touch()
+            details = []
+            with mock.patch(
+                "wolf_tools.run_process",
+                return_value=ToolResult([], 0, "", "", 0.1),
+            ) as run:
+                OfficialToolRunner(executable, ImportScope()).run(
+                    "EXTRACT", root, diagnostic_log=details.append
+                )
+            command = run.call_args.args[0]
+            self.assertEqual("-wait", command[-1])
+            self.assertTrue(run.call_args.kwargs["hide_window"])
+            self.assertTrue(run.call_args.kwargs["capture_console"])
+            self.assertTrue(any("MessageBeep" in line and "IsWindow" in line for line in details))
+
     def test_nonzero_and_cancel(self):
         with self.assertRaisesRegex(RuntimeError, "退出码 3"):
             run_process([sys.executable, "-c", "raise SystemExit(3)"], timeout=10)

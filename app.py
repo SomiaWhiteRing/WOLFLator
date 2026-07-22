@@ -1449,6 +1449,10 @@ QCheckBox { spacing: 10px; padding: 6px 0; }
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--console-capture-worker":
+        from wolf_tools import console_capture_worker
+
+        return console_capture_worker(int(sys.argv[2]), sys.argv[3])
     app = QApplication(sys.argv)
     app.setApplicationName("WOLFLator")
     app.setOrganizationName("WOLFLator")
