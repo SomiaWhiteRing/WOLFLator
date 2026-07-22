@@ -200,6 +200,8 @@ class WorkbookTests(unittest.TestCase):
             sheet.append(["COMMON-1-0-0", "", "Event", "(Common Event)", "", "内部名", ""])
             sheet.append(["DISPLAY-1", "", "Event", "Message", "", "顔", ""])
             sheet.append(["FILE-1", "<FILENAME>\nCOPY-FROM-DISPLAY-1", "Image", "File", "", "顔", ""])
+            sheet.append(["NAME-D-SDB-0-9", "<FILENAME>", "SDB info", "Data name", "", "トイレ", ""])
+            sheet.append(["DISPLAY-2", "COPY-FROM-NAME-D-SDB-0-9", "Event", "Message", "", "トイレ", ""])
             workbook.save(full_path)
 
             baseline_path = root / "baseline.xlsx"
@@ -209,11 +211,12 @@ class WorkbookTests(unittest.TestCase):
             sheet.append(["UDB-1-0-0", "", "Status", "Label", "", "攻撃力", ""])
             sheet.append(["DISPLAY-1", "", "Event", "Message", "", "顔", ""])
             sheet.append(["FILE-1", "<FILENAME>\nCOPY-FROM-DISPLAY-1", "Image", "File", "", "顔", ""])
+            sheet.append(["DISPLAY-2", "COPY-FROM-NAME-D-SDB-0-9", "Event", "Message", "", "トイレ", ""])
             workbook.save(baseline_path)
 
             items = read_translation_items(full_path)
             baseline_items = read_translation_items(baseline_path)
-            self.assertEqual(2, classify_optional_name_delta(items, baseline_items))
+            self.assertEqual(3, classify_optional_name_delta(items, baseline_items))
             self.assertEqual(ImportCategory.OPTIONAL_NAME, items[0].category)
             self.assertEqual(ImportCategory.DISPLAY, items[1].copy_category)
             self.assertEqual(ImportCategory.OPTIONAL_NAME, items[2].category)
@@ -235,6 +238,8 @@ class WorkbookTests(unittest.TestCase):
             self.assertIsNone(output.active["G4"].value)
             self.assertIsNone(output.active["G5"].value)
             self.assertIsNone(output.active["G6"].value)
+            self.assertIsNone(output.active["G7"].value)
+            self.assertIsNone(output.active["G8"].value)
 
     def test_merge_and_scoped_workbook_preserve_table(self):
         with tempfile.TemporaryDirectory() as directory:

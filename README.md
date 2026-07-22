@@ -36,6 +36,8 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。
 官方工具始终生成全量 XLSX，并额外生成一份关闭名称项的内部基准表来精确分类；翻译范围和导入范围可独立切换，切换范围不需要重新导出。
 
+真实游戏 `gorigirlSGK1.00` 的阶段证据、已修复缺陷、恢复边界和下一次干净一键验收要求见 [2026-07-22 实机全流程归档](docs/qa/2026-07-22-gorigirlSGK1.00-e2e.md)。
+
 ## 构建 Windows 发行包
 
 ```powershell

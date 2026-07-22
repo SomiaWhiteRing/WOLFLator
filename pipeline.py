@@ -746,7 +746,7 @@ class Pipeline:
         support = self.work_dir / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)
         shutil.copy2(scoped, support / WORKBOOK_NAME)
-        translated = self._official_runner().translate(
+        translated = self._official_runner(self.manifest.import_scope).translate(
             self.work_dir,
             cancel_event=self.cancel_event,
             log=self.log,

@@ -658,7 +658,11 @@ def selected_translation_requirements(
             continue
         source = _copy_source(item, by_code) if item.category is ImportCategory.COPY else item
         sources[source.key] = source
-        groups.setdefault(source.key, set()).add(category)
+        categories = groups.setdefault(source.key, set())
+        categories.add(category)
+        intrinsic = _content_category(source.code, source.flag, source.type)
+        if intrinsic in {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}:
+            categories.add(intrinsic)
 
     requirements: dict[str, set[ImportCategory]] = {}
     for key, categories in groups.items():

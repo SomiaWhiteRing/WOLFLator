@@ -106,6 +106,31 @@ class PipelineTests(unittest.TestCase):
                     pipeline._translate()
             self.assertEqual(2, run.call_count)
 
+    def test_import_passes_the_selected_scope_to_the_official_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = self._translation_pipeline(root)
+            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1")]
+            items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
+            pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
+                "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
+                "items": str(items_path),
+            }
+            scoped = root / "import-scoped.xlsx"
+            scoped.write_bytes(b"xlsx")
+            translated = root / "translated-game"
+            runner = mock.Mock()
+            runner.translate.return_value = translated
+
+            with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
+                "pipeline.write_scoped_workbook", return_value=scoped
+            ):
+                artifacts = pipeline._import()
+
+            factory.assert_called_once_with(pipeline.manifest.import_scope)
+            runner.translate.assert_called_once()
+            self.assertEqual(str(translated), artifacts["translated_game"])
+
     def test_manifest_rejects_missing_translation_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
