@@ -21,6 +21,10 @@ from typing import Callable, Iterable, Iterator
 
 from models import TranslationItem
 from safe_io import atomic_write_json, package_lock, replace_with_retry
+from wolf_command_catalog import (
+    VERIFIED_EDITOR_VERSION,
+    command_effect,
+)
 from wolf_tools import hash_directory, run_process, sha256_file
 
 
@@ -33,9 +37,6 @@ AUTO_ANALYSIS_SCHEMA = 2
 _VALUE_LIMIT = 256
 _LOOP_LIMIT = 32
 _CALL_DEPTH_LIMIT = 8
-# Editor 3.713 calibration and the official command manual confirm these
-# commands never assign string variables. Numeric side effects remain tainted.
-_NO_STRING_WRITE_OPCODES = frozenset({101, 103, 106, 140, 150, 212})
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
@@ -131,9 +132,12 @@ class _StringValue:
 class _AnalysisState:
     numbers: dict[int, _NumberValue]
     strings: dict[int, _StringValue]
+    database_strings: dict[tuple[str, int, int, int], _StringValue]
 
     def copy(self) -> "_AnalysisState":
-        return _AnalysisState(dict(self.numbers), dict(self.strings))
+        return _AnalysisState(
+            dict(self.numbers), dict(self.strings), dict(self.database_strings)
+        )
 
 
 class _LinkParser(HTMLParser):
@@ -796,7 +800,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
 
 def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
     if not states:
-        return _AnalysisState({}, {})
+        return _AnalysisState({}, {}, {})
     result = states[0].copy()
     for state in states[1:]:
         result.numbers = {
@@ -808,6 +812,15 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
             key: value
             for key in set(result.strings) | set(state.strings)
             if (value := _merge_strings(result.strings.get(key), state.strings.get(key))) is not None
+        }
+        result.database_strings = {
+            key: value
+            for key in set(result.database_strings) | set(state.database_strings)
+            if (
+                value := _merge_strings(
+                    result.database_strings.get(key), state.database_strings.get(key)
+                )
+            ) is not None
         }
     return result
 
@@ -879,11 +892,10 @@ class _BlockAnalyzer:
         return set(value.values)
 
     def _database(self, command: _Command, index: int, state: _AnalysisState) -> None:
-        if len(command.ints) < 5:
+        if len(command.ints) not in {4, 5}:
             self._record_unknown(command, index, "invalid-250")
             return
         flags = command.ints[3]
-        destination = command.ints[4] & 0x00FFFFFF
         byte1 = (flags >> 8) & 0xFF
         byte2 = (flags >> 16) & 0xFF
         database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
@@ -891,9 +903,13 @@ class _BlockAnalyzer:
             self._record_unknown(command, index, f"250-flags-{flags:08x}")
             return
         if byte1 & 0xF0 != 0x10:
-            # Database writes consume the final argument; they do not assign it.
-            self._record_unknown(command, index, f"250-write-{flags:08x}")
+            if len(command.ints) == 4 and command.strings:
+                self._write_database_string(command, index, state, database, byte2)
             return
+        if len(command.ints) != 5:
+            self._record_unknown(command, index, "invalid-250-read")
+            return
+        destination = command.ints[4] & 0x00FFFFFF
         type_ids = self._type_ids(database, command, byte2, state)
         if not type_ids:
             state.strings[destination] = _StringValue(trace=(self._location(index),), unknown="数据库类型无法解析")
@@ -967,7 +983,11 @@ class _BlockAnalyzer:
                     if db_type.field_types[field_id] >= 2000:
                         string_field = True
                         coordinate_keys = self.database_keys.get(coordinate, ())
-                        if coordinate_keys:
+                        runtime_value = state.database_strings.get(coordinate)
+                        if runtime_value is not None:
+                            keys.update(runtime_value.source_keys)
+                            cells.update(runtime_value.cells)
+                        elif coordinate_keys:
                             cells.add(coordinate)
                             keys.update(coordinate_keys)
                     else:
@@ -987,6 +1007,71 @@ class _BlockAnalyzer:
             values = _limited(numeric_values)
             state.numbers[destination] = _NumberValue(
                 values, "数据库数值集合超过 256 项" if values is None else "", True
+            )
+
+    def _write_database_string(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        database: str,
+        selector_flags: int,
+    ) -> None:
+        type_ids = self._type_ids(database, command, selector_flags, state)
+        if not type_ids:
+            return
+        if selector_flags & 0x02:
+            data_name = command.strings[2] if len(command.strings) > 2 else ""
+            data_ids = {
+                data_id
+                for type_id in type_ids
+                for data_id, name in enumerate(self.databases[database][type_id].data_names)
+                if name == data_name
+            }
+        else:
+            data_ids = self._selector(command.ints[1], state, unknown_means_all=False) or set()
+        if selector_flags & 0x04:
+            field_name = command.strings[3] if len(command.strings) > 3 else ""
+            field_ids = {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database][type_id].field_names.items()
+                if name == field_name
+            }
+        else:
+            field_ids = self._selector(command.ints[2], state, unknown_means_all=False) or set()
+        coordinates = {
+            (database, type_id, data_id, field_id)
+            for type_id in type_ids
+            for data_id in data_ids
+            for field_id in field_ids
+        }
+        if len(coordinates) > _VALUE_LIMIT:
+            return
+        value = self._literal_string(command, index, 0, state)
+        for coordinate in coordinates:
+            state.database_strings[coordinate] = value
+
+    def _set_runtime_value(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        *,
+        string_result: bool,
+    ) -> None:
+        if not command.ints:
+            self._record_unknown(command, index, "missing-destination")
+            return
+        destination = command.ints[0] & 0x00FFFFFF
+        if string_result:
+            state.strings[destination] = _StringValue(
+                trace=(self._location(index),),
+                unknown=f"字符串由运行时命令 opcode={command.opcode} 取得",
+            )
+        else:
+            state.numbers[destination] = _NumberValue(
+                None, f"数值由运行时命令 opcode={command.opcode} 取得"
             )
 
     def _set_number(self, command: _Command, index: int, state: _AnalysisState) -> None:
@@ -1039,12 +1124,16 @@ class _BlockAnalyzer:
         return value
 
     def _set_string(self, command: _Command, index: int, state: _AnalysisState) -> None:
-        if len(command.ints) < 3:
+        if len(command.ints) < 2:
             self._record_unknown(command, index, "invalid-122")
             return
-        destination, flags, source_raw = command.ints[:3]
+        destination, flags = command.ints[:2]
+        source_raw = command.ints[2] if len(command.ints) > 2 else 0
         source_kind = flags & 0x0F
         assignment = (flags >> 8) & 0x0F
+        if source_kind == 1 and len(command.ints) < 3:
+            self._record_unknown(command, index, "invalid-122-variable-source")
+            return
         if source_kind == 0:
             value = self._literal_string(command, index, 0, state)
         elif source_kind == 1:
@@ -1114,7 +1203,8 @@ class _BlockAnalyzer:
         if not command.ints:
             self._record_unknown(command, index, "invalid-112")
             return
-        count = command.ints[0]
+        # Editor 3.713 uses both a bare count and 0x10 | count.
+        count = command.ints[0] & 0x0F
         if count < 0 or len(command.ints) < count + 1 or len(command.strings) < count:
             self._record_unknown(command, index, "invalid-112-count")
             return
@@ -1348,6 +1438,7 @@ class _BlockAnalyzer:
         callee_state = _AnalysisState(
             {1_600_000: _NumberValue(frozenset({choice}))},
             {},
+            dict(state.database_strings),
         )
         for offset, raw in enumerate(command.ints[3:string_start], start=1):
             callee_state.numbers[1_600_000 + offset] = _number_argument(raw, state)
@@ -1445,8 +1536,25 @@ class _BlockAnalyzer:
                 self._set_number(command, index, state)
             elif command.opcode == 122:
                 self._set_string(command, index, state)
+            elif command.opcode == 123:
+                self._set_runtime_value(command, index, state, string_result=False)
+            elif command.opcode == 124:
+                # Editor 3.713 exposes both numeric and string-valued system queries.
+                # A query overwrites prior provenance; runtime strings are not
+                # WOLFLator-editable sources and therefore remain untracked.
+                category = command.ints[1] if len(command.ints) > 1 else -1
+                field = command.ints[3] if len(command.ints) > 3 else -1
+                string_result = category == 4096 and field == 9
+                self._set_runtime_value(command, index, state, string_result=string_result)
             elif command.opcode == 250:
                 self._database(command, index, state)
+            elif command.opcode == 221:
+                self._set_runtime_value(
+                    command,
+                    index,
+                    state,
+                    string_result=bool(command.ints and command.ints[-1] == 1),
+                )
             elif command.opcode == 112:
                 self._condition(command, index, state)
                 branch = self._branches(index, end, state, exits)
@@ -1454,7 +1562,9 @@ class _BlockAnalyzer:
                     merged, index = branch
                     if merged is None:
                         return False
-                    state.numbers, state.strings = merged.numbers, merged.strings
+                    state.numbers = merged.numbers
+                    state.strings = merged.strings
+                    state.database_strings = merged.database_strings
                     continue
             elif command.opcode == 111:
                 branch = self._branches(index, end, state, exits)
@@ -1462,7 +1572,9 @@ class _BlockAnalyzer:
                     merged, index = branch
                     if merged is None:
                         return False
-                    state.numbers, state.strings = merged.numbers, merged.strings
+                    state.numbers = merged.numbers
+                    state.strings = merged.strings
+                    state.database_strings = merged.database_strings
                     continue
             elif command.opcode in {210, 300}:
                 self._call_event(command, index, state)
@@ -1520,7 +1632,9 @@ class _BlockAnalyzer:
                                     value.source_keys, value.cells, value.trace,
                                     "循环扩大后字符串仍未稳定", value.symbolic_all
                                 )
-                        state.numbers, state.strings = merged.numbers, merged.strings
+                        state.numbers = merged.numbers
+                        state.strings = merged.strings
+                        state.database_strings = merged.database_strings
                     index = closing + 1
                     continue
             elif command.opcode == 213 and exits is not None:
@@ -1530,19 +1644,30 @@ class _BlockAnalyzer:
                     self.summary_failed = f"未支持的标签跳转 {command.strings!r}"
                     self._record_unknown(command, index, "summary-goto")
                 return False
-            elif command.opcode in _NO_STRING_WRITE_OPCODES or (
-                command.opcode == 213 and command.strings == ("END",)
-            ):
-                self._taint_unknown(command, index, state, strings=False)
+            elif command.opcode == 213 and command.strings == ("END",):
+                pass
             elif command.opcode not in {0, 401, 420, 421, 498, 499}:
-                if any(command.strings) or any(value >= 1_000_000 for value in command.ints):
-                    self._record_unknown(command, index)
-                self._taint_unknown(command, index, state)
+                effect = command_effect(
+                    command.opcode, len(command.ints), len(command.strings)
+                )
+                if effect in {"no_write", "control_flow"}:
+                    pass
+                elif effect == "numeric_write":
+                    self._set_runtime_value(command, index, state, string_result=False)
+                elif effect == "event_call":
+                    # Reserved calls do not return into the current event frame.
+                    pass
+                else:
+                    if any(command.strings) or any(
+                        value >= 1_000_000 for value in command.ints
+                    ):
+                        self._record_unknown(command, index)
+                    self._taint_unknown(command, index, state)
             index += 1
         return True
 
     def run(self) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-        self._execute(0, len(self.block.commands), _AnalysisState({}, {}))
+        self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
         warnings = [
             {"opcode": opcode, "shape": shape, "count": count,
              "locations": self.unknown_locations[(opcode, shape)][:5]}
@@ -1699,12 +1824,26 @@ def analyze_auto_export(
         database_counts[name] = counts
 
     dependencies, blocking, warnings = _analyze_blocks(blocks, items, database_types)
+    verified_version = tuple(int(value) for value in VERIFIED_EDITOR_VERSION.split("."))
+    newer_editor = editor.version_tuple > verified_version
+    catalog_warnings = (
+        [
+            f"当前命令表仅验证至 Editor {VERIFIED_EDITOR_VERSION}；"
+            f"{editor.version} 的新参数形状仍按未知命令处理。"
+        ]
+        if newer_editor
+        else []
+    )
     return {
         "schema": AUTO_ANALYSIS_SCHEMA,
         "editor": {
             "path": str(editor.path),
             "version": editor.version,
             "sha256": editor.sha256,
+        },
+        "command_catalog": {
+            "verified_through": VERIFIED_EDITOR_VERSION,
+            "newer_editor": newer_editor,
         },
         "input_hash": input_hash,
         "output_hash": hash_directory(root),
@@ -1719,7 +1858,7 @@ def analyze_auto_export(
         "dependencies": dependencies,
         "blocking_issues": blocking,
         "unknown_commands": warnings,
-        "warnings": [
+        "warnings": catalog_warnings + [
             f"未解释的字符串命令 opcode={warning['opcode']} {warning['shape']} ×{warning['count']}"
             for warning in warnings
         ],

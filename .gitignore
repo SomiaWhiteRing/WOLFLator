@@ -8,4 +8,4 @@ vendor/*.exe
 vendor/.download/
 vendor/licenses/
 .coverage
-
+_qa/

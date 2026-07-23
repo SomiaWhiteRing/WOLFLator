@@ -830,9 +830,12 @@ class WorkbookAndFontTests(unittest.TestCase):
                         # emitted 0x900 and described replacement in pretty output.
                         "COMMAND_NUM=22",
                         "WoditorEvCOMMAND_START",
-                        '[122][3,1]<0>(1600005,0,0)("校准")',
+                        # Official 3.713 omits source_raw for literal assignment.
+                        '[122][2,1]<0>(1600005,0)("校准")',
                         '[122][3,0]<0>(1600006,1,1600005)()',
-                        '[112][2,1]<0>(1,1600006)("校准")',
+                        # Official 3.713 can encode condition count as 0x10 | count
+                        # while retaining four padded string slots.
+                        '[112][2,4]<0>(17,1600006)("校准","","","")',
                         '[250][5,4]<0>(7,-3,0,332288,1600096)("","任意类型","","任意字段甲")',
                         '[121][4,0]<0>(1600016,0,0,0)()',
                         '[179][1,0]<0>(2)()',
