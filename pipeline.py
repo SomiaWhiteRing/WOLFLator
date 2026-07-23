@@ -306,6 +306,7 @@ class Pipeline:
                 record.artifacts.get("official_warning_count", "0"),
                 record.artifacts.get("font_warning_count", "0"),
                 record.artifacts.get("editor_warning_count", "0"),
+                record.artifacts.get("import_protection_warning_count", "0"),
             )
         )
         self.state(PipelineStateEvent(stage, status, current, total, detail, warnings))
@@ -1096,6 +1097,12 @@ class Pipeline:
         protection_path = self.artifacts_dir / "import-protection.json"
         _atomic_json(protection_path, protection)
         summary = protection["summary"]
+        permissive_warnings = int(summary.get("logic_permissive_warnings", 0))
+        if permissive_warnings:
+            self.warning(
+                f"宽松逻辑策略已放行 {permissive_warnings} 组无法证明安全的 WOLF 条件依赖；"
+                "详情已写入导入保护报告。"
+            )
         self.log(
             f"导入保护：保留 {summary['protected']} 组原文，"
             f"提示 {summary['warnings']} 组可疑标识符，"

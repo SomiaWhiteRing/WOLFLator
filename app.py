@@ -1332,6 +1332,21 @@ class MainWindow(QMainWindow):
         copy_note.setObjectName("secondaryText")
         layout.addWidget(copy_note)
 
+        logic_policy_row = QHBoxLayout()
+        logic_policy_row.addWidget(QLabel("未知事件逻辑"))
+        self.logic_unknown_policy = QComboBox()
+        self.logic_unknown_policy.addItem("严格：阻止导入", "block")
+        self.logic_unknown_policy.addItem("宽松：警告后继续", "warn")
+        self.logic_unknown_policy.currentIndexChanged.connect(
+            self._save_import_protection
+        )
+        self.protect_logic_references.toggled.connect(
+            self.logic_unknown_policy.setEnabled
+        )
+        logic_policy_row.addWidget(self.logic_unknown_policy)
+        logic_policy_row.addStretch(1)
+        layout.addLayout(logic_policy_row)
+
         identifier_row = QHBoxLayout()
         identifier_row.addWidget(QLabel("可疑标识符"))
         self.suspicious_identifier_action = QComboBox()
@@ -1371,6 +1386,9 @@ class MainWindow(QMainWindow):
             protect_paths_and_commands=self.protect_paths_and_commands.isChecked(),
             protect_logic_references=self.protect_logic_references.isChecked(),
             allow_copy_condition_groups=self.allow_copy_condition_groups.isChecked(),
+            logic_unknown_policy=str(
+                self.logic_unknown_policy.currentData() or "block"
+            ),
             suspicious_identifiers=str(
                 self.suspicious_identifier_action.currentData() or "warn"
             ),
@@ -1435,12 +1453,17 @@ class MainWindow(QMainWindow):
                         row, column, QTableWidgetItem(str(value))
                     )
             summary = report["summary"]
+            logic_issue_label = (
+                "相关警告"
+                if manifest.import_protection.logic_unknown_policy == "warn"
+                else "阻断问题"
+            )
             suffix = "；表格仅显示前 500 项" if len(entries) > 500 else ""
             self.import_protection_summary.setText(
                 f"保留 {summary['protected']} 组，警告 {summary['warnings']} 组，"
                 f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
                 f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
-                f"阻断问题 {summary.get('logic_blocking_relevant', 0)} 组，"
+                f"{logic_issue_label} {summary.get('logic_blocking_relevant', 0)} 组，"
                 f"未知语义 {summary.get('unknown_logic_semantics', 0)} 类，"
                 f"整体翻译 {summary['atomic_groups']} 组{suffix}"
             )
@@ -2038,6 +2061,15 @@ class MainWindow(QMainWindow):
         )
         self.suspicious_identifier_action.setCurrentIndex(max(identifier_index, 0))
         self.suspicious_identifier_action.blockSignals(False)
+        self.logic_unknown_policy.blockSignals(True)
+        logic_policy_index = self.logic_unknown_policy.findData(
+            manifest.import_protection.logic_unknown_policy
+        )
+        self.logic_unknown_policy.setCurrentIndex(max(logic_policy_index, 0))
+        self.logic_unknown_policy.blockSignals(False)
+        self.logic_unknown_policy.setEnabled(
+            self.protect_logic_references.isChecked()
+        )
         self.import_protection_table.setRowCount(0)
         self.import_protection_summary.setText("点击预览分析当前译文")
         self._load_glossary()
@@ -2240,6 +2272,7 @@ class MainWindow(QMainWindow):
             self.protect_paths_and_commands,
             self.protect_logic_references,
             self.allow_copy_condition_groups,
+            self.logic_unknown_policy,
             self.suspicious_identifier_action,
             self.preview_import_protection_button,
         ):
@@ -2254,6 +2287,9 @@ class MainWindow(QMainWindow):
             self._set_font_controls_enabled(False)
         else:
             self._update_external_filter_controls()
+            self.logic_unknown_policy.setEnabled(
+                self.protect_logic_references.isChecked()
+            )
         self.stop_button.setEnabled(locked)
 
     def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:

@@ -225,6 +225,8 @@ class CliTests(unittest.TestCase):
                             "--target",
                             "import",
                             "--no-protect-paths-and-commands",
+                            "--logic-unknown-policy",
+                            "warn",
                             "--suspicious-identifiers",
                             "protect",
                         ]
@@ -232,6 +234,7 @@ class CliTests(unittest.TestCase):
                 )
             loaded = cli.load_manifest(manifest)
             self.assertFalse(loaded.import_protection.protect_paths_and_commands)
+            self.assertEqual("warn", loaded.import_protection.logic_unknown_policy)
             self.assertEqual("protect", loaded.import_protection.suspicious_identifiers)
 
     def test_ctrl_c_cancels_pipeline_and_returns_130(self):

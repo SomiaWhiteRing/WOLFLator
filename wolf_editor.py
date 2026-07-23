@@ -33,6 +33,9 @@ AUTO_ANALYSIS_SCHEMA = 2
 _VALUE_LIMIT = 256
 _LOOP_LIMIT = 32
 _CALL_DEPTH_LIMIT = 8
+# Editor 3.713 calibration and the official command manual confirm these
+# commands never assign string variables. Numeric side effects remain tainted.
+_NO_STRING_WRITE_OPCODES = frozenset({101, 103, 106, 140, 150, 212})
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
@@ -839,6 +842,7 @@ class _BlockAnalyzer:
         self.blocking: list[dict[str, object]] = []
         self.unknown = Counter()
         self.unknown_locations: dict[tuple[int, str], list[str]] = {}
+        self._unknown_seen: set[tuple[int, str, str]] = set()
         self.summary_failed = ""
 
     def _location(self, index: int) -> str:
@@ -848,9 +852,15 @@ class _BlockAnalyzer:
         )
 
     def _record_unknown(self, command: _Command, index: int, shape: str | None = None) -> None:
-        key = (command.opcode, shape or f"ints={len(command.ints)},strings={len(command.strings)}")
+        description = shape or f"ints={len(command.ints)},strings={len(command.strings)}"
+        location = self._location(index)
+        seen_key = (command.opcode, description, location)
+        if seen_key in self._unknown_seen:
+            return
+        self._unknown_seen.add(seen_key)
+        key = (command.opcode, description)
         self.unknown[key] += 1
-        self.unknown_locations.setdefault(key, []).append(self._location(index))
+        self.unknown_locations.setdefault(key, []).append(location)
 
     def _type_ids(self, database: str, command: _Command, flags: int, state: _AnalysisState) -> set[int] | None:
         types = self.databases.get(database, {})
@@ -1211,17 +1221,25 @@ class _BlockAnalyzer:
             branch_states.append(state.copy())
         return (_merge_states(branch_states) if branch_states else None), closing + 1
 
-    def _taint_unknown(self, command: _Command, index: int, state: _AnalysisState) -> None:
+    def _taint_unknown(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        *,
+        strings: bool = True,
+    ) -> None:
         affected = {value & 0x00FFFFFF for value in command.ints if value >= 1_000_000}
-        for variable in affected & set(state.strings):
-            current = state.strings[variable]
-            state.strings[variable] = _StringValue(
-                current.source_keys,
-                current.cells,
-                current.trace + (self._location(index),),
-                f"来源经过未支持命令 opcode={command.opcode}",
-                current.symbolic_all,
-            )
+        if strings:
+            for variable in affected & set(state.strings):
+                current = state.strings[variable]
+                state.strings[variable] = _StringValue(
+                    current.source_keys,
+                    current.cells,
+                    current.trace + (self._location(index),),
+                    f"来源经过未支持命令 opcode={command.opcode}",
+                    current.symbolic_all,
+                )
         for variable in affected & set(state.numbers):
             current = state.numbers[variable]
             state.numbers[variable] = _NumberValue(
@@ -1512,6 +1530,10 @@ class _BlockAnalyzer:
                     self.summary_failed = f"未支持的标签跳转 {command.strings!r}"
                     self._record_unknown(command, index, "summary-goto")
                 return False
+            elif command.opcode in _NO_STRING_WRITE_OPCODES or (
+                command.opcode == 213 and command.strings == ("END",)
+            ):
+                self._taint_unknown(command, index, state, strings=False)
             elif command.opcode not in {0, 401, 420, 421, 498, 499}:
                 if any(command.strings) or any(value >= 1_000_000 for value in command.ints):
                     self._record_unknown(command, index)

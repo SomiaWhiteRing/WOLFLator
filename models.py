@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MANIFEST_SCHEMA = 5
+MANIFEST_SCHEMA = 6
 DEFAULT_EXTERNAL_FILE_LIMIT_KB = 128
 MAX_EXTERNAL_FILE_LIMIT_KB = 1_048_576
 SUSPICIOUS_IDENTIFIER_ACTIONS = {"ignore", "warn", "protect"}
+LOGIC_UNKNOWN_POLICIES = {"block", "warn"}
 
 
 def utc_now() -> str:
@@ -74,6 +75,7 @@ class ImportProtectionRules:
     protect_paths_and_commands: bool = True
     allow_copy_condition_groups: bool = True
     protect_logic_references: bool = True
+    logic_unknown_policy: str = "block"
     suspicious_identifiers: str = "warn"
 
 
@@ -246,7 +248,7 @@ class ProjectManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
         schema = data.get("schema")
-        if type(schema) is not int or schema not in (1, 2, 3, 4, MANIFEST_SCHEMA):
+        if type(schema) is not int or schema not in (1, 2, 3, 4, 5, MANIFEST_SCHEMA):
             raise ValueError(f"不支持的项目清单 schema: {schema}")
         fields = {
             "project_id",
@@ -320,19 +322,24 @@ class ProjectManifest:
             # Editor-backed logic rule and is discarded on the next save.
             protection_data.pop("protect_standalone_conditions", None)
             protection_data.setdefault("protect_logic_references", True)
+            if schema < 6:
+                protection_data.setdefault("logic_unknown_policy", "block")
         protection_fields = {
             "protect_external_references",
             "protect_paths_and_commands",
             "allow_copy_condition_groups",
             "protect_logic_references",
+            "logic_unknown_policy",
             "suspicious_identifiers",
         }
         _require_fields(protection_data, protection_fields, "导入保护规则")
         if any(
             type(protection_data[name]) is not bool
-            for name in protection_fields - {"suspicious_identifiers"}
+            for name in protection_fields - {"logic_unknown_policy", "suspicious_identifiers"}
         ):
             raise ValueError("导入保护规则开关必须是布尔值。")
+        if protection_data["logic_unknown_policy"] not in LOGIC_UNKNOWN_POLICIES:
+            raise ValueError("未知事件逻辑策略必须是 block 或 warn。")
         if protection_data["suspicious_identifiers"] not in SUSPICIOUS_IDENTIFIER_ACTIONS:
             raise ValueError("可疑标识符策略必须是 ignore、warn 或 protect。")
         item = cls(

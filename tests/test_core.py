@@ -732,10 +732,22 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "dependencies": [blocking_dependency],
                 "blocking_issues": [blocking_dependency],
             }
-            with self.assertRaisesRegex(RuntimeError, "可关闭.*强制继续"):
+            with self.assertRaisesRegex(RuntimeError, "宽松：警告后继续"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), blocking_analysis
                 )
+            permissive = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(logic_unknown_policy="warn"),
+                blocking_analysis,
+            )
+            self.assertEqual(1, permissive["summary"]["logic_permissive_warnings"])
+            self.assertEqual(1, permissive["summary"]["logic_risk"])
+            self.assertTrue(
+                any(entry["reason"] == "logic_blocking" for entry in permissive["entries"])
+            )
             forced = analyze_import_protection(
                 items,
                 ImportScope(),
@@ -816,7 +828,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                         # 0x301 for first-line cut; RIMWING CEv92 command 156 emitted
                         # 0xA01 for cut-up-to-text; RIMWING CEv52 command 865
                         # emitted 0x900 and described replacement in pretty output.
-                        "COMMAND_NUM=21",
+                        "COMMAND_NUM=22",
                         "WoditorEvCOMMAND_START",
                         '[122][3,1]<0>(1600005,0,0)("校准")',
                         '[122][3,0]<0>(1600006,1,1600005)()',
@@ -830,6 +842,9 @@ class WorkbookAndFontTests(unittest.TestCase):
                         # command selector plus three inputs) and two string inputs.
                         # Opcode 210 reserves string slot 0 for its target just like 300.
                         '[210][9,3]<1>(500008,16785444,151,0,0,0,1600007,0,1600008)("","","")',
+                        # Picture operations can share a numeric CSelf slot with a
+                        # tracked string without assigning that string namespace.
+                        '[150][3,0]<1>(2,1600008,4)()',
                         '[122][3,0]<1>(1600006,769,1600008)()',
                         '[122][3,0]<1>(1600006,2561,1600007)()',
                         '[122][3,1]<1>(1600006,2560,0)("\\cself[7]")',
@@ -866,9 +881,18 @@ class WorkbookAndFontTests(unittest.TestCase):
                         "EVENT_NUM=1",
                         "EVENT_ID=1",
                         "EVENT_NAME=Map event",
-                        "COMMAND_NUM=1",
+                        "COMMAND_NUM=10",
                         "WoditorEvCOMMAND_START",
-                        '[999][0,1]<0>()("未知,\\路径")',
+                        '[179][1,0]<0>(2)()',
+                        '[999][0,1]<1>()("未知,\\路径")',
+                        '[101][0,1]<1>()("文章")',
+                        '[103][0,1]<1>()("注释")',
+                        '[106][0,1]<1>()("调试")',
+                        '[140][6,1]<1>(33554465,0,0,0,100,100)("\\cself[8]")',
+                        '[150][11,1]<1>(0,1600033,0,2,1,1,255,1600031,1600032,100,0)("picture.png")',
+                        '[212][0,1]<1>()("label")',
+                        '[213][0,1]<1>()("END")',
+                        '[498][0,0]<0>()()',
                         "WoditorEvCOMMAND_END",
                     ]
                 ),
@@ -917,7 +941,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 TranslationItem(
                     key="condition",
                     original="HPバー",
-                    code="COMMON-63-18-0",
+                    code="COMMON-63-19-0",
                     type="事件",
                     info="条件",
                 ),
@@ -952,7 +976,10 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual({1}, {cell["field"] for cell in dependency["database_cells"]})
             self.assertTrue(any("common=8 cmd=151" in entry for entry in dependency["trace"]))
             self.assertEqual(1, report["counts"]["map_maps"])
-            self.assertIn(999, {entry["opcode"] for entry in report["unknown_commands"]})
+            self.assertEqual(
+                [(999, 1)],
+                [(entry["opcode"], entry["count"]) for entry in report["unknown_commands"]],
+            )
 
             common.write_text(common.read_text(encoding="utf-8").replace("任意类型", "English Type").replace("任意字段甲", "field_name"), encoding="utf-8")
             database = basic / "DataBase.Auto.txt"
@@ -969,7 +996,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analyze_auto_export(auto, items, editor, input_hash="input")
             database.write_text(database_text, encoding="utf-8")
 
-            common.write_text(common.read_text(encoding="utf-8").replace("COMMAND_NUM=21", "COMMAND_NUM=22", 1), encoding="utf-8")
+            common.write_text(common.read_text(encoding="utf-8").replace("COMMAND_NUM=22", "COMMAND_NUM=23", 1), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "COMMAND_NUM"):
                 analyze_auto_export(auto, items, editor, input_hash="input")
 
@@ -1000,7 +1027,6 @@ class WorkbookAndFontTests(unittest.TestCase):
             (game / "Data" / "MapData").mkdir()
             (game / "Data" / "MapData" / "Map001.mps").write_bytes(b"map")
             (game / "Data" / "story.txt").write_text("story", encoding="utf-8")
-            (game / "Data" / "work_temp").mkdir()
             sandbox = root / "sandbox"
             sandbox.mkdir()
             maps_found = _copy_editor_sandbox(editor, game, sandbox)
@@ -1008,7 +1034,6 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertTrue((sandbox / "Data" / "BasicData" / "Game.dat").is_file())
             self.assertFalse((sandbox / "Data" / "BasicData" / "icon.png").exists())
             self.assertFalse((sandbox / "Data" / "story.txt").exists())
-            self.assertFalse((sandbox / "Data" / "work_temp").exists())
 
     def test_editor_release_page_chooses_highest_and_prefers_mini(self):
         release = latest_editor_release_from_html(

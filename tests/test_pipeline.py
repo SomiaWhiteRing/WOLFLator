@@ -466,8 +466,16 @@ class PipelineTests(unittest.TestCase):
             legacy.pop("import_protection")
             Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
             migrated = load_manifest(manifest_path)
-            self.assertEqual(5, migrated.schema)
+            self.assertEqual(6, migrated.schema)
             self.assertFalse(migrated.export_scope.external)
+
+            schema_five = migrated.to_dict()
+            schema_five["schema"] = 5
+            schema_five["import_protection"].pop("logic_unknown_policy", None)
+            manifest_path.write_text(json.dumps(schema_five), encoding="utf-8")
+            self.assertEqual(
+                "block", load_manifest(manifest_path).import_protection.logic_unknown_policy
+            )
             self.assertTrue(migrated.export_scope.optional_name)
             self.assertTrue(migrated.exclude_large_external_files)
             self.assertEqual(128, migrated.external_file_limit_kb)

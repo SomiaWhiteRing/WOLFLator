@@ -345,6 +345,7 @@ def _scope(args: argparse.Namespace) -> int:
         "protect_paths_and_commands",
         "allow_copy_condition_groups",
         "protect_logic_references",
+        "logic_unknown_policy",
         "suspicious_identifiers",
     )
     protection_requested = any(getattr(args, name) is not None for name in protection_names)
@@ -488,6 +489,11 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=help_text,
         )
+    scope.add_argument(
+        "--logic-unknown-policy",
+        choices=("block", "warn"),
+        help="无法证明相关事件逻辑安全时阻止导入或仅警告",
+    )
     scope.add_argument(
         "--suspicious-identifiers",
         choices=("ignore", "warn", "protect"),

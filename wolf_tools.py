@@ -1500,7 +1500,7 @@ def analyze_import_protection(
     rules: ImportProtectionRules,
     logic_analysis: dict[str, object] | None = None,
     *,
-    block_on_logic_issue: bool = True,
+    block_on_logic_issue: bool | None = None,
 ) -> dict[str, object]:
     requirements = selected_translation_requirements(
         items,
@@ -1699,13 +1699,18 @@ def analyze_import_protection(
                 ):
                     add(item, "keep_original", "logic_value_change", evidence, details)
         relevant_logic_blocking = relevant_blocking
-        if relevant_blocking and block_on_logic_issue:
+        should_block = (
+            rules.logic_unknown_policy == "block"
+            if block_on_logic_issue is None
+            else block_on_logic_issue
+        )
+        if relevant_blocking and should_block:
             first = relevant_blocking[0]
             raise RuntimeError(
                 "WOLF 事件逻辑依赖在分析途中失去可证明来源，已阻止导入："
                 f"{first.get('auto_file', '')} event={first.get('event_id', '')} "
                 f"page={first.get('page', '')} command={first.get('command', '')}，"
-                f"{first.get('reason', '')}。可关闭“WOLF 事件逻辑保护”强制继续。"
+                f"{first.get('reason', '')}。可改用“宽松：警告后继续”或关闭逻辑保护。"
             )
 
     if rules.suspicious_identifiers != "ignore":
@@ -1737,7 +1742,19 @@ def analyze_import_protection(
             ),
             "logic_blocking_relevant": len(relevant_logic_blocking),
             "logic_protection_enabled": rules.protect_logic_references,
-            "logic_risk": len(logic_blocking) if not rules.protect_logic_references else 0,
+            "logic_unknown_policy": rules.logic_unknown_policy,
+            "logic_permissive_warnings": (
+                len(relevant_logic_blocking)
+                if rules.protect_logic_references and rules.logic_unknown_policy == "warn"
+                else 0
+            ),
+            "logic_risk": (
+                len(logic_blocking)
+                if not rules.protect_logic_references
+                else len(relevant_logic_blocking)
+                if rules.logic_unknown_policy == "warn"
+                else 0
+            ),
             "unknown_logic_semantics": len(
                 logic_analysis.get("unknown_commands", [])
                 if isinstance(logic_analysis, dict)
