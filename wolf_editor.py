@@ -22,8 +22,9 @@ from typing import Callable, Iterable, Iterator
 from models import TranslationItem
 from safe_io import atomic_write_json, package_lock, replace_with_retry
 from wolf_command_catalog import (
+    CATALOG_SCHEMA,
     VERIFIED_EDITOR_VERSION,
-    command_effect,
+    command_semantics,
 )
 from wolf_tools import hash_directory, run_process, sha256_file
 
@@ -33,10 +34,10 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 2
+AUTO_ANALYSIS_SCHEMA = 3
 _VALUE_LIMIT = 256
-_LOOP_LIMIT = 32
-_CALL_DEPTH_LIMIT = 8
+_LOOP_LIMIT = 64
+_CALL_DEPTH_LIMIT = 64
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
@@ -84,6 +85,11 @@ class _Command:
     raw: str
 
 
+# Public IR names are deliberately small value objects. The parser still uses the
+# private aliases below so this upgrade does not duplicate the proven parser.
+AutoCommand = _Command
+
+
 @dataclass(frozen=True)
 class _CommandBlock:
     source: str
@@ -95,6 +101,39 @@ class _CommandBlock:
     value_inputs: int = 0
     string_inputs: int = 0
     return_target: int = -1
+
+
+AutoEvent = _CommandBlock
+
+
+@dataclass(frozen=True)
+class AutoLabel:
+    name: str
+    target_command: int
+    scope: str
+
+
+@dataclass(frozen=True)
+class AutoDatabaseCoordinate:
+    database: str
+    type_id: int
+    data_id: int
+    field_id: int
+
+
+@dataclass(frozen=True)
+class AutoEdge:
+    source: str
+    target: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class AutoProject:
+    editor_version: str
+    events: tuple[AutoEvent, ...]
+    databases: tuple[str, ...]
+    edges: tuple[AutoEdge, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,10 +161,12 @@ class _StringValue:
     trace: tuple[str, ...] = ()
     unknown: str = ""
     symbolic_all: bool = False
+    scopes: frozenset[str] = frozenset()
+    literals: frozenset[str] | None = frozenset()
 
     @property
     def tracked(self) -> bool:
-        return bool(self.source_keys or self.cells)
+        return bool(self.source_keys or self.cells or self.symbolic_all or self.scopes)
 
 
 @dataclass
@@ -133,10 +174,16 @@ class _AnalysisState:
     numbers: dict[int, _NumberValue]
     strings: dict[int, _StringValue]
     database_strings: dict[tuple[str, int, int, int], _StringValue]
+    unknown_scopes: frozenset[str] = frozenset()
+    unknown_reasons: frozenset[str] = frozenset()
 
     def copy(self) -> "_AnalysisState":
         return _AnalysisState(
-            dict(self.numbers), dict(self.strings), dict(self.database_strings)
+            dict(self.numbers),
+            dict(self.strings),
+            dict(self.database_strings),
+            self.unknown_scopes,
+            self.unknown_reasons,
         )
 
 
@@ -783,19 +830,60 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             tuple(dict.fromkeys(value.trace + ("控制流部分分支赋值",))),
             value.unknown,
             value.symbolic_all,
+            value.scopes,
+            value.literals,
         )
     keys = set(left.source_keys) | set(right.source_keys)
     cells = set(left.cells) | set(right.cells)
     symbolic_all = left.symbolic_all or right.symbolic_all
+    scopes = left.scopes | right.scopes
+    literals = (
+        None
+        if left.literals is None or right.literals is None
+        else frozenset(set(left.literals) | set(right.literals))
+    )
+    if literals is not None and len(literals) > _VALUE_LIMIT:
+        literals = None
     if len(keys) + len(cells) > _VALUE_LIMIT and not symbolic_all:
-        return _StringValue(trace=(left.trace + right.trace)[-_VALUE_LIMIT:], unknown="字符串来源集合超过 256 项")
+        return _StringValue(
+            trace=(left.trace + right.trace)[-_VALUE_LIMIT:],
+            unknown="字符串来源集合超过 256 项",
+            symbolic_all=True,
+            scopes=scopes or frozenset({"project"}),
+            literals=None,
+        )
     return _StringValue(
         frozenset(keys),
         frozenset(cells),
         tuple(dict.fromkeys(left.trace + right.trace))[-_VALUE_LIMIT:],
         (left.unknown if left.tracked else "") or (right.unknown if right.tracked else ""),
         symbolic_all,
+        scopes,
+        literals,
     )
+
+
+def _with_literals(
+    value: _StringValue, literals: frozenset[str] | None
+) -> _StringValue:
+    return _StringValue(
+        value.source_keys,
+        value.cells,
+        value.trace,
+        value.unknown,
+        value.symbolic_all,
+        value.scopes,
+        literals,
+    )
+
+
+def _concat_literals(
+    left: frozenset[str] | None, right: frozenset[str] | None
+) -> frozenset[str] | None:
+    if left is None or right is None:
+        return None
+    output = {a + b for a in left for b in right}
+    return frozenset(output) if len(output) <= _VALUE_LIMIT else None
 
 
 def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
@@ -822,6 +910,8 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
                 )
             ) is not None
         }
+        result.unknown_scopes = result.unknown_scopes | state.unknown_scopes
+        result.unknown_reasons = result.unknown_reasons | state.unknown_reasons
     return result
 
 
@@ -842,6 +932,7 @@ class _BlockAnalyzer:
         event_items: dict[str, tuple[TranslationItem, ...]],
         common_by_id: dict[int, _CommandBlock] | None = None,
         common_by_name: dict[str, tuple[_CommandBlock, ...]] | None = None,
+        event_scopes: dict[int, frozenset[str]] | None = None,
         call_stack: tuple[tuple[int, int], ...] = (),
     ) -> None:
         self.block = block
@@ -850,6 +941,7 @@ class _BlockAnalyzer:
         self.event_items = event_items
         self.common_by_id = common_by_id or {}
         self.common_by_name = common_by_name or {}
+        self.event_scopes = event_scopes or {}
         self.call_stack = call_stack
         self.dependencies: list[dict[str, object]] = []
         self.blocking: list[dict[str, object]] = []
@@ -857,6 +949,107 @@ class _BlockAnalyzer:
         self.unknown_locations: dict[tuple[int, str], list[str]] = {}
         self._unknown_seen: set[tuple[int, str, str]] = set()
         self.summary_failed = ""
+        labels: dict[str, list[int]] = {}
+        for position, command in enumerate(block.commands):
+            if command.opcode == 212 and len(command.strings) == 1:
+                labels.setdefault(command.strings[0], []).append(position)
+        self.labels = {name: tuple(positions) for name, positions in labels.items()}
+
+    def _resource_reference(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        semantics: dict[str, object] | None,
+    ) -> None:
+        if not semantics:
+            return
+        roles = list(semantics.get("string_roles", []))
+        protected_roles = {
+            "resource_path",
+            "file_path",
+            "common_event_name",
+            "call_argument",
+            "label",
+            "label_target",
+        }
+        for string_index, role in enumerate(roles):
+            if role not in protected_roles or string_index >= len(command.strings):
+                continue
+            value = self._literal_string(command, index, string_index, state)
+            if not value.tracked:
+                continue
+            code = _event_code(self.block, index + 1, string_index).upper()
+            dependency = {
+                    "kind": "resource",
+                    "auto_file": self.block.source,
+                    "event_type": self.block.event_type,
+                    "event_id": self.block.event_id,
+                    "event_name": self.block.event_name,
+                    "page": self.block.page,
+                    "command": index + 1,
+                    "string_index": string_index,
+                    "condition_code": code,
+                    "condition_keys": [],
+                    "operator": "resource_reference",
+                    "literal": command.strings[string_index],
+                    "right_is_variable": False,
+                    "source_keys": sorted(value.source_keys),
+                    "right_source_keys": [],
+                    "database_cells": [],
+                    "right_database_cells": [],
+                    "trace": list(value.trace),
+                    "right_trace": [],
+                    "unresolved_scopes": sorted(value.scopes),
+                    "status": "blocking" if value.unknown or value.symbolic_all else "resolved",
+                    "reason": value.unknown,
+                    "resource_role": role,
+            }
+            self.dependencies.append(dependency)
+            if dependency["status"] == "blocking":
+                self.blocking.append(dependency)
+
+    def _value_boundary_reference(
+        self,
+        command: _Command,
+        index: int,
+        value: _StringValue,
+        role: str,
+        scopes: frozenset[str] = frozenset(),
+    ) -> None:
+        if not value.tracked:
+            return
+        dependency = {
+            "kind": "resource",
+            "auto_file": self.block.source,
+            "event_type": self.block.event_type,
+            "event_id": self.block.event_id,
+            "event_name": self.block.event_name,
+            "page": self.block.page,
+            "command": index + 1,
+            "string_index": -1,
+            "condition_code": "",
+            "condition_keys": [],
+            "operator": "value_boundary",
+            "literal": "",
+            "right_is_variable": False,
+            "source_keys": sorted(value.source_keys),
+            "right_source_keys": [],
+            "database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(value.cells)
+            ],
+            "right_database_cells": [],
+            "trace": list(value.trace),
+            "right_trace": [],
+            "unresolved_scopes": sorted(value.scopes | scopes),
+            "status": "blocking" if value.unknown or value.symbolic_all else "resolved",
+            "reason": value.unknown,
+            "resource_role": role,
+        }
+        self.dependencies.append(dependency)
+        if dependency["status"] == "blocking":
+            self.blocking.append(dependency)
 
     def _location(self, index: int) -> str:
         return (
@@ -874,6 +1067,52 @@ class _BlockAnalyzer:
         key = (command.opcode, description)
         self.unknown[key] += 1
         self.unknown_locations.setdefault(key, []).append(location)
+
+    def _blocking_scope_dependency(
+        self,
+        command: _Command,
+        index: int,
+        kind: str,
+        reason: str,
+        scopes: frozenset[str],
+        values: Iterable[_StringValue] = (),
+    ) -> None:
+        values = tuple(values)
+        source_keys = sorted({key for value in values for key in value.source_keys})
+        cells = sorted({cell for value in values for cell in value.cells})
+        scopes = scopes | frozenset(
+            scope for value in values for scope in value.scopes
+        )
+        dependency = {
+            "kind": kind,
+            "auto_file": self.block.source,
+            "event_type": self.block.event_type,
+            "event_id": self.block.event_id,
+            "event_name": self.block.event_name,
+            "page": self.block.page,
+            "command": index + 1,
+            "string_index": -1,
+            "condition_code": "",
+            "condition_keys": [],
+            "operator": "opaque_effect" if kind == "opaque" else "event_call",
+            "literal": command.strings[0] if command.strings else "",
+            "right_is_variable": False,
+            "source_keys": source_keys,
+            "right_source_keys": [],
+            "database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in cells
+            ],
+            "right_database_cells": [],
+            "trace": [self._location(index)],
+            "right_trace": [],
+            "unresolved_scopes": sorted(scopes),
+            "unresolved_reasons": [reason],
+            "status": "blocking",
+            "reason": reason,
+        }
+        self.dependencies.append(dependency)
+        self.blocking.append(dependency)
 
     def _type_ids(self, database: str, command: _Command, flags: int, state: _AnalysisState) -> set[int] | None:
         types = self.databases.get(database, {})
@@ -912,7 +1151,13 @@ class _BlockAnalyzer:
         destination = command.ints[4] & 0x00FFFFFF
         type_ids = self._type_ids(database, command, byte2, state)
         if not type_ids:
-            state.strings[destination] = _StringValue(trace=(self._location(index),), unknown="数据库类型无法解析")
+            state.strings[destination] = _StringValue(
+                trace=(self._location(index),),
+                unknown="数据库类型无法解析",
+                symbolic_all=True,
+                scopes=frozenset({f"database:{database}:*:*:*"}),
+                literals=None,
+            )
             return
 
         data_raw, field_raw = command.ints[1], command.ints[2]
@@ -961,12 +1206,19 @@ class _BlockAnalyzer:
             field_ids = selected or set()
         if not field_ids:
             state.strings[destination] = _StringValue(
-                trace=(self._location(index),), unknown="数据库字段选择器无法解析"
+                trace=(self._location(index),),
+                unknown="数据库字段选择器无法解析",
+                symbolic_all=True,
+                scopes=frozenset(
+                    f"database:{database}:{type_id}:*:*" for type_id in type_ids
+                ),
+                literals=None,
             )
             return
 
         cells: set[tuple[str, int, int, int]] = set()
         keys: set[str] = set()
+        string_values: set[str] = set()
         numeric_values: set[int] = set()
         string_field = False
         for type_id in type_ids:
@@ -987,9 +1239,12 @@ class _BlockAnalyzer:
                         if runtime_value is not None:
                             keys.update(runtime_value.source_keys)
                             cells.update(runtime_value.cells)
+                            if runtime_value.literals is not None:
+                                string_values.update(runtime_value.literals)
                         elif coordinate_keys:
                             cells.add(coordinate)
                             keys.update(coordinate_keys)
+                            string_values.add(db_type.rows[data_id][field_id])
                     else:
                         try:
                             numeric_values.add(int(db_type.rows[data_id][field_id]))
@@ -1000,9 +1255,32 @@ class _BlockAnalyzer:
             f"data={'all' if not data_ids else sorted(data_ids)[:8]} fields={sorted(field_ids)}",
         )
         if string_field:
-            state.strings[destination] = _StringValue(
-                frozenset(keys), frozenset(cells), trace, symbolic_all=data_all,
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for type_id in type_ids
+                for field_id in field_ids
             )
+            if len(keys) + len(cells) > _VALUE_LIMIT:
+                state.strings[destination] = _StringValue(
+                    trace=trace,
+                    unknown="数据库字符串来源集合超过 256 项",
+                    symbolic_all=True,
+                    scopes=scopes,
+                    literals=None,
+                )
+            else:
+                state.strings[destination] = _StringValue(
+                    frozenset(keys),
+                    frozenset(cells),
+                    trace,
+                    symbolic_all=data_all,
+                    scopes=scopes if data_all else frozenset(),
+                    literals=(
+                        frozenset(string_values)
+                        if len(string_values) <= _VALUE_LIMIT
+                        else None
+                    ),
+                )
         elif numeric_values:
             values = _limited(numeric_values)
             state.numbers[destination] = _NumberValue(
@@ -1051,6 +1329,16 @@ class _BlockAnalyzer:
         value = self._literal_string(command, index, 0, state)
         for coordinate in coordinates:
             state.database_strings[coordinate] = value
+        self._value_boundary_reference(
+            command,
+            index,
+            value,
+            "database_string_write",
+            frozenset(
+                f"database:{item[0]}:{item[1]}:{item[2]}:{item[3]}"
+                for item in coordinates
+            ),
+        )
 
     def _set_runtime_value(
         self,
@@ -1068,6 +1356,7 @@ class _BlockAnalyzer:
             state.strings[destination] = _StringValue(
                 trace=(self._location(index),),
                 unknown=f"字符串由运行时命令 opcode={command.opcode} 取得",
+                literals=None,
             )
         else:
             state.numbers[destination] = _NumberValue(
@@ -1113,14 +1402,35 @@ class _BlockAnalyzer:
             )
             if item.original == literal
         )
+        if self.block.event_type == "common":
+            source_scope = f"common:{self.block.event_id}"
+        else:
+            match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", self.block.source, re.IGNORECASE)
+            map_id = int(match.group(1)) if match else 0
+            source_scope = f"map:{map_id}:{self.block.event_id}:{self.block.page}"
         value = _StringValue(
             keys,
             trace=(f"{self._location(index)} opcode={command.opcode} literal",),
+            scopes=frozenset({source_scope}) if keys else frozenset(),
+            literals=frozenset({literal}),
         )
+        concrete: frozenset[str] | None = frozenset({literal})
         for reference in _CSELF_REFERENCE_RE.findall(literal):
             referenced = state.strings.get(1_600_000 + int(reference))
             if referenced is not None:
                 value = _merge_strings(value, referenced) or value
+                if concrete is not None and referenced.literals is not None:
+                    token = f"\\cself[{reference}]"
+                    concrete = frozenset(
+                        text.replace(token, replacement)
+                        for text in concrete
+                        for replacement in referenced.literals
+                    )
+                    if len(concrete) > _VALUE_LIMIT:
+                        concrete = None
+                else:
+                    concrete = None
+        value = _with_literals(value, concrete)
         return value
 
     def _set_string(self, command: _Command, index: int, state: _AnalysisState) -> None:
@@ -1139,7 +1449,10 @@ class _BlockAnalyzer:
         elif source_kind == 1:
             value = state.strings.get(
                 source_raw & 0x00FFFFFF,
-                _StringValue(unknown=f"字符串变量 {source_raw & 0x00FFFFFF} 来源未知"),
+                _StringValue(
+                    unknown=f"字符串变量 {source_raw & 0x00FFFFFF} 来源未知",
+                    literals=None,
+                ),
             )
         else:
             current = state.strings.get(destination)
@@ -1149,12 +1462,21 @@ class _BlockAnalyzer:
                 current.trace if current else (),
                 f"未支持的 122 来源模式 {source_kind}",
                 current.symbolic_all if current else False,
+                current.scopes if current else frozenset(),
+                current.literals if current else None,
             )
             return
         if assignment == 0:
             state.strings[destination] = value
         elif assignment == 1:
-            state.strings[destination] = _merge_strings(state.strings.get(destination), value) or value
+            current = state.strings.get(destination)
+            merged = _merge_strings(current, value) or value
+            state.strings[destination] = _with_literals(
+                merged,
+                _concat_literals(
+                    current.literals if current else frozenset({""}), value.literals
+                ),
+            )
         elif assignment == 3 and source_kind == 1:
             # ponytail: Auto protection tracks provenance, not WOLF's concrete string values.
             source = source_raw & 0x00FFFFFF
@@ -1164,6 +1486,8 @@ class _BlockAnalyzer:
                 tuple(dict.fromkeys(value.trace + (f"{self._location(index)} opcode=122 op=3",))),
                 value.unknown,
                 value.symbolic_all,
+                value.scopes,
+                value.literals,
             )
             state.strings[destination] = traced
             state.strings[source] = traced
@@ -1177,6 +1501,8 @@ class _BlockAnalyzer:
                 tuple(dict.fromkeys(merged.trace + (f"{self._location(index)} opcode=122 op=10",))),
                 value.unknown,
                 merged.symbolic_all,
+                merged.scopes,
+                merged.literals,
             )
         elif assignment == 9 and source_kind == 0:
             current = state.strings.get(destination)
@@ -1191,12 +1517,34 @@ class _BlockAnalyzer:
             replacement = _StringValue(
                 frozenset(literal_keys),
                 trace=(f"{self._location(index)} opcode=122 op=9",),
+                literals=frozenset(command.strings),
             )
             state.strings[destination] = _merge_strings(current, replacement) or replacement
         else:
             state.strings[destination] = _StringValue(
                 value.source_keys, value.cells, value.trace,
-                f"未支持的 122 赋值运算 {assignment}", value.symbolic_all
+                f"未支持的 122 赋值运算 {assignment}", value.symbolic_all,
+                value.scopes,
+                None,
+            )
+        result = state.strings.get(destination)
+        if result is None:
+            return
+        writes_global = not 1_600_000 <= destination < 1_600_100
+        if assignment == 3 and source_kind == 1:
+            source = source_raw & 0x00FFFFFF
+            writes_global = writes_global or not 1_600_000 <= source < 1_600_100
+        if writes_global:
+            self._value_boundary_reference(
+                command, index, result, "global_string_write"
+            )
+        if (
+            self.block.event_type == "common"
+            and self.block.return_target >= 5
+            and destination == 1_600_000 + self.block.return_target
+        ):
+            self._value_boundary_reference(
+                command, index, result, "common_event_return"
             )
 
     def _condition(self, command: _Command, index: int, state: _AnalysisState) -> None:
@@ -1223,7 +1571,10 @@ class _BlockAnalyzer:
                 right_index = count + 1 + condition_index
                 right_variable = command.ints[right_index] & 0x00FFFFFF if right_index < len(command.ints) else -1
                 right_value = state.strings.get(right_variable)
-            if operator is None:
+            if state.unknown_scopes:
+                status = "blocking"
+                reason = "条件执行前经过可能读写字符串的不透明命令"
+            elif operator is None:
                 status = "blocking" if value and value.tracked else "untracked"
                 reason = "未支持的字符串比较编码"
             elif right_is_variable and (
@@ -1234,16 +1585,25 @@ class _BlockAnalyzer:
             elif right_is_variable and (value.unknown or right_value.unknown):
                 status = "blocking"
                 reason = value.unknown or right_value.unknown
+            elif right_is_variable and (
+                value.literals is None or right_value.literals is None
+            ):
+                status = "blocking"
+                reason = "字符串变量比较的具体值无法有限枚举"
             elif value is None or not value.tracked:
                 status = "untracked"
                 reason = f"条件变量 {variable} 从事件入口进入"
             elif value.unknown:
                 status = "blocking"
                 reason = value.unknown
+            elif value.literals is None:
+                status = "blocking"
+                reason = "条件字符串的具体值无法有限枚举"
             else:
                 status = "resolved"
                 reason = ""
             dependency = {
+                "kind": "condition",
                 "auto_file": self.block.source,
                 "event_type": self.block.event_type,
                 "event_id": self.block.event_id,
@@ -1268,6 +1628,19 @@ class _BlockAnalyzer:
                 ],
                 "trace": list(value.trace if value else ()),
                 "right_trace": list(right_value.trace if right_value else ()),
+                "left_values": sorted(value.literals) if value and value.literals is not None else [],
+                "right_values": (
+                    sorted(right_value.literals)
+                    if right_value and right_value.literals is not None
+                    else []
+                ),
+                "unresolved_scopes": sorted(
+                    state.unknown_scopes
+                    |
+                    (value.scopes if value else frozenset())
+                    | (right_value.scopes if right_value else frozenset())
+                ),
+                "unresolved_reasons": sorted(state.unknown_reasons),
                 "status": status,
                 "reason": reason,
             }
@@ -1289,27 +1662,63 @@ class _BlockAnalyzer:
         end: int,
         state: _AnalysisState,
         exits: list[_AnalysisState] | None = None,
+        truth: bool | None = None,
     ) -> tuple[_AnalysisState | None, int] | None:
         closing = self._matching(start, end, 499)
         if closing is None:
             return None
         indent = self.block.commands[start].indent
-        markers = [
+        all_markers = [
             index for index in range(start + 1, closing)
             if self.block.commands[index].indent == indent
             and self.block.commands[index].opcode in {401, 420, 421}
         ]
-        if not markers:
+        if not all_markers:
             return state, closing + 1
+        if truth is True:
+            markers = all_markers[:1]
+        elif truth is False:
+            markers = [
+                marker for marker in all_markers
+                if self.block.commands[marker].opcode in {420, 421}
+            ]
+            if not markers:
+                return state, closing + 1
+        else:
+            markers = all_markers
         branch_states: list[_AnalysisState] = []
-        for marker_index, marker in enumerate(markers):
-            branch_end = markers[marker_index + 1] if marker_index + 1 < len(markers) else closing
+        for marker in markers:
+            position = all_markers.index(marker)
+            branch_end = (
+                all_markers[position + 1]
+                if position + 1 < len(all_markers)
+                else closing
+            )
             branch_state = state.copy()
             if self._execute(marker + 1, branch_end, branch_state, exits):
                 branch_states.append(branch_state)
-        if not any(self.block.commands[index].opcode in {420, 421} for index in markers):
+        if truth is None and not any(
+            self.block.commands[index].opcode in {420, 421} for index in markers
+        ):
             branch_states.append(state.copy())
         return (_merge_states(branch_states) if branch_states else None), closing + 1
+
+    @staticmethod
+    def _numeric_condition_truth(
+        command: _Command, state: _AnalysisState
+    ) -> bool | None:
+        # Editor 3.713 pretty output confirms flag 2 means numeric equality.
+        if len(command.ints) != 4 or command.ints[0] != 1 or command.ints[3] != 2:
+            return None
+        left = _number_argument(command.ints[1], state)
+        right = _number_argument(command.ints[2], state)
+        if left.values is None or right.values is None:
+            return None
+        if left.values.isdisjoint(right.values):
+            return False
+        if len(left.values) == len(right.values) == 1:
+            return True
+        return None
 
     def _taint_unknown(
         self,
@@ -1329,7 +1738,22 @@ class _BlockAnalyzer:
                     current.trace + (self._location(index),),
                     f"来源经过未支持命令 opcode={command.opcode}",
                     current.symbolic_all,
+                    current.scopes,
+                    None,
                 )
+        if strings:
+            scopes = frozenset({"project"})
+            state.unknown_scopes = state.unknown_scopes | scopes
+            state.unknown_reasons = state.unknown_reasons | frozenset({
+                f"{self._location(index)} opcode={command.opcode} 参数形状不透明"
+            })
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "opaque",
+                f"未校准或不透明命令 opcode={command.opcode}",
+                scopes,
+            )
         for variable in affected & set(state.numbers):
             current = state.numbers[variable]
             state.numbers[variable] = _NumberValue(
@@ -1342,8 +1766,23 @@ class _BlockAnalyzer:
         index: int,
         state: _AnalysisState,
         reason: str,
+        scopes: frozenset[str] | None = None,
     ) -> None:
         self._record_unknown(command, index, f"call-not-inlined:{reason}")
+        if scopes is None:
+            scopes = frozenset({"project"})
+        input_values = tuple(
+            state.strings[raw & 0x00FFFFFF]
+            for raw in command.ints[2:-1]
+            if raw >= 1_000_000 and (raw & 0x00FFFFFF) in state.strings
+        )
+        self._blocking_scope_dependency(
+            command, index, "call", reason, scopes, input_values
+        )
+        state.unknown_scopes = state.unknown_scopes | scopes
+        state.unknown_reasons = state.unknown_reasons | frozenset({
+            f"{self._location(index)} opcode={command.opcode}: {reason}"
+        })
         if len(command.ints) < 2 or not command.ints[1] & 0x01000000:
             return
         destination = command.ints[-1] & 0x00FFFFFF
@@ -1358,7 +1797,9 @@ class _BlockAnalyzer:
             value.cells,
             tuple(dict.fromkeys(value.trace + (self._location(index),))),
             f"来源经过未解释的公共事件调用 opcode={command.opcode}: {reason}",
-            value.symbolic_all,
+            "project" in scopes,
+            value.scopes | scopes,
+            None,
         )
         numeric_inputs = [
             state.numbers[raw & 0x00FFFFFF]
@@ -1371,54 +1812,88 @@ class _BlockAnalyzer:
             any(item.tracked for item in numeric_inputs),
         )
 
-    def _call_target(self, command: _Command) -> tuple[_CommandBlock, int] | None:
-        if len(command.ints) < 3 or command.ints[2] >= 1_000_000:
+    def _call_target(
+        self, command: _Command, state: _AnalysisState
+    ) -> tuple[_CommandBlock, int | None] | None:
+        if len(command.ints) < 3:
             return None
-        choice = command.ints[2]
         if command.opcode == 300:
             if not command.strings:
                 return None
-            matches = self.common_by_name.get(command.strings[0], ())
-            return (matches[0], choice) if len(matches) == 1 else None
-        reference = command.ints[0]
-        if 500_000 <= reference < 600_000:
-            target_id = reference - 500_000
-        elif 599_000 <= reference < 601_000 and self.block.event_type == "common":
-            target_id = self.block.event_id + reference - 600_100
+            target_names: frozenset[str] | None = frozenset({command.strings[0]})
+            reference = _CSELF_REFERENCE_RE.fullmatch(command.strings[0])
+            if reference:
+                value = state.strings.get(1_600_000 + int(reference.group(1)))
+                target_names = value.literals if value else None
+            matches = {
+                block.event_id: block
+                for name in (target_names or ())
+                for block in self.common_by_name.get(name, ())
+            }
+            target = next(iter(matches.values())) if len(matches) == 1 else None
         else:
+            reference = command.ints[0]
+            if 599_000 <= reference < 601_000 and self.block.event_type == "common":
+                target_id = self.block.event_id + reference - 600_100
+            elif 500_000 <= reference < 600_000:
+                target_id = reference - 500_000
+            else:
+                return None
+            target = self.common_by_id.get(target_id)
+        if target is None:
             return None
-        target = self.common_by_id.get(target_id)
-        return (target, choice) if target is not None else None
+        choice_value = _number_argument(command.ints[2], state)
+        choice = (
+            next(iter(choice_value.values))
+            if choice_value.values is not None and len(choice_value.values) == 1
+            else None
+        )
+        return target, choice
 
     def _call_event(self, command: _Command, index: int, state: _AnalysisState) -> None:
-        # ponytail: Only explicit return slots carry provenance across calls here.
-        # Add global-string side-effect summaries if a real project proves they matter.
-        if len(command.ints) < 2 or not command.ints[1] & 0x01000000:
-            return
-        resolved = self._call_target(command)
+        has_return = len(command.ints) >= 2 and bool(command.ints[1] & 0x01000000)
+        resolved = self._call_target(command, state)
         if resolved is None:
-            self._unknown_call(command, index, state, "调用目标无法解析")
+            if has_return:
+                self._unknown_call(
+                    command, index, state, "调用目标无法解析", frozenset()
+                )
             return
         target, choice = resolved
+        target_scopes = frozenset()
+        if choice is None:
+            if has_return:
+                self._unknown_call(
+                    command, index, state, "调用入口无法有限解析", target_scopes
+                )
+            return
+        if not has_return:
+            return
         call_key = (target.event_id, choice)
         if len(self.call_stack) >= _CALL_DEPTH_LIMIT:
-            self._unknown_call(command, index, state, "调用深度超过 8 层")
+            self._unknown_call(command, index, state, "调用摘要超过 64 层仍未收敛", target_scopes)
             return
         if call_key in self.call_stack:
-            self._unknown_call(command, index, state, "检测到递归调用")
+            self._unknown_call(command, index, state, "检测到递归调用", target_scopes)
             return
-        if target.return_target < 0 or target.value_inputs < 1:
-            self._unknown_call(command, index, state, "被调事件没有有效返回槽或命令参数")
+        if has_return and (target.value_inputs < 1 or target.return_target < 0):
+            self._unknown_call(
+                command,
+                index,
+                state,
+                "被调事件没有有效命令参数或返回槽",
+                target_scopes,
+            )
             return
 
         flags = command.ints[1]
         numeric_slots = flags & 0x0F
         string_count = (flags >> 4) & 0x0F
-        if not 1 <= numeric_slots <= target.value_inputs:
-            self._unknown_call(command, index, state, "数值实参数量与 Auto 头部不符")
+        if not 1 <= numeric_slots <= max(target.value_inputs, 1):
+            self._unknown_call(command, index, state, "数值实参数量与 Auto 头部不符", target_scopes)
             return
         if string_count > target.string_inputs:
-            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符")
+            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
             return
         # ponytail: The call record is authoritative for this entry point. Common
         # events may expose fewer inputs than their file-wide maximum; absent slots
@@ -1426,13 +1901,14 @@ class _BlockAnalyzer:
         numeric_count = numeric_slots - 1
         string_start = 3 + numeric_count
         string_end = string_start + string_count
-        if len(command.ints) != string_end + 1:
-            self._unknown_call(command, index, state, "实参数量与 Auto 头部不符")
+        expected_ints = string_end + int(has_return)
+        if len(command.ints) != expected_ints:
+            self._unknown_call(command, index, state, "实参数量与 Auto 头部不符", target_scopes)
             return
         string_offset = 1
         string_arguments = command.ints[string_start:string_end]
         if any(raw < 1_000_000 for raw in string_arguments) and len(command.strings) < string_offset + string_count:
-            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符")
+            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
             return
 
         callee_state = _AnalysisState(
@@ -1447,7 +1923,10 @@ class _BlockAnalyzer:
             if raw >= 1_000_000:
                 callee_state.strings[destination] = state.strings.get(
                     raw & 0x00FFFFFF,
-                    _StringValue(unknown=f"字符串实参 {raw & 0x00FFFFFF} 来源未知"),
+                    _StringValue(
+                        unknown=f"字符串实参 {raw & 0x00FFFFFF} 来源未知",
+                        literals=None,
+                    ),
                 )
             else:
                 callee_state.strings[destination] = self._literal_string(
@@ -1468,7 +1947,7 @@ class _BlockAnalyzer:
             None,
         )
         if label is None:
-            self._unknown_call(command, index, state, f"缺少 cmd:{choice} 标签")
+            self._unknown_call(command, index, state, f"缺少 cmd:{choice} 标签", target_scopes)
             return
         end = next(
             (
@@ -1486,27 +1965,46 @@ class _BlockAnalyzer:
             self.event_items,
             self.common_by_id,
             self.common_by_name,
+            self.event_scopes,
             self.call_stack + (call_key,),
         )
         exits: list[_AnalysisState] = []
         fell_through = child._execute(label + 1, end, callee_state, exits)
-        if fell_through or child.summary_failed or not exits:
+        self.dependencies.extend(child.dependencies)
+        self.blocking.extend(child.blocking)
+        self.unknown.update(child.unknown)
+        for key, values in child.unknown_locations.items():
+            self.unknown_locations.setdefault(key, []).extend(values)
+        if child.summary_failed or fell_through or not exits:
             self._unknown_call(
                 command,
                 index,
                 state,
                 child.summary_failed or "公共事件摘要没有在 END 返回",
+                target_scopes,
             )
             return
 
         result = _merge_states(exits)
+        state.database_strings = dict(result.database_strings)
+        state.unknown_scopes = state.unknown_scopes | result.unknown_scopes
+        state.unknown_reasons = state.unknown_reasons | result.unknown_reasons
+        # Global variables are shared across public-event frames; CSelf slots are not.
+        for variable, value in result.strings.items():
+            if not 1_600_000 <= variable < 1_600_100:
+                state.strings[variable] = value
+        for variable, value in result.numbers.items():
+            if not 1_600_000 <= variable < 1_600_100:
+                state.numbers[variable] = value
+        if not has_return:
+            return
         return_variable = 1_600_000 + target.return_target
         destination = command.ints[-1] & 0x00FFFFFF
         call_trace = f"{self._location(index)} -> common={target.event_id} cmd={choice}"
         if target.return_target >= 5:
             value = result.strings.get(return_variable)
             if value is None:
-                self._unknown_call(command, index, state, "字符串返回槽没有赋值")
+                self._unknown_call(command, index, state, "字符串返回槽没有赋值", target_scopes)
                 return
             state.strings[destination] = _StringValue(
                 value.source_keys,
@@ -1514,11 +2012,13 @@ class _BlockAnalyzer:
                 tuple(dict.fromkeys(value.trace + (call_trace,))),
                 value.unknown,
                 value.symbolic_all,
+                value.scopes,
+                value.literals,
             )
         else:
             value = result.numbers.get(return_variable)
             if value is None:
-                self._unknown_call(command, index, state, "数值返回槽没有赋值")
+                self._unknown_call(command, index, state, "数值返回槽没有赋值", target_scopes)
                 return
             state.numbers[destination] = value
 
@@ -1530,8 +2030,18 @@ class _BlockAnalyzer:
         exits: list[_AnalysisState] | None = None,
     ) -> bool:
         index = start
+        jump_counts: Counter[int] = Counter()
         while index < end:
             command = self.block.commands[index]
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            if semantics is None:
+                self._record_unknown(command, index)
+                self._taint_unknown(command, index, state)
+                index += 1
+                continue
+            self._resource_reference(command, index, state, semantics)
             if command.opcode == 121:
                 self._set_number(command, index, state)
             elif command.opcode == 122:
@@ -1565,9 +2075,17 @@ class _BlockAnalyzer:
                     state.numbers = merged.numbers
                     state.strings = merged.strings
                     state.database_strings = merged.database_strings
+                    state.unknown_scopes = merged.unknown_scopes
+                    state.unknown_reasons = merged.unknown_reasons
                     continue
             elif command.opcode == 111:
-                branch = self._branches(index, end, state, exits)
+                branch = self._branches(
+                    index,
+                    end,
+                    state,
+                    exits,
+                    truth=self._numeric_condition_truth(command, state),
+                )
                 if branch:
                     merged, index = branch
                     if merged is None:
@@ -1575,6 +2093,8 @@ class _BlockAnalyzer:
                     state.numbers = merged.numbers
                     state.strings = merged.strings
                     state.database_strings = merged.database_strings
+                    state.unknown_scopes = merged.unknown_scopes
+                    state.unknown_reasons = merged.unknown_reasons
                     continue
             elif command.opcode in {210, 300}:
                 self._call_event(command, index, state)
@@ -1630,33 +2150,67 @@ class _BlockAnalyzer:
                                     continue
                                 merged.strings[variable] = _StringValue(
                                     value.source_keys, value.cells, value.trace,
-                                    "循环扩大后字符串仍未稳定", value.symbolic_all
+                                    "循环扩大后字符串仍未稳定", True,
+                                    value.scopes,
+                                    None,
                                 )
                         state.numbers = merged.numbers
                         state.strings = merged.strings
                         state.database_strings = merged.database_strings
+                        state.unknown_scopes = merged.unknown_scopes
+                        state.unknown_reasons = merged.unknown_reasons
                     index = closing + 1
                     continue
-            elif command.opcode == 213 and exits is not None:
+            elif command.opcode == 213:
                 if command.strings == ("END",):
-                    exits.append(state.copy())
-                else:
-                    self.summary_failed = f"未支持的标签跳转 {command.strings!r}"
-                    self._record_unknown(command, index, "summary-goto")
+                    if exits is not None:
+                        exits.append(state.copy())
+                    return False
+                target_name = command.strings[0] if len(command.strings) == 1 else ""
+                targets = self.labels.get(target_name, ())
+                if len(targets) == 1:
+                    target = targets[0]
+                    jump_counts[target] += 1
+                    if jump_counts[target] <= _LOOP_LIMIT:
+                        end = len(self.block.commands)
+                        index = target + 1
+                        continue
+                    state.unknown_scopes = state.unknown_scopes | frozenset({"project"})
+                    state.unknown_reasons = state.unknown_reasons | frozenset({
+                        f"{self._location(index)}: 标签跳转 {target_name!r} 未收敛"
+                    })
+                    self.summary_failed = f"标签跳转 {target_name!r} 超过 64 次仍未收敛"
+                    self._record_unknown(command, index, "summary-goto-cycle")
+                    return False
+                if exits is not None:
+                    self.summary_failed = f"无法唯一解析标签跳转 {command.strings!r}"
+                self._record_unknown(command, index, "summary-goto")
+                state.unknown_scopes = state.unknown_scopes | frozenset({"project"})
+                state.unknown_reasons = state.unknown_reasons | frozenset({
+                    f"{self._location(index)}: 无法唯一解析标签 {target_name!r}"
+                })
                 return False
-            elif command.opcode == 213 and command.strings == ("END",):
-                pass
             elif command.opcode not in {0, 401, 420, 421, 498, 499}:
-                effect = command_effect(
-                    command.opcode, len(command.ints), len(command.strings)
-                )
+                effect = str(semantics["effect"]) if semantics else None
                 if effect in {"no_write", "control_flow"}:
                     pass
                 elif effect == "numeric_write":
                     self._set_runtime_value(command, index, state, string_result=False)
                 elif effect == "event_call":
-                    # Reserved calls do not return into the current event frame.
-                    pass
+                    self._unknown_call(
+                        command,
+                        index,
+                        state,
+                        "未内联的公共事件调用",
+                        frozenset(
+                            {
+                                "common:*",
+                                "database:UDB:*:*:*",
+                                "database:CDB:*:*:*",
+                                "database:SDB:*:*:*",
+                            }
+                        ),
+                    )
                 else:
                     if any(command.strings) or any(
                         value >= 1_000_000 for value in command.ints
@@ -1667,7 +2221,32 @@ class _BlockAnalyzer:
         return True
 
     def run(self) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-        self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
+        entry_labels = [
+            (index, int(command.strings[0].removeprefix("cmd:")))
+            for index, command in enumerate(self.block.commands)
+            if self.block.event_type == "common"
+            and command.opcode == 212
+            and command.indent == 0
+            and len(command.strings) == 1
+            and command.strings[0].startswith("cmd:")
+            and command.strings[0].removeprefix("cmd:").isdigit()
+        ]
+        if entry_labels:
+            first = entry_labels[0][0]
+            if first:
+                self._execute(0, first, _AnalysisState({}, {}, {}))
+            for label_index, (start, choice) in enumerate(entry_labels):
+                end = (
+                    entry_labels[label_index + 1][0]
+                    if label_index + 1 < len(entry_labels)
+                    else len(self.block.commands)
+                )
+                state = _AnalysisState(
+                    {1_600_000: _NumberValue(frozenset({choice}))}, {}, {}
+                )
+                self._execute(start + 1, end, state)
+        else:
+            self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
         warnings = [
             {"opcode": opcode, "shape": shape, "count": count,
              "locations": self.unknown_locations[(opcode, shape)][:5]}
@@ -1710,6 +2289,7 @@ def _analyze_blocks(
         if len(group) == 1
     }
     common_by_name = {name: tuple(group) for name, group in common_names.items()}
+    event_scopes = _conservative_event_scopes(blocks, common_by_id, common_by_name)
     dependencies: list[dict[str, object]] = []
     blocking: list[dict[str, object]] = []
     unknown = Counter()
@@ -1722,6 +2302,7 @@ def _analyze_blocks(
             frozen_event_items,
             common_by_id,
             common_by_name,
+            event_scopes,
         )
         block_dependencies, block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
@@ -1766,6 +2347,18 @@ def _analyze_blocks(
             for cell in sorted(right_cells)
         ]
         current["trace"] = list(dict.fromkeys([*current["trace"], *dependency["trace"]]))[:_VALUE_LIMIT]
+        for field in ("left_values", "right_values"):
+            current[field] = sorted(
+                set(current.get(field, [])) | set(dependency.get(field, []))
+            )[:_VALUE_LIMIT]
+        current["unresolved_scopes"] = sorted(
+            set(current.get("unresolved_scopes", []))
+            | set(dependency.get("unresolved_scopes", []))
+        )
+        current["unresolved_reasons"] = list(dict.fromkeys([
+            *current.get("unresolved_reasons", []),
+            *dependency.get("unresolved_reasons", []),
+        ]))[:_VALUE_LIMIT]
         if current["status"] == "blocking":
             pass
         elif dependency["status"] == "blocking":
@@ -1777,6 +2370,211 @@ def _analyze_blocks(
     dependencies = list(merged_dependencies.values())
     blocking = [item for item in dependencies if item["status"] == "blocking"]
     return dependencies, blocking, warnings
+
+
+def _conservative_event_scopes(
+    blocks: list[_CommandBlock],
+    common_by_id: dict[int, _CommandBlock],
+    common_by_name: dict[str, tuple[_CommandBlock, ...]],
+) -> dict[int, frozenset[str]]:
+    direct: dict[int, set[str]] = {}
+    calls: dict[int, set[int]] = {}
+    database_scopes = {"database:UDB:*:*:*", "database:CDB:*:*:*", "database:SDB:*:*:*"}
+    for event_id, block in common_by_id.items():
+        scopes: set[str] = set()
+        targets: set[int] = set()
+        for command in block.commands:
+            semantics = command_semantics(command.opcode, len(command.ints), len(command.strings))
+            if semantics is None:
+                scopes.add("project")
+            if command.opcode == 122 and command.ints:
+                destination = command.ints[0] & 0x00FFFFFF
+                if not 1_600_000 <= destination < 1_600_100:
+                    scopes.add(f"common:{event_id}")
+            if command.opcode == 250 and len(command.ints) >= 4:
+                byte1 = (command.ints[3] >> 8) & 0xFF
+                database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+                if database and byte1 & 0xF0 != 0x10:
+                    scopes.add(f"database:{database}:*:*:*")
+            if command.opcode not in {210, 300} or len(command.ints) < 3:
+                continue
+            target: _CommandBlock | None = None
+            if command.opcode == 300 and command.strings:
+                matches = common_by_name.get(command.strings[0], ())
+                target = matches[0] if len(matches) == 1 else None
+            elif command.opcode == 210:
+                reference = command.ints[0]
+                if 599_000 <= reference < 601_000:
+                    target_id = event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                else:
+                    target_id = -1
+                target = common_by_id.get(target_id)
+            if target is None:
+                scopes.update(database_scopes | {"common:*"})
+            else:
+                targets.add(target.event_id)
+        direct[event_id] = scopes
+        calls[event_id] = targets
+
+    summaries: dict[int, set[str]] = {}
+    # ponytail: Effects are monotone set unions, so graph reachability is the
+    # exact SCC fixed point and avoids repeatedly interpreting recursive bodies.
+    for event_id in direct:
+        pending = [event_id]
+        visited: set[int] = set()
+        merged: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            merged.update(direct.get(current, set()))
+            pending.extend(calls.get(current, ()))
+            if len(merged) > _VALUE_LIMIT:
+                if "project" in merged:
+                    merged = {"project"}
+                else:
+                    database = {
+                        scope for scope in merged if scope.startswith("database:")
+                    }
+                    merged = database | (
+                        {"common:*"}
+                        if any(scope.startswith("common:") for scope in merged)
+                        else set()
+                    )
+                break
+        summaries[event_id] = merged
+    return {event_id: frozenset(scopes) for event_id, scopes in summaries.items()}
+
+
+def _event_node(block: _CommandBlock) -> str:
+    return f"{block.event_type}:{block.source}:{block.event_id}:{block.page}"
+
+
+def _call_graph_report(blocks: list[_CommandBlock]) -> tuple[dict[str, object], list[dict[str, object]]]:
+    common_by_id = {
+        block.event_id: block for block in blocks if block.event_type == "common"
+    }
+    common_by_name: dict[str, list[_CommandBlock]] = {}
+    for block in common_by_id.values():
+        common_by_name.setdefault(block.event_name, []).append(block)
+    conservative_scopes = _conservative_event_scopes(
+        blocks,
+        common_by_id,
+        {name: tuple(group) for name, group in common_by_name.items()},
+    )
+    edges: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = []
+    adjacency: dict[str, set[str]] = {_event_node(block): set() for block in common_by_id.values()}
+    calibrated = 0
+    command_total = 0
+    for block in blocks:
+        calls: list[dict[str, object]] = []
+        reads = writes = opaque = 0
+        for index, command in enumerate(block.commands, start=1):
+            command_total += 1
+            semantics = command_semantics(command.opcode, len(command.ints), len(command.strings))
+            if semantics:
+                calibrated += 1
+                reads += int(bool(semantics["reads_variables"]))
+                writes += int(bool(semantics["writes_variables"]))
+            else:
+                opaque += 1
+            if command.opcode not in {210, 300}:
+                continue
+            targets: list[_CommandBlock] = []
+            if command.opcode == 300 and command.strings:
+                targets = common_by_name.get(command.strings[0], [])
+            elif command.ints:
+                reference = command.ints[0]
+                target_id = None
+                if 599_000 <= reference < 601_000 and block.event_type == "common":
+                    target_id = block.event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                if target_id in common_by_id:
+                    targets = [common_by_id[target_id]]
+            edge = {
+                "source": _event_node(block),
+                "command": index,
+                "opcode": command.opcode,
+                "targets": [_event_node(target) for target in targets],
+                "dynamic": len(targets) != 1,
+            }
+            calls.append(edge)
+            edges.append(edge)
+            if block.event_type == "common":
+                adjacency.setdefault(_event_node(block), set()).update(edge["targets"])
+        summaries.append(
+            {
+                "event": _event_node(block),
+                "event_name": block.event_name,
+                "commands": len(block.commands),
+                "variable_reads": reads,
+                "variable_writes": writes,
+                "opaque_commands": opaque,
+                "calls": calls,
+                "conservative_scopes": sorted(
+                    conservative_scopes.get(block.event_id, frozenset())
+                    if block.event_type == "common"
+                    else frozenset()
+                ),
+            }
+        )
+
+    # Tarjan is small and deterministic; it exposes recursion without interpreting WOLF runtime.
+    index = 0
+    stack: list[str] = []
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    components: list[list[str]] = []
+
+    def visit(node: str) -> None:
+        nonlocal index
+        indices[node] = low[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for target in sorted(adjacency.get(node, ())):
+            if target not in indices:
+                visit(target)
+                low[node] = min(low[node], low[target])
+            elif target in on_stack:
+                low[node] = min(low[node], indices[target])
+        if low[node] == indices[node]:
+            component: list[str] = []
+            while True:
+                target = stack.pop()
+                on_stack.remove(target)
+                component.append(target)
+                if target == node:
+                    break
+            components.append(sorted(component))
+
+    for node in sorted(adjacency):
+        if node not in indices:
+            visit(node)
+    recursive = [
+        component for component in components
+        if len(component) > 1 or any(node in adjacency.get(node, ()) for node in component)
+    ]
+    return (
+        {
+            "nodes": len(adjacency),
+            "edges": edges,
+            "dynamic_edges": sum(bool(edge["dynamic"]) for edge in edges),
+            "recursive_sccs": recursive,
+            "coverage": {
+                "commands": command_total,
+                "calibrated": calibrated,
+                "ratio": (calibrated / command_total) if command_total else 1.0,
+            },
+        },
+        summaries,
+    )
 
 
 def analyze_auto_export(
@@ -1823,7 +2621,14 @@ def analyze_auto_export(
         }
         database_counts[name] = counts
 
-    dependencies, blocking, warnings = _analyze_blocks(blocks, items, database_types)
+    project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
+    dependencies, blocking, warnings = _analyze_blocks(project.events, items, database_types)
+    call_graph, event_summaries = _call_graph_report(list(project.events))
+    unresolved_scopes = sorted({
+        str(scope)
+        for dependency in dependencies
+        for scope in dependency.get("unresolved_scopes", [])
+    })
     verified_version = tuple(int(value) for value in VERIFIED_EDITOR_VERSION.split("."))
     newer_editor = editor.version_tuple > verified_version
     catalog_warnings = (
@@ -1842,8 +2647,10 @@ def analyze_auto_export(
             "sha256": editor.sha256,
         },
         "command_catalog": {
+            "schema": CATALOG_SCHEMA,
             "verified_through": VERIFIED_EDITOR_VERSION,
             "newer_editor": newer_editor,
+            "coverage": call_graph["coverage"],
         },
         "input_hash": input_hash,
         "output_hash": hash_directory(root),
@@ -1857,11 +2664,145 @@ def analyze_auto_export(
         "databases": database_report,
         "dependencies": dependencies,
         "blocking_issues": blocking,
+        "event_summaries": event_summaries,
+        "call_graph": call_graph,
+        "reachable_scopes": unresolved_scopes,
+        "safe_to_translate": [],
+        "keep_original": [],
+        "unresolved_scopes": unresolved_scopes,
+        "translated_replay": {"status": "pending_import"},
+        "structural_diff": {"status": "pending_import"},
         "unknown_commands": warnings,
         "warnings": catalog_warnings + [
             f"未解释的字符串命令 opcode={warning['opcode']} {warning['shape']} ×{warning['count']}"
             for warning in warnings
         ],
+    }
+
+
+def compare_auto_structure(
+    before_dir: str | Path,
+    after_dir: str | Path,
+    items: list[TranslationItem],
+    approved_keys: set[str],
+) -> dict[str, object]:
+    """Compare Editor round-trips while masking only explicitly approved text slots."""
+    before_root = Path(before_dir).resolve()
+    after_root = Path(after_dir).resolve()
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code.upper(), []).append(item)
+    approved_codes = {
+        code
+        for code, code_items in by_code.items()
+        if any(item.key in approved_keys for item in code_items)
+    }
+    for code, code_items in by_code.items():
+        for item in code_items:
+            if not item.flag.upper().startswith("COPY-FROM-"):
+                continue
+            source_code = item.flag[len("COPY-FROM-"):].upper()
+            if source_code in approved_codes:
+                approved_codes.add(code)
+
+    def event_index(root: Path) -> dict[tuple[str, int, int], _CommandBlock]:
+        result: dict[tuple[str, int, int], _CommandBlock] = {}
+        paths = [root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+        paths.extend(sorted((root / "MapData").rglob("*.mps.Auto.txt")))
+        for path in paths:
+            if not path.is_file():
+                continue
+            event_type = "common" if path.name == "CommonEvent.dat.Auto.txt" else "map"
+            for block in _event_blocks(path, event_type, source=path.relative_to(root).as_posix())[0]:
+                result[(block.source, block.event_id, block.page)] = block
+        return result
+
+    differences: list[dict[str, object]] = []
+    difference_count = 0
+
+    def add(kind: str, location: str, before: object, after: object) -> None:
+        nonlocal difference_count
+        difference_count += 1
+        if len(differences) < 200:
+            differences.append({"kind": kind, "location": location, "before": before, "after": after})
+
+    before_events = event_index(before_root)
+    after_events = event_index(after_root)
+    if set(before_events) != set(after_events):
+        add("event_set", "AutoProject", sorted(map(str, before_events)), sorted(map(str, after_events)))
+    for key in sorted(set(before_events) & set(after_events)):
+        before = before_events[key]
+        after = after_events[key]
+        location = f"{before.source} event={before.event_id} page={before.page}"
+        if before.event_name != after.event_name:
+            add("event_name", location, before.event_name, after.event_name)
+        if len(before.commands) != len(after.commands):
+            add("command_count", location, len(before.commands), len(after.commands))
+            continue
+        for index, (left, right) in enumerate(zip(before.commands, after.commands, strict=True), start=1):
+            command_location = f"{location} command={index}"
+            if (left.opcode, left.ints, left.indent) != (right.opcode, right.ints, right.indent):
+                add(
+                    "command_structure",
+                    command_location,
+                    [left.opcode, list(left.ints), left.indent],
+                    [right.opcode, list(right.ints), right.indent],
+                )
+                continue
+            if len(left.strings) != len(right.strings):
+                add("string_count", command_location, len(left.strings), len(right.strings))
+                continue
+            for string_index, (left_text, right_text) in enumerate(zip(left.strings, right.strings, strict=True)):
+                if left_text == right_text:
+                    continue
+                code = _event_code(before, index, string_index).upper()
+                if code not in approved_codes:
+                    add("unapproved_string", f"{command_location} string={string_index}", left_text, right_text)
+
+    database_names = (("DataBase", "UDB"), ("CDataBase", "CDB"), ("SysDataBase", "SDB"))
+    for filename, database in database_names:
+        left_path = before_root / "BasicData" / f"{filename}.Auto.txt"
+        right_path = after_root / "BasicData" / f"{filename}.Auto.txt"
+        if left_path.is_file() != right_path.is_file():
+            add("database_file", filename, left_path.is_file(), right_path.is_file())
+            continue
+        if not left_path.is_file():
+            continue
+        left_types = _database_index(left_path, database)[0]
+        right_types = _database_index(right_path, database)[0]
+        if set(left_types) != set(right_types):
+            add("database_types", database, sorted(left_types), sorted(right_types))
+            continue
+        for type_id in sorted(left_types):
+            left_type = left_types[type_id]
+            right_type = right_types[type_id]
+            type_location = f"{database}[{type_id}]"
+            if (
+                left_type.name != right_type.name
+                or left_type.field_names != right_type.field_names
+                or left_type.field_types != right_type.field_types
+                or left_type.data_names != right_type.data_names
+                or len(left_type.rows) != len(right_type.rows)
+            ):
+                add("database_metadata", type_location, left_type.name, right_type.name)
+            for data_id, (left_row, right_row) in enumerate(zip(left_type.rows, right_type.rows)):
+                if len(left_row) != len(right_row):
+                    add("database_width", f"{type_location}[{data_id}]", len(left_row), len(right_row))
+                    continue
+                for field_id, (left_text, right_text) in enumerate(zip(left_row, right_row)):
+                    if left_text == right_text:
+                        continue
+                    code = f"{database}-{type_id}-{data_id}-{field_id}".upper()
+                    if code not in approved_codes:
+                        add("unapproved_database_string", code, left_text, right_text)
+
+    return {
+        "status": "passed" if not differences else "failed",
+        "approved_keys": len(approved_keys),
+        "differences": differences,
+        "difference_count": difference_count,
+        "before_hash": hash_directory(before_root),
+        "after_hash": hash_directory(after_root),
     }
 
 

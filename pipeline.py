@@ -57,7 +57,12 @@ from safe_io import (
     read_text_with_retry,
     replace_with_retry,
 )
-from wolf_editor import AUTO_ANALYSIS_SCHEMA, export_and_analyze, inspect_wolf_editor
+from wolf_editor import (
+    AUTO_ANALYSIS_SCHEMA,
+    compare_auto_structure,
+    export_and_analyze,
+    inspect_wolf_editor,
+)
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
@@ -805,10 +810,22 @@ class Pipeline:
                 diagnostic_log=self.detail,
                 warning=self.warning,
             )
+            editor_analysis = json.loads(
+                editor_result.analysis_path.read_text(encoding="utf-8")
+            )
+            call_graph = editor_analysis.get("call_graph", {})
+            coverage = editor_analysis.get("command_catalog", {}).get("coverage", {})
+            self.log(
+                "Editor 安全分析："
+                f"命令形状覆盖 {coverage.get('calibrated', 0)}/{coverage.get('commands', 0)}，"
+                f"事件摘要 {len(editor_analysis.get('event_summaries', []))} 个，"
+                f"调用边 {len(call_graph.get('edges', []))} 条，"
+                f"递归 SCC {len(call_graph.get('recursive_sccs', []))} 个。"
+            )
             if editor_result.warning_count:
                 self.warning(
-                    f"Editor 事件分析完成，但有 {editor_result.warning_count} 类未知字符串命令；"
-                    "这些命令未被盲目加入保护。"
+                    f"Editor 事件分析完成，但有 {editor_result.warning_count} 类不透明命令；"
+                    "若它们进入翻译相关逻辑，导入时会自动保留影响范围内的原文。"
                 )
 
             categories: dict[str, int] = {}
@@ -1064,6 +1081,7 @@ class Pipeline:
         return {"full_workbook": str(full), "items": self.manifest.version.stage(Stage.TRANSLATE).artifacts["items"]}
 
     def _import(self) -> dict[str, str]:
+        token = f"{int(time.time())}-{os.getpid()}-{time.time_ns() & 0xFFFFFF:x}"
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
         items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
         rules = self.manifest.import_protection
@@ -1094,13 +1112,13 @@ class Pipeline:
             + " protection="
             + json.dumps(rules.__dict__, ensure_ascii=False, sort_keys=True)
         )
-        protection_path = self.artifacts_dir / "import-protection.json"
+        protection_path = self.artifacts_dir / f"import-protection-{token}.json"
         _atomic_json(protection_path, protection)
         summary = protection["summary"]
-        permissive_warnings = int(summary.get("logic_permissive_warnings", 0))
-        if permissive_warnings:
+        auto_preserved = int(summary.get("logic_auto_preserved", 0))
+        if auto_preserved:
             self.warning(
-                f"宽松逻辑策略已放行 {permissive_warnings} 组无法证明安全的 WOLF 条件依赖；"
+                f"保守逻辑策略已自动保留 {auto_preserved} 条无法证明安全的原文；"
                 "详情已写入导入保护报告。"
             )
         self.log(
@@ -1118,29 +1136,99 @@ class Pipeline:
             )
         scoped = write_scoped_workbook(
             full,
-            self.artifacts_dir / "import-scoped.xlsx",
+            self.artifacts_dir / f"import-scoped-{token}.xlsx",
             self.manifest.import_scope,
             self.work_dir,
             items,
             allow_copy_condition_groups=rules.allow_copy_condition_groups,
             protected_keys=protected_keys,
         )
-        support = self.work_dir / SUPPORT_DIR
+        staging_game = self.artifacts_dir / f".import-game-{token}"
+        shutil.copytree(
+            self.work_dir,
+            staging_game,
+            ignore=lambda _path, names: [
+                name
+                for name in names
+                if name.startswith("Translated") and "Chinese (Simplified)" in name
+            ],
+        )
+        support = staging_game / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)
         shutil.copy2(scoped, support / WORKBOOK_NAME)
         runner = self._official_runner(full_export_scope())
-        translated = runner.translate(
-            self.work_dir,
-            cancel_event=self.cancel_event,
-            log=self.log,
-            diagnostic_log=self.detail,
-        )
+        post_editor_dir = self.artifacts_dir / f"post-import-editor-{token}"
+        previous = self.work_dir / ".wolflator-translated-previous"
+        translated: Path | None = None
+        post_editor = None
+        try:
+            staged_translated = runner.translate(
+                staging_game,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+            )
+            if not staged_translated.resolve().is_relative_to(staging_game.resolve()):
+                raise RuntimeError("官方工具的译版输出越过了导入暂存目录。")
+            self.log("正在用 WOLF RPG Editor 回读导入结果并验证事件结构...")
+            post_editor = export_and_analyze(
+                self.settings.wolf_editor_path,
+                staged_translated,
+                post_editor_dir,
+                items,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+                warning=self.warning,
+            )
+            safe_changed_keys = {
+                item.key
+                for item in items
+                if item.translation and item.key in set(protection["safe_to_translate"])
+            }
+            structural_diff = compare_auto_structure(
+                self.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"],
+                post_editor.auto_dir,
+                items,
+                safe_changed_keys,
+            )
+            protection["structural_diff"] = structural_diff
+            _atomic_json(protection_path, protection)
+            if structural_diff["status"] != "passed":
+                first = structural_diff["differences"][0]
+                raise RuntimeError(
+                    "导入后的 Editor Auto 结构与导入前不一致，已拒绝本次导入："
+                    f"{first['location']} ({first['kind']})。"
+                )
+            translated = self.work_dir / staged_translated.name
+            if previous.exists():
+                self._safe_remove(previous)
+            try:
+                if translated.exists():
+                    replace_with_retry(translated, previous)
+                replace_with_retry(staged_translated, translated)
+            except Exception:
+                if not translated.exists() and previous.exists():
+                    replace_with_retry(previous, translated)
+                raise
+            if previous.exists():
+                try:
+                    self._safe_remove(previous)
+                except OSError as error:
+                    self.warning(f"旧导入产物清理失败，已保留在 {previous}：{error}")
+            self.log("Editor Auto 回读验证通过：未发现未批准的事件或数据库结构变化。")
+        finally:
+            if staging_game.exists():
+                self._safe_remove(staging_game)
+        assert translated is not None and post_editor is not None
         artifacts = {
             "scoped_workbook": str(scoped),
             "translated_game": str(translated),
             "import_protection": str(protection_path),
             "import_protected_count": str(summary["protected"]),
             "import_protection_warning_count": str(summary["warnings"]),
+            "post_import_editor_auto": str(post_editor.auto_dir),
+            "post_import_editor_analysis": str(post_editor.analysis_path),
         }
         diagnostics = runner.diagnostics
         originals_by_code: dict[str, set[str]] = {}

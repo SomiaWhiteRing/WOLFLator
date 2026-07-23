@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-CATALOG_SCHEMA = 2
+CATALOG_SCHEMA = 3
 VERIFIED_EDITOR_VERSION = "3.713.2026.718"
 VERIFIED_EDITOR_SHA256 = "2ce5639f669643ded07a9390ef05054b8f95acbfa1b4dc1f4936246df5eae0c3"
 
@@ -94,7 +94,7 @@ CALIBRATED_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {
     106: ((0, 1),),
     107: ((0, 0),),
     111: ((4, 0), (7, 0), (10, 0), (13, 0)),
-    112: ((2, 4), (3, 4), (4, 4), (5, 4)),
+    112: ((2, 1), (2, 4), (3, 4), (4, 4), (5, 4)),
     121: ((4, 0), (5, 0)),
     122: ((2, 1), (2, 2), (3, 0), (3, 1), (3, 2), (4, 1)),
     123: ((2, 0), (3, 0)),
@@ -149,11 +149,33 @@ SPECIALIZED_OPCODES = frozenset({112, 121, 122, 124, 210, 221, 250, 300})
 # are consumed by the analyzer. Other strings are display text, labels, or
 # resource paths and do not assign an event string variable.
 STRING_PARAMETER_ROLES: dict[int, tuple[str, ...]] = {
+    101: ("display_text",),
+    102: ("display_text",),
+    103: ("comment",),
+    106: ("display_text",),
     112: ("condition_literal",),
     122: ("assignment_literal",),
+    140: ("resource_path",),
+    150: ("resource_path",),
     210: ("call_argument",),
+    212: ("label",),
+    213: ("label_target",),
     250: ("database_selector_or_value",),
+    251: ("file_path",),
+    290: ("resource_path",),
     300: ("common_event_name", "call_argument"),
+}
+
+_TRANSFER_BY_EFFECT = {
+    "no_write": "preserve",
+    "numeric_write": "numeric_write",
+    "string_read": "string_read",
+    "string_write": "string_write",
+    "condition": "condition",
+    "control_flow": "control_flow",
+    "database": "database",
+    "event_call": "event_call",
+    "opaque": "opaque",
 }
 
 # Paths are documentation for the frozen 3.713 free-edition UI. They are not
@@ -233,6 +255,32 @@ def command_effect(opcode: int, int_count: int, string_count: int) -> str | None
     return item[1]
 
 
+def command_semantics(
+    opcode: int, int_count: int, string_count: int
+) -> dict[str, object] | None:
+    """Return only Editor-calibrated semantics for this exact parameter shape."""
+    item = COMMAND_CATALOG.get(opcode)
+    if item is None or (int_count, string_count) not in CALIBRATED_SHAPES.get(opcode, ()):
+        return None
+    effect = item[1]
+    roles = STRING_PARAMETER_ROLES.get(opcode, ())
+    return {
+        "opcode": opcode,
+        "shape": [int_count, string_count],
+        "effect": effect,
+        "transfer": _TRANSFER_BY_EFFECT[effect],
+        "integer_roles": ["encoded_parameter"] * int_count,
+        "string_roles": [
+            roles[min(index, len(roles) - 1)] if roles else "display_or_metadata"
+            for index in range(string_count)
+        ],
+        "reads_variables": effect in {"numeric_write", "string_read", "string_write", "condition", "database", "event_call"},
+        "writes_variables": effect in {"numeric_write", "string_write", "database", "event_call"},
+        "evidence": item[2],
+        "editor_version": VERIFIED_EDITOR_VERSION,
+    }
+
+
 def catalog_record(opcode: int) -> dict[str, object] | None:
     item = COMMAND_CATALOG.get(opcode)
     if item is None:
@@ -245,6 +293,10 @@ def catalog_record(opcode: int) -> dict[str, object] | None:
         "shapes": [list(shape) for shape in CALIBRATED_SHAPES.get(opcode, ())],
         "ui_path": UI_PATHS.get(opcode, "official sample/corpus"),
         "string_parameters": list(STRING_PARAMETER_ROLES.get(opcode, ())),
+        "semantics": [
+            command_semantics(opcode, int_count, string_count)
+            for int_count, string_count in CALIBRATED_SHAPES.get(opcode, ())
+        ],
         "case_ids": [
             str(case["id"])
             for case in MANUAL_CALIBRATION_CASES

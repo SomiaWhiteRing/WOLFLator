@@ -148,6 +148,21 @@ def _status(args: argparse.Namespace) -> int:
         }
         for stage in STAGE_ORDER
     }
+    safety: dict[str, object] = {}
+    protection_path = version.stage(Stage.IMPORT).artifacts.get("import_protection", "")
+    if protection_path and Path(protection_path).is_file():
+        try:
+            protection = json.loads(Path(protection_path).read_text(encoding="utf-8"))
+            summary = protection.get("summary", {})
+            safety = {
+                "safe_to_translate": len(protection.get("safe_to_translate", [])),
+                "keep_original": len(protection.get("keep_original", [])),
+                "unresolved_scopes": len(protection.get("unresolved_scopes", [])),
+                "logic_dependencies": summary.get("logic_dependencies", 0),
+                "structural_diff": protection.get("structural_diff", {}).get("status", "unknown"),
+            }
+        except (OSError, ValueError, TypeError):
+            safety = {"status": "unreadable"}
     result = {
         "project": manifest.project_id,
         "name": manifest.name,
@@ -161,6 +176,7 @@ def _status(args: argparse.Namespace) -> int:
         "busy": busy,
         "lock": safe_owner if busy else {},
         "stages": records,
+        "translation_safety": safety,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -184,6 +200,14 @@ def _status(args: argparse.Namespace) -> int:
             if record.artifacts.get("official_warning_count"):
                 suffix = f"（{record.artifacts['official_warning_count']} 个官方警告）"
             print(f"{stage.value:10} {record.status.value}{suffix}")
+        if safety:
+            print(
+                "安全门："
+                f"可翻译 {safety.get('safe_to_translate', '?')}，"
+                f"保留原文 {safety.get('keep_original', '?')}，"
+                f"未知范围 {safety.get('unresolved_scopes', '?')}，"
+                f"结构回读 {safety.get('structural_diff', safety.get('status', '?'))}"
+            )
     return 0
 
 
@@ -492,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument(
         "--logic-unknown-policy",
         choices=("block", "warn"),
-        help="无法证明相关事件逻辑安全时阻止导入或仅警告",
+        help="无法证明相关事件逻辑安全时阻止导入，或保留受影响原文后继续",
     )
     scope.add_argument(
         "--suspicious-identifiers",

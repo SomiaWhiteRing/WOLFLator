@@ -21,6 +21,7 @@ from wolf_command_catalog import (
     MANUAL_CALIBRATION_CASES,
     PRO_OPCODE,
     command_effect,
+    command_semantics,
 )
 
 
@@ -43,7 +44,14 @@ class EditorCalibrationTests(unittest.TestCase):
             self.assertIn(effect, effects)
             for int_count, string_count in CALIBRATED_SHAPES.get(opcode, ()):
                 self.assertEqual(effect, command_effect(opcode, int_count, string_count))
+                semantics = command_semantics(opcode, int_count, string_count)
+                self.assertIsNotNone(semantics)
+                self.assertIn(semantics["transfer"], {
+                    "preserve", "numeric_write", "string_read", "string_write",
+                    "condition", "control_flow", "database", "event_call", "opaque",
+                })
             self.assertIsNone(command_effect(opcode, 999, 999))
+            self.assertIsNone(command_semantics(opcode, 999, 999))
 
     def test_auto_inventory_keeps_shapes_and_evidence_locations(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MANIFEST_SCHEMA = 6
+MANIFEST_SCHEMA = 7
 DEFAULT_EXTERNAL_FILE_LIMIT_KB = 128
 MAX_EXTERNAL_FILE_LIMIT_KB = 1_048_576
 SUSPICIOUS_IDENTIFIER_ACTIONS = {"ignore", "warn", "protect"}
@@ -75,7 +75,7 @@ class ImportProtectionRules:
     protect_paths_and_commands: bool = True
     allow_copy_condition_groups: bool = True
     protect_logic_references: bool = True
-    logic_unknown_policy: str = "block"
+    logic_unknown_policy: str = "warn"
     suspicious_identifiers: str = "warn"
 
 
@@ -248,7 +248,7 @@ class ProjectManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
         schema = data.get("schema")
-        if type(schema) is not int or schema not in (1, 2, 3, 4, 5, MANIFEST_SCHEMA):
+        if type(schema) is not int or schema not in (1, 2, 3, 4, 5, 6, MANIFEST_SCHEMA):
             raise ValueError(f"不支持的项目清单 schema: {schema}")
         fields = {
             "project_id",

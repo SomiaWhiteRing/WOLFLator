@@ -156,8 +156,11 @@ IMPORT_PROTECTION_REASON_LABELS = {
     "path_or_command": "路径或脚本命令",
     "logic_condition": "WOLF 条件字面量",
     "logic_value_change": "WOLF 条件真值变化",
+    "logic_derived_value": "WOLF 派生条件值保留",
     "logic_untracked": "WOLF 条件来源未追踪",
     "logic_blocking": "WOLF 条件来源阻断",
+    "logic_unresolved_scope": "WOLF 未知作用域自动保留",
+    "resource_reference": "WOLF 资源、标签或调用引用",
     "suspicious_identifier": "可疑标识符",
     "copy_mixed_scope_group": "COPY-FROM 条件/混合范围组",
 }
@@ -1336,7 +1339,7 @@ class MainWindow(QMainWindow):
         logic_policy_row.addWidget(QLabel("未知事件逻辑"))
         self.logic_unknown_policy = QComboBox()
         self.logic_unknown_policy.addItem("严格：阻止导入", "block")
-        self.logic_unknown_policy.addItem("宽松：警告后继续", "warn")
+        self.logic_unknown_policy.addItem("保守：保留风险原文后继续", "warn")
         self.logic_unknown_policy.currentIndexChanged.connect(
             self._save_import_protection
         )
@@ -1387,7 +1390,7 @@ class MainWindow(QMainWindow):
             protect_logic_references=self.protect_logic_references.isChecked(),
             allow_copy_condition_groups=self.allow_copy_condition_groups.isChecked(),
             logic_unknown_policy=str(
-                self.logic_unknown_policy.currentData() or "block"
+                self.logic_unknown_policy.currentData() or "warn"
             ),
             suspicious_identifiers=str(
                 self.suspicious_identifier_action.currentData() or "warn"
@@ -1454,7 +1457,7 @@ class MainWindow(QMainWindow):
                     )
             summary = report["summary"]
             logic_issue_label = (
-                "相关警告"
+                "自动保留范围"
                 if manifest.import_protection.logic_unknown_policy == "warn"
                 else "阻断问题"
             )
@@ -1464,6 +1467,7 @@ class MainWindow(QMainWindow):
                 f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
                 f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
                 f"{logic_issue_label} {summary.get('logic_blocking_relevant', 0)} 组，"
+                f"已证明可翻译 {len(report.get('safe_to_translate', []))} 组，"
                 f"未知语义 {summary.get('unknown_logic_semantics', 0)} 类，"
                 f"整体翻译 {summary['atomic_groups']} 组{suffix}"
             )

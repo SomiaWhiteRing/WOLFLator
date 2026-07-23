@@ -54,7 +54,7 @@ class PipelineTests(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "schema": 2,
+                    "schema": 3,
                     "dependencies": [],
                     "blocking_issues": [],
                     "unknown_commands": [],
@@ -64,6 +64,9 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
         pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_analysis"] = str(path)
+        pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"] = str(
+            pipeline.artifacts_dir / "editor-auto"
+        )
         return path
 
     def _translation_pipeline(self, root: Path) -> Pipeline:
@@ -75,6 +78,7 @@ class PipelineTests(unittest.TestCase):
             root / "cache",
             glossary_api_key="",
         )
+        make_game(pipeline.work_dir)
         items = [
             TranslationItem(key="plain", original="甲", code="COMMON-1"),
             TranslationItem(
@@ -151,6 +155,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(manifest.export_scope.external)
             self.assertTrue(manifest.exclude_large_external_files)
             self.assertEqual(128, manifest.external_file_limit_kb)
+            self.assertEqual("warn", manifest.import_protection.logic_unknown_policy)
 
     def test_filtered_export_uses_temporary_view_and_returns_workbook(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -391,24 +396,80 @@ class PipelineTests(unittest.TestCase):
             }
             scoped = root / "import-scoped.xlsx"
             scoped.write_bytes(b"xlsx")
-            translated = root / "translated-game"
             runner = mock.Mock()
-            runner.translate.return_value = translated
+            runner.translate.side_effect = lambda game_root, **_kwargs: make_game(
+                Path(game_root) / "Translated1_Chinese (Simplified)"
+            )
             runner.diagnostics = []
             runner.console_outputs = []
             stale_diagnostics = pipeline.artifacts_dir / "official-diagnostics.json"
             stale_diagnostics.parent.mkdir(parents=True, exist_ok=True)
             stale_diagnostics.write_text("stale", encoding="utf-8")
 
+            post_editor = mock.Mock(auto_dir=root / "post-auto", analysis_path=root / "post-analysis.json")
             with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
                 "pipeline.write_scoped_workbook", return_value=scoped
+            ), mock.patch("pipeline.export_and_analyze", return_value=post_editor), mock.patch(
+                "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
             ):
                 artifacts = pipeline._import()
 
             factory.assert_called_once_with(full_export_scope())
             runner.translate.assert_called_once()
-            self.assertEqual(str(translated), artifacts["translated_game"])
+            self.assertEqual(
+                str(pipeline.work_dir / "Translated1_Chinese (Simplified)"),
+                artifacts["translated_game"],
+            )
+            self.assertFalse(any(pipeline.artifacts_dir.glob(".import-game-*")))
             self.assertFalse(stale_diagnostics.exists())
+
+    def test_import_structure_failure_keeps_previous_translated_game(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pipeline = self._translation_pipeline(root)
+            items = [
+                TranslationItem(
+                    key="plain", original="甲", translation="译文", code="COMMON-1"
+                )
+            ]
+            items_path = dump_items(
+                pipeline.artifacts_dir / "items-translated.json", items
+            )
+            pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
+                "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
+                "items": str(items_path),
+            }
+            old = make_game(pipeline.work_dir / "Translated1_Chinese (Simplified)")
+            (old / "old.txt").write_text("keep", encoding="utf-8")
+            scoped = root / "import-scoped.xlsx"
+            scoped.write_bytes(b"xlsx")
+            runner = mock.Mock()
+            runner.translate.side_effect = lambda game_root, **_kwargs: make_game(
+                Path(game_root) / "Translated1_Chinese (Simplified)"
+            )
+            runner.diagnostics = []
+            runner.console_outputs = []
+            post_editor = mock.Mock(
+                auto_dir=root / "post-auto", analysis_path=root / "post-analysis.json"
+            )
+            with mock.patch.object(
+                pipeline, "_official_runner", return_value=runner
+            ), mock.patch(
+                "pipeline.write_scoped_workbook", return_value=scoped
+            ), mock.patch(
+                "pipeline.export_and_analyze", return_value=post_editor
+            ), mock.patch(
+                "pipeline.compare_auto_structure",
+                return_value={
+                    "status": "failed",
+                    "differences": [{"location": "event=1", "kind": "opcode"}],
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "已拒绝本次导入"):
+                    pipeline._import()
+
+            self.assertEqual("keep", (old / "old.txt").read_text(encoding="utf-8"))
+            self.assertFalse(any(pipeline.artifacts_dir.glob(".import-game-*")))
 
     def test_import_persists_official_warnings_and_console(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -423,7 +484,9 @@ class PipelineTests(unittest.TestCase):
             scoped = root / "import-scoped.xlsx"
             scoped.write_bytes(b"xlsx")
             runner = mock.Mock()
-            runner.translate.return_value = root / "translated-game"
+            runner.translate.side_effect = lambda game_root, **_kwargs: make_game(
+                Path(game_root) / "Translated1_Chinese (Simplified)"
+            )
             runner.diagnostics = [
                 {
                     "mode": "TRANSLATE",
@@ -436,8 +499,11 @@ class PipelineTests(unittest.TestCase):
                 {"mode": "TRANSLATE", "timeline": "earlier screen", "final": "raw screen"}
             ]
 
+            post_editor = mock.Mock(auto_dir=root / "post-auto", analysis_path=root / "post-analysis.json")
             with mock.patch.object(pipeline, "_official_runner", return_value=runner), mock.patch(
                 "pipeline.write_scoped_workbook", return_value=scoped
+            ), mock.patch("pipeline.export_and_analyze", return_value=post_editor), mock.patch(
+                "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
             ):
                 artifacts = pipeline._import()
 
@@ -466,7 +532,7 @@ class PipelineTests(unittest.TestCase):
             legacy.pop("import_protection")
             Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
             migrated = load_manifest(manifest_path)
-            self.assertEqual(6, migrated.schema)
+            self.assertEqual(7, migrated.schema)
             self.assertFalse(migrated.export_scope.external)
 
             schema_five = migrated.to_dict()

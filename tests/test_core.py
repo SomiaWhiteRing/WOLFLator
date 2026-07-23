@@ -81,6 +81,7 @@ from wolf_editor import (
     EditorInfo,
     _copy_editor_sandbox,
     analyze_auto_export,
+    compare_auto_structure,
     inspect_wolf_editor,
     install_supported_editor,
     latest_editor_release_from_html,
@@ -643,7 +644,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 2"):
+            with self.assertRaisesRegex(ValueError, "schema 3"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -670,7 +671,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 2,
+                "schema": 3,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -691,6 +692,32 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertIn("UDB-7-1-2", protected_codes)
             self.assertIn("COMMON-63-167-2", protected_codes)
             self.assertNotIn("DISPLAY-1", protected_codes)
+            resource_dependency = {
+                **dependency,
+                "kind": "resource",
+                "operator": "resource_reference",
+                "resource_role": "resource_path",
+                "condition_keys": [],
+                "source_keys": [by_code["COMMON-63-167-2"].key],
+                "unresolved_scopes": ["project"],
+            }
+            resource_report = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(),
+                {**analysis, "dependencies": [resource_dependency]},
+            )
+            self.assertIn(
+                by_code["COMMON-63-167-2"].key, resource_report["protected_keys"]
+            )
+            self.assertNotIn(by_code["DISPLAY-1"].key, resource_report["protected_keys"])
+            resource_entry = next(
+                entry
+                for entry in resource_report["entries"]
+                if entry["reason"] == "resource_reference"
+            )
+            self.assertEqual("resource_path", resource_entry["resource_role"])
             variable_side = {
                 **dependency,
                 "status": "untracked",
@@ -722,6 +749,29 @@ class WorkbookAndFontTests(unittest.TestCase):
                     {**analysis, "dependencies": [{**dependency, "operator": operator, "literal": literal}]},
                 )
                 self.assertIn(by_code["UDB-7-1-1"].key, trial["protected_keys"])
+            derived = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(),
+                {
+                    **analysis,
+                    "dependencies": [
+                        {
+                            **dependency,
+                            "source_keys": [by_code["UDB-7-1-1"].key],
+                            "literal": "永不命中",
+                            "left_values": ["前缀/戦_HPバー"],
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(
+                any(
+                    entry["reason"] == "logic_derived_value"
+                    for entry in derived["entries"]
+                )
+            )
             blocking_dependency = {
                 **dependency,
                 "status": "blocking",
@@ -732,9 +782,13 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "dependencies": [blocking_dependency],
                 "blocking_issues": [blocking_dependency],
             }
-            with self.assertRaisesRegex(RuntimeError, "宽松：警告后继续"):
+            with self.assertRaisesRegex(RuntimeError, "保守：保留风险原文后继续"):
                 analyze_import_protection(
-                    items, ImportScope(), game, ImportProtectionRules(), blocking_analysis
+                    items,
+                    ImportScope(),
+                    game,
+                    ImportProtectionRules(logic_unknown_policy="block"),
+                    blocking_analysis,
                 )
             permissive = analyze_import_protection(
                 items,
@@ -744,9 +798,10 @@ class WorkbookAndFontTests(unittest.TestCase):
                 blocking_analysis,
             )
             self.assertEqual(1, permissive["summary"]["logic_permissive_warnings"])
-            self.assertEqual(1, permissive["summary"]["logic_risk"])
+            self.assertEqual(0, permissive["summary"]["logic_risk"])
+            self.assertGreaterEqual(permissive["summary"]["logic_auto_preserved"], 1)
             self.assertTrue(
-                any(entry["reason"] == "logic_blocking" for entry in permissive["entries"])
+                any(entry["reason"] == "logic_unresolved_scope" for entry in permissive["entries"])
             )
             forced = analyze_import_protection(
                 items,
@@ -884,7 +939,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                         "EVENT_NUM=1",
                         "EVENT_ID=1",
                         "EVENT_NAME=Map event",
-                        "COMMAND_NUM=10",
+                        "COMMAND_NUM=11",
                         "WoditorEvCOMMAND_START",
                         '[179][1,0]<0>(2)()',
                         '[999][0,1]<1>()("未知,\\路径")',
@@ -894,6 +949,9 @@ class WorkbookAndFontTests(unittest.TestCase):
                         '[140][6,1]<1>(33554465,0,0,0,100,100)("\\cself[8]")',
                         '[150][11,1]<1>(0,1600033,0,2,1,1,255,1600031,1600032,100,0)("picture.png")',
                         '[212][0,1]<1>()("label")',
+                        # A familiar opcode with an uncalibrated shape must not
+                        # enter the specialized string-assignment transfer.
+                        '[122][1,0]<1>(1600099)()',
                         '[213][0,1]<1>()("END")',
                         '[498][0,0]<0>()()',
                         "WoditorEvCOMMAND_END",
@@ -968,7 +1026,10 @@ class WorkbookAndFontTests(unittest.TestCase):
             editor_path.write_bytes(b"editor")
             editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
             report = analyze_auto_export(auto, items, editor, input_hash="input")
-            self.assertEqual(2, report["schema"])
+            self.assertEqual(3, report["schema"])
+            self.assertIn("event_summaries", report)
+            self.assertIn("call_graph", report)
+            self.assertIn("translated_replay", report)
             dependency = next(
                 item for item in report["dependencies"] if item["literal"] == "HPバー"
             )
@@ -980,9 +1041,15 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertTrue(any("common=8 cmd=151" in entry for entry in dependency["trace"]))
             self.assertEqual(1, report["counts"]["map_maps"])
             self.assertEqual(
-                [(999, 1)],
+                [(122, 1), (999, 1)],
                 [(entry["opcode"], entry["count"]) for entry in report["unknown_commands"]],
             )
+            opaque = next(
+                item
+                for item in report["blocking_issues"]
+                if item.get("kind") == "opaque" and "opcode=122" in item["reason"]
+            )
+            self.assertEqual(["project"], opaque["unresolved_scopes"])
 
             common.write_text(common.read_text(encoding="utf-8").replace("任意类型", "English Type").replace("任意字段甲", "field_name"), encoding="utf-8")
             database = basic / "DataBase.Auto.txt"
@@ -1002,6 +1069,38 @@ class WorkbookAndFontTests(unittest.TestCase):
             common.write_text(common.read_text(encoding="utf-8").replace("COMMAND_NUM=22", "COMMAND_NUM=23", 1), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "COMMAND_NUM"):
                 analyze_auto_export(auto, items, editor, input_hash="input")
+
+    def test_editor_roundtrip_masks_only_approved_text_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before = root / "before" / "BasicData"
+            after = root / "after" / "BasicData"
+            before.mkdir(parents=True)
+            after.mkdir(parents=True)
+
+            def auto(text: str, opcode: int = 101) -> str:
+                return "\n".join((
+                    "[COMMON_EVENT_TEXT_OUTPUT]",
+                    "COMMON_EVENT_NUM=1",
+                    "COMMON_ID=1",
+                    "COMMON_NAME=Event",
+                    "COMMAND_NUM=1",
+                    "WoditorEvCOMMAND_START",
+                    f'[{opcode}][0,1]<0>()("{text}")',
+                    "WoditorEvCOMMAND_END",
+                ))
+
+            path_before = before / "CommonEvent.dat.Auto.txt"
+            path_after = after / "CommonEvent.dat.Auto.txt"
+            path_before.write_text(auto("原文"), encoding="utf-8")
+            path_after.write_text(auto("译文"), encoding="utf-8")
+            item = TranslationItem(key="display", original="原文", code="COMMON-1-0-0")
+            passed = compare_auto_structure(root / "before", root / "after", [item], {item.key})
+            self.assertEqual("passed", passed["status"])
+            path_after.write_text(auto("译文", opcode=106), encoding="utf-8")
+            failed = compare_auto_structure(root / "before", root / "after", [item], {item.key})
+            self.assertEqual("failed", failed["status"])
+            self.assertEqual("command_structure", failed["differences"][0]["kind"])
 
     def test_editor_version_and_sandbox_contract(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1524,6 +1524,7 @@ def analyze_import_protection(
         logic_analysis.get("blocking_issues", []) if isinstance(logic_analysis, dict) else []
     )
     relevant_logic_blocking: list[dict[str, object]] = []
+    unresolved_scope_entries: list[dict[str, object]] = []
 
     def add(
         item: TranslationItem,
@@ -1575,15 +1576,73 @@ def analyze_import_protection(
             if evidence:
                 add(item, "keep_original", "external_reference", evidence)
 
-    source_items = {source.key: source for source in source_by_item.values()}.values()
+    source_items = list({source.key: source for source in source_by_item.values()}.values())
+    common_items: dict[str, list[TranslationItem]] = {}
+    database_items: list[tuple[TranslationItem, tuple[str, str, str, str]]] = []
+    for item in source_items:
+        common_match = re.match(r"COMMON-(\d+)-", item.code, re.IGNORECASE)
+        if common_match:
+            common_items.setdefault(common_match.group(1), []).append(item)
+        database_match = re.fullmatch(
+            r"(UDB|CDB|SDB)-(\d+)-(\d+)-(\d+)", item.code, re.IGNORECASE
+        )
+        if database_match:
+            database_items.append((item, database_match.groups()))
+    scope_cache: dict[str, list[TranslationItem]] = {}
+
+    def items_for_scopes(scopes: list[object]) -> list[TranslationItem]:
+        selected: dict[str, TranslationItem] = {}
+        for raw_scope in scopes:
+            scope_name = str(raw_scope)
+            if scope_name in scope_cache:
+                candidates = scope_cache[scope_name]
+                for item in candidates:
+                    if item.key in requirements and item.translation:
+                        selected[item.key] = item
+                continue
+            if scope_name == "project":
+                candidates = source_items
+            elif scope_name == "common:*":
+                candidates = [item for values in common_items.values() for item in values]
+            elif scope_name.startswith("common:"):
+                event_id = scope_name.split(":", 1)[1]
+                candidates = common_items.get(event_id, [])
+            elif scope_name.startswith("map:"):
+                _, map_id, event_id, page = scope_name.split(":", 3)
+                prefix = f"MAP-{map_id}-EV{int(event_id):03d}-PAGE{page}-"
+                candidates = [
+                    item for item in source_items if item.code.upper().startswith(prefix)
+                ]
+            elif scope_name.startswith("database:"):
+                parts = scope_name.split(":")
+                if len(parts) != 5:
+                    candidates = source_items
+                else:
+                    _, database, type_id, data_id, field_id = parts
+                    candidates = [
+                        item
+                        for item, coordinate in database_items
+                        if coordinate[0].upper() == database.upper()
+                        and (type_id == "*" or coordinate[1] == type_id)
+                        and (data_id == "*" or coordinate[2] == data_id)
+                        and (field_id == "*" or coordinate[3] == field_id)
+                    ]
+            else:
+                candidates = source_items
+            candidates = list(candidates)
+            scope_cache[scope_name] = candidates
+            for item in candidates:
+                if item.key in requirements and item.translation:
+                    selected[item.key] = item
+        return list(selected.values())
     if rules.protect_paths_and_commands:
         for item in source_items:
             if _looks_like_path_or_command(item):
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 2:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 2 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 3:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 3 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
@@ -1594,16 +1653,23 @@ def analyze_import_protection(
             if not isinstance(dependency, dict):
                 raise ValueError("Editor 分析报告的条件依赖格式错误。")
             operator = str(dependency.get("operator", ""))
+            dependency_kind = str(dependency.get("kind", "condition"))
             literal = str(dependency.get("literal", ""))
             source_keys = dependency.get("source_keys", [])
             right_source_keys = dependency.get("right_source_keys", [])
             condition_keys = dependency.get("condition_keys", [])
             cells = dependency.get("database_cells", [])
+            scopes = dependency.get("unresolved_scopes", [])
+            left_values = dependency.get("left_values", [])
+            right_values = dependency.get("right_values", [])
             if (
                 not isinstance(source_keys, list)
                 or not isinstance(right_source_keys, list)
                 or not isinstance(condition_keys, list)
                 or not isinstance(cells, list)
+                or not isinstance(scopes, list)
+                or not isinstance(left_values, list)
+                or not isinstance(right_values, list)
             ):
                 raise ValueError("Editor 分析报告的条件来源格式错误。")
             coordinates = ", ".join(
@@ -1618,6 +1684,7 @@ def analyze_import_protection(
                 + (f" <- {coordinates}" if coordinates else "")
             )
             details = {
+                "dependency_kind": dependency_kind,
                 "auto_file": dependency.get("auto_file", ""),
                 "event_type": dependency.get("event_type", ""),
                 "event_id": dependency.get("event_id", -1),
@@ -1628,8 +1695,26 @@ def analyze_import_protection(
                 "literal": literal,
                 "database_cells": cells,
                 "right_database_cells": dependency.get("right_database_cells", []),
+                "left_values": left_values,
+                "right_values": right_values,
                 "dependency_status": dependency.get("status", ""),
+                "unresolved_scopes": scopes,
+                "resource_role": dependency.get("resource_role", ""),
             }
+            if dependency_kind == "resource":
+                resource_items = [
+                    by_key[str(key)] for key in source_keys if str(key) in by_key
+                ]
+                if dependency.get("status") == "blocking":
+                    resource_items.extend(items_for_scopes(scopes or ["project"]))
+                for item in resource_items:
+                    add(item, "keep_original", "resource_reference", evidence, details)
+                if dependency.get("status") == "blocking" and resource_items:
+                    relevant_blocking.append(dependency)
+                    unresolved_scope_entries.append(
+                        {"scopes": scopes or ["project"], "reason": dependency.get("reason", ""), "evidence": evidence}
+                    )
+                continue
             for key in condition_keys:
                 item = by_key.get(str(key))
                 if item:
@@ -1657,15 +1742,40 @@ def analyze_import_protection(
                 right_candidates[source.key] = item
                 if source.key in requirements and source.translation:
                     relevant_right_sources.append(item)
-            if dependency.get("status") == "blocking" and (relevant_sources or relevant_right_sources):
+            scoped_sources = items_for_scopes(scopes)
+            if dependency.get("status") == "blocking" and (
+                relevant_sources or relevant_right_sources or scoped_sources
+            ):
                 relevant_blocking.append(dependency)
-                for item in [*relevant_sources, *relevant_right_sources]:
-                    add(item, "warn", "logic_blocking", evidence, details)
+                unresolved_scope_entries.append(
+                    {"scopes": scopes or ["project"], "reason": dependency.get("reason", ""), "evidence": evidence}
+                )
+                if rules.logic_unknown_policy == "warn":
+                    affected = [*relevant_sources, *relevant_right_sources, *scoped_sources]
+                    if not affected:
+                        affected = items_for_scopes(["project"])
+                    for item in affected:
+                        add(item, "keep_original", "logic_unresolved_scope", evidence, details)
                 continue
             if dependency.get("status") == "untracked" and dependency.get("right_is_variable"):
                 for item in [*relevant_sources, *relevant_right_sources]:
                     add(item, "keep_original", "logic_untracked_source", evidence, details)
             if dependency.get("status") != "resolved":
+                continue
+            left_originals = {
+                source_by_item[item.key].original for item in source_candidates.values()
+            }
+            right_originals = {
+                source_by_item[item.key].original for item in right_candidates.values()
+            }
+            derived_left = bool(left_values) and set(map(str, left_values)) != left_originals
+            derived_right = bool(right_values) and set(map(str, right_values)) != right_originals
+            if derived_left or derived_right:
+                for item in (
+                    ([*relevant_sources] if derived_left else [])
+                    + ([*relevant_right_sources] if derived_right else [])
+                ):
+                    add(item, "keep_original", "logic_derived_value", evidence, details)
                 continue
             if right_source_keys:
                 # ponytail: Auto dependencies are small in practice; if a project
@@ -1710,7 +1820,7 @@ def analyze_import_protection(
                 "WOLF 事件逻辑依赖在分析途中失去可证明来源，已阻止导入："
                 f"{first.get('auto_file', '')} event={first.get('event_id', '')} "
                 f"page={first.get('page', '')} command={first.get('command', '')}，"
-                f"{first.get('reason', '')}。可改用“宽松：警告后继续”或关闭逻辑保护。"
+                f"{first.get('reason', '')}。可改用“保守：保留风险原文后继续”或关闭逻辑保护。"
             )
 
     if rules.suspicious_identifiers != "ignore":
@@ -1722,8 +1832,21 @@ def analyze_import_protection(
     action_order = {"keep_original": 0, "warn": 1, "atomic_translate": 2}
     entries.sort(key=lambda entry: (action_order[entry["action"]], entry["code"], entry["original"]))
     return {
-        "schema": 3,
+        "schema": 4,
         "protected_keys": sorted(protected),
+        "safe_to_translate": sorted(set(requirements) - protected),
+        "keep_original": sorted(protected),
+        "unresolved_scopes": unresolved_scope_entries,
+        "translated_replay": {
+            "iterations": 1,
+            "candidate_changes": sum(
+                bool(item.translation) for item in source_items if item.key in requirements
+            ),
+            "safe_changes": len(set(requirements) - protected),
+            "protected_changes": len(protected),
+            "control_flow_equivalent": not bool(relevant_logic_blocking) or rules.logic_unknown_policy == "warn",
+        },
+        "structural_diff": {"status": "pending_official_roundtrip"},
         "entries": entries,
         "summary": {
             "protected": len(protected),
@@ -1748,11 +1871,17 @@ def analyze_import_protection(
                 if rules.protect_logic_references and rules.logic_unknown_policy == "warn"
                 else 0
             ),
+            "logic_auto_preserved": (
+                len({
+                    entry["key"] for entry in entries
+                    if entry["reason"] == "logic_unresolved_scope"
+                })
+                if rules.protect_logic_references and rules.logic_unknown_policy == "warn"
+                else 0
+            ),
             "logic_risk": (
                 len(logic_blocking)
                 if not rules.protect_logic_references
-                else len(relevant_logic_blocking)
-                if rules.logic_unknown_policy == "warn"
                 else 0
             ),
             "unknown_logic_semantics": len(
