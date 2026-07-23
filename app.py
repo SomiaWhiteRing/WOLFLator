@@ -88,6 +88,7 @@ from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
 from wolf_editor import (
     EDITOR_DOWNLOAD_URL,
+    analyze_translation_safety,
     inspect_wolf_editor,
     install_supported_editor,
 )
@@ -96,6 +97,7 @@ from wolf_tools import (
     final_display_texts,
     load_items,
     read_font_slots,
+    selected_translation_requirements,
 )
 
 
@@ -160,6 +162,8 @@ IMPORT_PROTECTION_REASON_LABELS = {
     "logic_untracked": "WOLF 条件来源未追踪",
     "logic_blocking": "WOLF 条件来源阻断",
     "logic_unresolved_scope": "WOLF 未知作用域自动保留",
+    "logic_state_write": "WOLF 跨事件状态写入",
+    "not_proven_safe": "未获得静态安全证明",
     "resource_reference": "WOLF 资源、标签或调用引用",
     "suspicious_identifier": "可疑标识符",
     "copy_mixed_scope_group": "COPY-FROM 条件/混合范围组",
@@ -174,6 +178,31 @@ def _load_editor_analysis(manifest) -> dict[str, object] | None:
     if not isinstance(value, dict):
         raise ValueError("Editor 分析报告根节点不是对象。")
     return value
+
+
+def _translation_safety_for_manifest(
+    manifest, items, *, policy: str | None = None
+) -> dict[str, object]:
+    analysis = _load_editor_analysis(manifest)
+    if analysis is None:
+        raise RuntimeError("缺少 Editor 分析报告，请重新执行导出文本。")
+    rules = manifest.import_protection
+    required = selected_translation_requirements(
+        items,
+        manifest.import_scope,
+        allow_copy_condition_groups=rules.allow_copy_condition_groups,
+    )
+    return analyze_translation_safety(
+        manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"],
+        items,
+        {
+            item.key: item.translation
+            for item in items
+            if item.key in required and item.translation
+        },
+        policy or rules.logic_unknown_policy,
+        analysis=analysis,
+    )
 
 
 class PipelineThread(QThread):
@@ -329,6 +358,9 @@ class FontScanThread(QThread):
                 game_root,
                 manifest.import_protection,
                 _load_editor_analysis(manifest),
+                logic_safety=_translation_safety_for_manifest(
+                    manifest, items, policy="warn"
+                ),
             )
             required = required_characters(
                 final_display_texts(
@@ -1430,11 +1462,14 @@ class MainWindow(QMainWindow):
             if not game_root.is_dir():
                 game_root = version_dir / "source"
             report = analyze_import_protection(
-                load_items(items_path),
+                (items := load_items(items_path)),
                 manifest.import_scope,
                 game_root,
                 manifest.import_protection,
                 _load_editor_analysis(manifest),
+                logic_safety=_translation_safety_for_manifest(
+                    manifest, items, policy="warn"
+                ),
                 block_on_logic_issue=False,
             )
             entries = report["entries"]
@@ -1466,6 +1501,8 @@ class MainWindow(QMainWindow):
                 f"保留 {summary['protected']} 组，警告 {summary['warnings']} 组，"
                 f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
                 f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
+                f"正向证明 {summary.get('logic_proven_safe', 0)} 组，"
+                f"未证明 {summary.get('logic_not_proven', 0)} 组，"
                 f"{logic_issue_label} {summary.get('logic_blocking_relevant', 0)} 组，"
                 f"已证明可翻译 {len(report.get('safe_to_translate', []))} 组，"
                 f"未知语义 {summary.get('unknown_logic_semantics', 0)} 类，"

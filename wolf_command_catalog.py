@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-CATALOG_SCHEMA = 3
+CATALOG_SCHEMA = 4
 VERIFIED_EDITOR_VERSION = "3.713.2026.718"
 VERIFIED_EDITOR_SHA256 = "2ce5639f669643ded07a9390ef05054b8f95acbfa1b4dc1f4936246df5eae0c3"
 
@@ -51,7 +51,7 @@ COMMAND_CATALOG: dict[int, tuple[str, str, str]] = {
     173: ("EraseEvent", "control_flow", "roundtrip"),
     174: ("ReturnToTitle", "control_flow", "roundtrip"),
     175: ("EndGame", "control_flow", "roundtrip"),
-    176: ("StartLoop2", "control_flow", "roundtrip"),
+    176: ("ContinueLoop", "control_flow", "roundtrip"),
     177: ("StopNonPic", "no_write", "manual"),
     178: ("ResumeNonPic", "no_write", "manual"),
     179: ("LoopTimes", "control_flow", "roundtrip"),
@@ -178,6 +178,72 @@ _TRANSFER_BY_EFFECT = {
     "opaque": "opaque",
 }
 
+
+def _roles(count: int, *names: str) -> list[str]:
+    if count <= len(names):
+        return list(names[:count])
+    tail = names[-1] if names else "unused"
+    return [*names, *([tail] * (count - len(names)))]
+
+
+def _integer_roles(opcode: int, int_count: int, effect: str) -> list[str]:
+    if opcode == 111:
+        return _roles(int_count, "condition_count", "left_operand", "right_operand", "condition_flags")
+    if opcode == 112:
+        return ["condition_count", *("string_condition" for _ in range(max(0, int_count - 1)))]
+    if opcode == 121:
+        return _roles(int_count, "destination_variable", "left_operand", "right_operand", "assignment_flags", "extra_operand")
+    if opcode == 122:
+        return _roles(int_count, "destination_string", "assignment_flags", "source_string_or_constant", "auxiliary_operand")
+    if opcode in {123, 124, 221}:
+        return _roles(int_count, "destination_variable", "runtime_category", "runtime_selector", "runtime_field")
+    if opcode in {170, 176, 179}:
+        return _roles(int_count, "loop_count_or_flags")
+    if opcode in {210, 300}:
+        return _roles(
+            int_count,
+            "common_event_target",
+            "call_flags",
+            "entry_selector",
+            "numeric_argument",
+            "numeric_argument",
+            "numeric_argument",
+            "string_argument",
+            "string_argument",
+            "return_target",
+        )
+    if opcode == 211:
+        return _roles(int_count, "reserved_common_event_target", "call_flags")
+    if opcode in {212, 213}:
+        return []
+    if opcode == 250:
+        return _roles(
+            int_count,
+            "database_type_selector",
+            "database_data_selector",
+            "database_field_selector",
+            "database_flags",
+            "destination_variable",
+        )
+    if opcode == 251:
+        return _roles(
+            int_count,
+            "database_type_selector",
+            "csv_mode",
+            "csv_data_selector",
+            "csv_field_selector",
+            "csv_flags",
+        )
+    if effect == "numeric_write":
+        return _roles(int_count, "destination_variable", "numeric_operand", "numeric_operand", "numeric_flags")
+    if effect == "event_call":
+        return _roles(int_count, "event_target", "call_flags", "call_argument")
+    if effect == "database":
+        return _roles(int_count, "database_selector", "database_selector", "database_selector", "database_flags", "destination_variable")
+    if effect == "control_flow":
+        return _roles(int_count, "control_flow_operand")
+    return _roles(int_count, "constant_or_resource_selector")
+
 # Paths are documentation for the frozen 3.713 free-edition UI. They are not
 # used to drive the Editor: the calibration driver pastes official event-code
 # records and asks the Editor to normalize them itself.
@@ -269,11 +335,12 @@ def command_semantics(
         "shape": [int_count, string_count],
         "effect": effect,
         "transfer": _TRANSFER_BY_EFFECT[effect],
-        "integer_roles": ["encoded_parameter"] * int_count,
+        "integer_roles": _integer_roles(opcode, int_count, effect),
         "string_roles": [
             roles[min(index, len(roles) - 1)] if roles else "display_or_metadata"
             for index in range(string_count)
         ],
+        "semantic_complete": True,
         "reads_variables": effect in {"numeric_write", "string_read", "string_write", "condition", "database", "event_call"},
         "writes_variables": effect in {"numeric_write", "string_write", "database", "event_call"},
         "evidence": item[2],

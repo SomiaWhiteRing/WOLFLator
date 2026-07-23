@@ -1500,6 +1500,7 @@ def analyze_import_protection(
     rules: ImportProtectionRules,
     logic_analysis: dict[str, object] | None = None,
     *,
+    logic_safety: dict[str, object] | None = None,
     block_on_logic_issue: bool | None = None,
 ) -> dict[str, object]:
     requirements = selected_translation_requirements(
@@ -1525,6 +1526,18 @@ def analyze_import_protection(
     )
     relevant_logic_blocking: list[dict[str, object]] = []
     unresolved_scope_entries: list[dict[str, object]] = []
+    proven_safe: set[str] = set()
+    if logic_safety is not None:
+        if logic_safety.get("schema") != 1:
+            raise ValueError("WOLF 候选译文安全报告格式错误。")
+        safe_values = logic_safety.get("safe_to_translate")
+        if not isinstance(safe_values, list):
+            raise ValueError("WOLF 候选译文安全报告缺少批准键集合。")
+        proven_safe = {str(value) for value in safe_values}
+    elif isinstance(logic_analysis, dict):
+        safe_values = logic_analysis.get("safe_to_translate", [])
+        if isinstance(safe_values, list):
+            proven_safe = {str(value) for value in safe_values}
 
     def add(
         item: TranslationItem,
@@ -1641,8 +1654,8 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 3:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 3 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 4:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 4 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
@@ -1701,6 +1714,17 @@ def analyze_import_protection(
                 "unresolved_scopes": scopes,
                 "resource_role": dependency.get("resource_role", ""),
             }
+            if dependency_kind in {"display", "flow"}:
+                continue
+            if dependency_kind == "state":
+                state_items = [
+                    by_key[str(key)] for key in source_keys if str(key) in by_key
+                ]
+                if dependency.get("status") != "resolved":
+                    state_items.extend(items_for_scopes(scopes))
+                for item in state_items:
+                    add(item, "keep_original", "logic_state_write", evidence, details)
+                continue
             if dependency_kind == "resource":
                 resource_items = [
                     by_key[str(key)] for key in source_keys if str(key) in by_key
@@ -1823,6 +1847,20 @@ def analyze_import_protection(
                 f"{first.get('reason', '')}。可改用“保守：保留风险原文后继续”或关闭逻辑保护。"
             )
 
+    for item in source_items:
+        if (
+            item.key in requirements
+            and item.translation
+            and item.key not in proven_safe
+            and item.key not in protected
+        ):
+            add(
+                item,
+                "keep_original",
+                "not_proven_safe",
+                "该文本没有显示用途证明或候选译文语义等价证明。",
+            )
+
     if rules.suspicious_identifiers != "ignore":
         action = "keep_original" if rules.suspicious_identifiers == "protect" else "warn"
         for item in source_items:
@@ -1832,20 +1870,22 @@ def analyze_import_protection(
     action_order = {"keep_original": 0, "warn": 1, "atomic_translate": 2}
     entries.sort(key=lambda entry: (action_order[entry["action"]], entry["code"], entry["original"]))
     return {
-        "schema": 4,
+        "schema": 5,
         "protected_keys": sorted(protected),
-        "safe_to_translate": sorted(set(requirements) - protected),
+        "safe_to_translate": sorted((set(requirements) & proven_safe) - protected),
         "keep_original": sorted(protected),
         "unresolved_scopes": unresolved_scope_entries,
-        "translated_replay": {
-            "iterations": 1,
-            "candidate_changes": sum(
-                bool(item.translation) for item in source_items if item.key in requirements
-            ),
-            "safe_changes": len(set(requirements) - protected),
-            "protected_changes": len(protected),
-            "control_flow_equivalent": not bool(relevant_logic_blocking) or rules.logic_unknown_policy == "warn",
-        },
+        "translated_replay": (
+            dict(logic_safety.get("replay", {}))
+            if isinstance(logic_safety, dict)
+            else {
+                "iterations": 0,
+                "candidate_changes": 0,
+                "safe_changes": 0,
+                "protected_changes": 0,
+                "control_flow_equivalent": False,
+            }
+        ),
         "structural_diff": {"status": "pending_official_roundtrip"},
         "entries": entries,
         "summary": {
@@ -1878,6 +1918,10 @@ def analyze_import_protection(
                 })
                 if rules.protect_logic_references and rules.logic_unknown_policy == "warn"
                 else 0
+            ),
+            "logic_proven_safe": len((set(requirements) & proven_safe) - protected),
+            "logic_not_proven": sum(
+                entry["reason"] == "not_proven_safe" for entry in entries
             ),
             "logic_risk": (
                 len(logic_blocking)

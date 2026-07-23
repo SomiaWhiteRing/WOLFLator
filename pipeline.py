@@ -59,6 +59,7 @@ from safe_io import (
 )
 from wolf_editor import (
     AUTO_ANALYSIS_SCHEMA,
+    analyze_translation_safety,
     compare_auto_structure,
     export_and_analyze,
     inspect_wolf_editor,
@@ -674,6 +675,28 @@ class Pipeline:
             raise ValueError("Editor 分析报告根节点不是对象。")
         return value
 
+    def _translation_safety(self, items) -> dict[str, object]:
+        rules = self.manifest.import_protection
+        required = selected_translation_requirements(
+            items,
+            self.manifest.import_scope,
+            allow_copy_condition_groups=rules.allow_copy_condition_groups,
+        )
+        analysis = self._editor_analysis()
+        if analysis is None:
+            raise RuntimeError("缺少 Editor 分析报告，请重新执行导出文本。")
+        return analyze_translation_safety(
+            self.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"],
+            items,
+            {
+                item.key: item.translation
+                for item in items
+                if item.key in required and item.translation
+            },
+            rules.logic_unknown_policy,
+            analysis=analysis,
+        )
+
     def _official_runner(self, scope: ImportScope) -> OfficialToolRunner:
         executable = prepare_official_tool(
             self.settings.wolf_tool_path,
@@ -1085,12 +1108,15 @@ class Pipeline:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
         items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
         rules = self.manifest.import_protection
+        logic_analysis = self._editor_analysis()
+        logic_safety = self._translation_safety(items)
         protection = analyze_import_protection(
             items,
             self.manifest.import_scope,
             self.work_dir,
             rules,
-            self._editor_analysis(),
+            logic_analysis,
+            logic_safety=logic_safety,
         )
         protected_keys = set(protection["protected_keys"])
         required = selected_translation_requirements(
@@ -1117,7 +1143,7 @@ class Pipeline:
         summary = protection["summary"]
         auto_preserved = int(summary.get("logic_auto_preserved", 0))
         if auto_preserved:
-            self.warning(
+            self.log(
                 f"保守逻辑策略已自动保留 {auto_preserved} 条无法证明安全的原文；"
                 "详情已写入导入保护报告。"
             )
@@ -1126,6 +1152,8 @@ class Pipeline:
             f"提示 {summary['warnings']} 组可疑标识符，"
             f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
             f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
+            f"正向证明 {summary.get('logic_proven_safe', 0)} 组，"
+            f"未证明 {summary.get('logic_not_proven', 0)} 组，"
             f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
             f"放行 {summary['atomic_groups']} 个 COPY-FROM 条件/混合范围组。"
         )
@@ -1372,6 +1400,7 @@ class Pipeline:
             self.work_dir,
             self.manifest.import_protection,
             self._editor_analysis(),
+            logic_safety=self._translation_safety(validated_items),
         )
         required = required_characters(
             final_display_texts(

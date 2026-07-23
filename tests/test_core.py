@@ -81,6 +81,7 @@ from wolf_editor import (
     EditorInfo,
     _copy_editor_sandbox,
     analyze_auto_export,
+    analyze_translation_safety,
     compare_auto_structure,
     inspect_wolf_editor,
     install_supported_editor,
@@ -601,7 +602,12 @@ class WorkbookAndFontTests(unittest.TestCase):
                 if entry["action"] == "keep_original"
             }
             self.assertEqual(
-                {"UDB-35-92-0", "UDB-35-93-0"},
+                {
+                    "COMMON-63-167-2",
+                    "DISPLAY-1",
+                    "UDB-35-92-0",
+                    "UDB-35-93-0",
+                },
                 protected_codes,
             )
 
@@ -616,10 +622,10 @@ class WorkbookAndFontTests(unittest.TestCase):
                 protected_keys=set(report["protected_keys"]),
             )
             output = load_workbook(scoped).active
-            self.assertEqual("HP条", output["G2"].value)
+            self.assertIsNone(output["G2"].value)
             self.assertIsNone(output["G3"].value)
             self.assertIsNone(output["G4"].value)
-            self.assertEqual("正常显示", output["G5"].value)
+            self.assertIsNone(output["G5"].value)
 
     def test_import_protection_uses_editor_logic_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -644,7 +650,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 3"):
+            with self.assertRaisesRegex(ValueError, "schema 4"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -671,10 +677,11 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 3,
+                "schema": 4,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
+                "safe_to_translate": [by_code["DISPLAY-1"].key],
             }
             report = analyze_import_protection(
                 items,
@@ -1026,10 +1033,10 @@ class WorkbookAndFontTests(unittest.TestCase):
             editor_path.write_bytes(b"editor")
             editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
             report = analyze_auto_export(auto, items, editor, input_hash="input")
-            self.assertEqual(3, report["schema"])
+            self.assertEqual(4, report["schema"])
             self.assertIn("event_summaries", report)
             self.assertIn("call_graph", report)
-            self.assertIn("translated_replay", report)
+            self.assertNotIn("translated_replay", report)
             dependency = next(
                 item for item in report["dependencies"] if item["literal"] == "HPバー"
             )
@@ -1069,6 +1076,160 @@ class WorkbookAndFontTests(unittest.TestCase):
             common.write_text(common.read_text(encoding="utf-8").replace("COMMAND_NUM=22", "COMMAND_NUM=23", 1), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "COMMAND_NUM"):
                 analyze_auto_export(auto, items, editor, input_hash="input")
+
+    def test_translation_safety_requires_positive_display_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Safety",
+                        "COMMAND_NUM=8",
+                        "WoditorEvCOMMAND_START",
+                        '[101][0,1]<0>()("表示文本")',
+                        '[122][2,1]<0>(1600005,0)("HP")',
+                        '[112][2,1]<0>(1,1600005)("HP")',
+                        '[122][2,1]<0>(1600006,0)("操作レバー")',
+                        '[150][11,1]<0>(32,0,0,0,0,0,0,0,0,0,0)("\\cself[6]")',
+                        '[122][2,1]<0>(1600007,0)("Picture/file.png")',
+                        '[150][11,1]<0>(0,0,0,0,0,0,0,0,0,0,0)("\\cself[7]")',
+                        '[122][2,1]<0>(2000000,0)("全局文本")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            items = [
+                TranslationItem(
+                    key="display",
+                    original="表示文本",
+                    translation="显示文本",
+                    code="COMMON-1-0-0",
+                ),
+                TranslationItem(
+                    key="logic_source",
+                    original="HP",
+                    translation="生命",
+                    code="COMMON-1-1-0",
+                ),
+                TranslationItem(
+                    key="logic_literal",
+                    original="HP",
+                    translation="生命",
+                    code="COMMON-1-2-0",
+                ),
+                TranslationItem(
+                    key="unmapped",
+                    original="系统参数",
+                    translation="系统参数译文",
+                    code="UDB-9-9-9",
+                ),
+                TranslationItem(
+                    key="picture_text",
+                    original="操作レバー",
+                    translation="操作杆",
+                    code="COMMON-1-3-0",
+                ),
+                TranslationItem(
+                    key="picture_file",
+                    original="Picture/file.png",
+                    translation="Picture/translated.png",
+                    code="COMMON-1-5-0",
+                ),
+                TranslationItem(
+                    key="dynamic_safe",
+                    original="装填レバー",
+                    translation="装填杆",
+                    code="UDB-7-0-0",
+                ),
+                TranslationItem(
+                    key="dynamic_unsafe",
+                    original="戦_HPバー",
+                    translation="战斗_HP槽",
+                    code="UDB-7-1-0",
+                ),
+                TranslationItem(
+                    key="global_state",
+                    original="全局文本",
+                    translation="全局译文",
+                    code="COMMON-1-7-0",
+                ),
+            ]
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            editor = EditorInfo(
+                editor_path,
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            analysis = analyze_auto_export(
+                root / "Auto", items, editor, input_hash="input"
+            )
+            analysis["usage_by_key"].update({
+                "dynamic_safe": ["display_only", "logic"],
+                "dynamic_unsafe": ["display_only", "logic"],
+            })
+            dynamic_dependency = {
+                "kind": "condition",
+                "condition_keys": [],
+                "source_keys": [],
+                "right_source_keys": [],
+                "source_scopes": ["database:UDB:7:*:0"],
+                "right_source_scopes": [],
+                "unresolved_scopes": ["database:UDB:7:*:0"],
+                "right_is_variable": False,
+                "left_values": [],
+                "right_values": [],
+                "status": "dynamic",
+                "reason": "数据库字符串来源集合超过 256 项",
+            }
+            analysis["dependencies"].extend((
+                {**dynamic_dependency, "operator": "not_equals", "literal": ""},
+                {**dynamic_dependency, "operator": "contains", "literal": "HPバー"},
+            ))
+            safety = analyze_translation_safety(
+                root / "Auto",
+                items,
+                {item.key: item.translation for item in items},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual(
+                ["display", "dynamic_safe", "picture_text"],
+                safety["safe_to_translate"],
+            )
+            self.assertEqual(
+                {
+                    "dynamic_unsafe",
+                    "global_state",
+                    "logic_literal",
+                    "logic_source",
+                    "picture_file",
+                    "unmapped",
+                },
+                set(safety["keep_original"]),
+            )
+            self.assertEqual(2, safety["replay"]["iterations"])
+            self.assertTrue(safety["replay"]["control_flow_equivalent"])
+            protection = analyze_import_protection(
+                items,
+                ImportScope(),
+                root,
+                ImportProtectionRules(),
+                analysis,
+                logic_safety=safety,
+            )
+            self.assertEqual(5, protection["schema"])
+            self.assertEqual(
+                ["display", "dynamic_safe", "picture_text"],
+                protection["safe_to_translate"],
+            )
 
     def test_editor_roundtrip_masks_only_approved_text_slots(self):
         with tempfile.TemporaryDirectory() as directory:

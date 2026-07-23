@@ -18,7 +18,7 @@ from models import (
     TranslationItem,
 )
 from pipeline import Pipeline, create_project, load_manifest
-from wolf_tools import dump_items, full_export_scope, load_items
+from wolf_tools import dump_items, full_export_scope, hash_directory, load_items
 
 
 def make_game(root: Path) -> Path:
@@ -51,22 +51,30 @@ class PipelineTests(unittest.TestCase):
     def _attach_editor_analysis(self, pipeline: Pipeline) -> Path:
         path = pipeline.artifacts_dir / "editor-analysis.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        auto_dir = pipeline.artifacts_dir / "editor-auto"
+        auto_dir.mkdir(parents=True, exist_ok=True)
+        (auto_dir / "fixture.txt").write_text("fixture", encoding="utf-8")
         path.write_text(
             json.dumps(
                 {
-                    "schema": 3,
+                    "schema": 4,
+                    "output_hash": hash_directory(auto_dir),
                     "dependencies": [],
                     "blocking_issues": [],
                     "unknown_commands": [],
+                    "usage_by_key": {
+                        "plain": ["display_only"],
+                        "control": ["display_only"],
+                        "text": ["display_only"],
+                    },
+                    "safe_to_translate": ["plain", "control", "text"],
                 },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
         pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_analysis"] = str(path)
-        pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"] = str(
-            pipeline.artifacts_dir / "editor-auto"
-        )
+        pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"] = str(auto_dir)
         return path
 
     def _translation_pipeline(self, root: Path) -> Pipeline:

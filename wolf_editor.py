@@ -34,10 +34,16 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 3
+AUTO_ANALYSIS_SCHEMA = 4
 _VALUE_LIMIT = 256
 _LOOP_LIMIT = 64
 _CALL_DEPTH_LIMIT = 64
+_CFG_IMPLEMENTED_OPCODES = frozenset(
+    {
+        0, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
+        212, 213, 401, 402, 420, 421, 498, 499,
+    }
+)
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
@@ -49,6 +55,7 @@ _COMMAND_RE = re.compile(
 )
 _WORKBOOK_DB_CODE_RE = re.compile(r"^(?P<database>UDB|CDB|SDB)-(?P<type>\d+)-(?P<data>\d+)-(?P<field>\d+)$", re.IGNORECASE)
 _CSELF_REFERENCE_RE = re.compile(r"\\cself\[(\d+)]", re.IGNORECASE)
+_STRING_REFERENCE_RE = re.compile(r"\\s\[(\d+)]", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -185,6 +192,28 @@ class _AnalysisState:
             self.unknown_scopes,
             self.unknown_reasons,
         )
+
+
+@dataclass(frozen=True)
+class _CallSummary:
+    fell_through: bool
+    exits: tuple[_AnalysisState, ...]
+    summary_failed: str
+    dependencies: tuple[dict[str, object], ...]
+    blocking: tuple[dict[str, object], ...]
+    unknown: Counter
+    unknown_locations: tuple[tuple[tuple[int, str], tuple[str, ...]], ...]
+
+
+_CallCache = dict[tuple[object, ...], _CallSummary]
+
+
+class _BreakLoop(Exception):
+    pass
+
+
+class _ContinueLoop(Exception):
+    pass
 
 
 class _LinkParser(HTMLParser):
@@ -877,6 +906,38 @@ def _with_literals(
     )
 
 
+def _string_value_status(value: _StringValue) -> tuple[str, str]:
+    if not value.unknown and not value.symbolic_all:
+        return "resolved", ""
+    opaque_prefixes = (
+        "来源经过未支持命令",
+        "来源经过未解释的公共事件调用",
+        "未支持的 122",
+    )
+    if value.unknown.startswith(opaque_prefixes):
+        return "blocking", value.unknown
+    return (
+        "dynamic",
+        value.unknown or "字符串来源已扩大为可定位的运行时符号范围",
+    )
+
+
+def _command_string_roles(
+    command: _Command, semantics: dict[str, object] | None
+) -> list[str]:
+    roles = list(semantics.get("string_roles", [])) if semantics else []
+    if command.opcode == 150 and command.strings:
+        if not roles:
+            roles = ["resource_path"]
+        # Editor 3.713 stores the Picture content kind in the low byte.
+        roles[0] = (
+            "display_text"
+            if command.ints and command.ints[0] & 0xFF == 0x20
+            else "resource_path"
+        )
+    return roles
+
+
 def _concat_literals(
     left: frozenset[str] | None, right: frozenset[str] | None
 ) -> frozenset[str] | None:
@@ -884,6 +945,63 @@ def _concat_literals(
         return None
     output = {a + b for a in left for b in right}
     return frozenset(output) if len(output) <= _VALUE_LIMIT else None
+
+
+def _string_variable_for_escape(kind: str, index: int) -> int:
+    if kind.lower() == "cself":
+        return 1_600_000 + index
+    return 3_000_000 + index
+
+
+def _string_reference_value(literal: str, state: _AnalysisState) -> _StringValue | None:
+    value: _StringValue | None = None
+    for kind, pattern in (
+        ("cself", _CSELF_REFERENCE_RE),
+        ("s", _STRING_REFERENCE_RE),
+    ):
+        for reference in pattern.findall(literal):
+            referenced = state.strings.get(_string_variable_for_escape(kind, int(reference)))
+            if referenced is not None:
+                value = _merge_strings(value, referenced)
+    return value
+
+
+def _expand_string_references(
+    literals: frozenset[str] | None, state: _AnalysisState
+) -> frozenset[str] | None:
+    if literals is None:
+        return None
+    concrete = set(literals)
+    changed = True
+    while changed:
+        changed = False
+        for pattern, prefix in (
+            (_CSELF_REFERENCE_RE, "cself"),
+            (_STRING_REFERENCE_RE, "s"),
+        ):
+            for text in tuple(concrete):
+                match = pattern.search(text)
+                if match is None:
+                    continue
+                variable = _string_variable_for_escape(prefix, int(match.group(1)))
+                value = state.strings.get(variable)
+                replacements: frozenset[str] | None = value.literals if value else None
+                if replacements is None and prefix == "cself":
+                    number = state.numbers.get(variable)
+                    if number is not None and number.values is not None:
+                        replacements = frozenset(str(item) for item in number.values)
+                if replacements is None:
+                    return None
+                token = match.group(0)
+                concrete.remove(text)
+                concrete.update(text.replace(token, replacement) for replacement in replacements)
+                if len(concrete) > _VALUE_LIMIT:
+                    return None
+                changed = True
+                break
+            if changed:
+                break
+    return frozenset(concrete)
 
 
 def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
@@ -915,6 +1033,25 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
     return result
 
 
+def _state_cache_key(state: _AnalysisState) -> tuple[object, ...]:
+    local_numbers = tuple(
+        sorted(
+            (key, value)
+            for key, value in state.numbers.items()
+            if 1_600_000 <= key < 1_600_100
+        )
+    )
+    local_strings = tuple(
+        sorted(
+            (key, value)
+            for key, value in state.strings.items()
+            if 1_600_000 <= key < 1_600_100
+        )
+    )
+    database = tuple(sorted(state.database_strings.items()))
+    return (local_numbers, local_strings, database)
+
+
 def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
     if block.event_type == "common":
         return f"COMMON-{block.event_id}-{command_index - 1}-{string_index}"
@@ -933,7 +1070,8 @@ class _BlockAnalyzer:
         common_by_id: dict[int, _CommandBlock] | None = None,
         common_by_name: dict[str, tuple[_CommandBlock, ...]] | None = None,
         event_scopes: dict[int, frozenset[str]] | None = None,
-        call_stack: tuple[tuple[int, int], ...] = (),
+        call_stack: tuple[tuple[int, int | None], ...] = (),
+        call_cache: _CallCache | None = None,
     ) -> None:
         self.block = block
         self.databases = databases
@@ -943,6 +1081,7 @@ class _BlockAnalyzer:
         self.common_by_name = common_by_name or {}
         self.event_scopes = event_scopes or {}
         self.call_stack = call_stack
+        self.call_cache = call_cache if call_cache is not None else {}
         self.dependencies: list[dict[str, object]] = []
         self.blocking: list[dict[str, object]] = []
         self.unknown = Counter()
@@ -955,6 +1094,23 @@ class _BlockAnalyzer:
                 labels.setdefault(command.strings[0], []).append(position)
         self.labels = {name: tuple(positions) for name, positions in labels.items()}
 
+    def _dynamic_entry_dispatcher(self) -> int | None:
+        if self.block.event_type != "common":
+            return None
+        for index, command in enumerate(self.block.commands[:-1]):
+            following = self.block.commands[index + 1]
+            if (
+                command.indent == 0
+                and following.indent == 0
+                and command.opcode == 122
+                and command.ints[:2] == (3_000_001, 0)
+                and command.strings == ("cmd:\\cself[0]",)
+                and following.opcode == 213
+                and following.strings == ("\\s[1]",)
+            ):
+                return index
+        return None
+
     def _resource_reference(
         self,
         command: _Command,
@@ -964,12 +1120,10 @@ class _BlockAnalyzer:
     ) -> None:
         if not semantics:
             return
-        roles = list(semantics.get("string_roles", []))
+        roles = _command_string_roles(command, semantics)
         protected_roles = {
             "resource_path",
             "file_path",
-            "common_event_name",
-            "call_argument",
             "label",
             "label_target",
         }
@@ -979,6 +1133,7 @@ class _BlockAnalyzer:
             value = self._literal_string(command, index, string_index, state)
             if not value.tracked:
                 continue
+            status, reason = _string_value_status(value)
             code = _event_code(self.block, index + 1, string_index).upper()
             dependency = {
                     "kind": "resource",
@@ -1001,13 +1156,65 @@ class _BlockAnalyzer:
                     "trace": list(value.trace),
                     "right_trace": [],
                     "unresolved_scopes": sorted(value.scopes),
-                    "status": "blocking" if value.unknown or value.symbolic_all else "resolved",
-                    "reason": value.unknown,
+                    "status": status,
+                    "reason": reason,
                     "resource_role": role,
             }
             self.dependencies.append(dependency)
             if dependency["status"] == "blocking":
                 self.blocking.append(dependency)
+
+    def _display_reference(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        semantics: dict[str, object] | None,
+    ) -> None:
+        if not semantics:
+            return
+        roles = _command_string_roles(command, semantics)
+        for string_index, role in enumerate(roles):
+            if role != "display_text" or string_index >= len(command.strings):
+                continue
+            value = self._literal_string(command, index, string_index, state)
+            if not value.tracked:
+                continue
+            status, reason = _string_value_status(value)
+            self.dependencies.append({
+                "kind": "display",
+                "auto_file": self.block.source,
+                "event_type": self.block.event_type,
+                "event_id": self.block.event_id,
+                "event_name": self.block.event_name,
+                "page": self.block.page,
+                "command": index + 1,
+                "string_index": string_index,
+                "condition_code": _event_code(
+                    self.block, index + 1, string_index
+                ).upper(),
+                "condition_keys": [],
+                "operator": "display",
+                "literal": command.strings[string_index],
+                "right_is_variable": False,
+                "source_keys": sorted(value.source_keys),
+                "right_source_keys": [],
+                "database_cells": [
+                    {
+                        "database": cell[0],
+                        "type": cell[1],
+                        "data": cell[2],
+                        "field": cell[3],
+                    }
+                    for cell in sorted(value.cells)
+                ],
+                "right_database_cells": [],
+                "trace": list(value.trace),
+                "right_trace": [],
+                "unresolved_scopes": sorted(value.scopes),
+                "status": status,
+                "reason": reason,
+            })
 
     def _value_boundary_reference(
         self,
@@ -1019,8 +1226,15 @@ class _BlockAnalyzer:
     ) -> None:
         if not value.tracked:
             return
+        status, reason = _string_value_status(value)
         dependency = {
-            "kind": "resource",
+            "kind": (
+                "flow"
+                if role == "common_event_return"
+                else "state"
+                if role == "global_string_write"
+                else "resource"
+            ),
             "auto_file": self.block.source,
             "event_type": self.block.event_type,
             "event_id": self.block.event_id,
@@ -1043,8 +1257,8 @@ class _BlockAnalyzer:
             "trace": list(value.trace),
             "right_trace": [],
             "unresolved_scopes": sorted(value.scopes | scopes),
-            "status": "blocking" if value.unknown or value.symbolic_all else "resolved",
-            "reason": value.unknown,
+            "status": status,
+            "reason": reason,
             "resource_role": role,
         }
         self.dependencies.append(dependency)
@@ -1055,6 +1269,17 @@ class _BlockAnalyzer:
         return (
             f"{self.block.source} event={self.block.event_id} page={self.block.page} "
             f"command={index + 1}"
+        )
+
+    def _current_scope(self) -> frozenset[str]:
+        if self.block.event_type == "common":
+            return frozenset({f"common:{self.block.event_id}"})
+        match = re.search(
+            r"Map(\d+)\.mps\.Auto\.txt$", self.block.source, re.IGNORECASE
+        )
+        map_id = int(match.group(1)) if match else 0
+        return frozenset(
+            {f"map:{map_id}:{self.block.event_id}:{self.block.page}"}
         )
 
     def _record_unknown(self, command: _Command, index: int, shape: str | None = None) -> None:
@@ -1076,6 +1301,8 @@ class _BlockAnalyzer:
         reason: str,
         scopes: frozenset[str],
         values: Iterable[_StringValue] = (),
+        *,
+        status: str = "blocking",
     ) -> None:
         values = tuple(values)
         source_keys = sorted({key for value in values for key in value.source_keys})
@@ -1108,11 +1335,12 @@ class _BlockAnalyzer:
             "right_trace": [],
             "unresolved_scopes": sorted(scopes),
             "unresolved_reasons": [reason],
-            "status": "blocking",
+            "status": status,
             "reason": reason,
         }
         self.dependencies.append(dependency)
-        self.blocking.append(dependency)
+        if status == "blocking":
+            self.blocking.append(dependency)
 
     def _type_ids(self, database: str, command: _Command, flags: int, state: _AnalysisState) -> set[int] | None:
         types = self.databases.get(database, {})
@@ -1149,18 +1377,24 @@ class _BlockAnalyzer:
             self._record_unknown(command, index, "invalid-250-read")
             return
         destination = command.ints[4] & 0x00FFFFFF
-        type_ids = self._type_ids(database, command, byte2, state)
-        if not type_ids:
-            state.strings[destination] = _StringValue(
-                trace=(self._location(index),),
-                unknown="数据库类型无法解析",
-                symbolic_all=True,
-                scopes=frozenset({f"database:{database}:*:*:*"}),
-                literals=None,
-            )
+        selected_type_ids = self._type_ids(database, command, byte2, state)
+        if selected_type_ids == set():
+            state.strings[destination] = _StringValue(literals=frozenset())
             return
+        type_ids = (
+            set(self.databases.get(database, {}))
+            if selected_type_ids is None
+            else selected_type_ids
+        )
 
         data_raw, field_raw = command.ints[1], command.ints[2]
+        if data_raw == -3 and field_raw == -3:
+            state.numbers[destination] = _NumberValue(
+                _limited(type_ids),
+                "数据库类型名称无法唯一解析" if len(type_ids) > _VALUE_LIMIT else "",
+                True,
+            )
+            return
         if data_raw == -3 and field_raw != -3:
             names = {command.strings[3]} if byte2 & 0x04 and len(command.strings) > 3 else set()
             fields = {
@@ -1173,6 +1407,60 @@ class _BlockAnalyzer:
                 _limited(fields),
                 "数据库字段名称无法唯一解析" if not fields or len(fields) > _VALUE_LIMIT else "",
                 True,
+            )
+            return
+
+        if field_raw == -3:
+            if byte2 & 0x02:
+                data_name = command.strings[2] if len(command.strings) > 2 else ""
+                data_ids = {
+                    data_id
+                    for type_id in type_ids
+                    for data_id, name in enumerate(
+                        self.databases[database][type_id].data_names
+                    )
+                    if name == data_name
+                }
+                state.numbers[destination] = _NumberValue(
+                    _limited(data_ids),
+                    "数据库数据名称无法唯一解析" if len(data_ids) > _VALUE_LIMIT else "",
+                    True,
+                )
+                return
+            selected = self._selector(data_raw, state, unknown_means_all=True)
+            data_ids = selected if selected else {
+                data_id
+                for type_id in type_ids
+                for data_id in range(len(self.databases[database][type_id].rows))
+            }
+            keys: set[str] = set()
+            cells: set[tuple[str, int, int, int]] = set()
+            names: set[str] = set()
+            for type_id in type_ids:
+                db_type = self.databases[database].get(type_id)
+                if db_type is None:
+                    continue
+                for data_id in data_ids:
+                    if not 0 <= data_id < len(db_type.data_names):
+                        continue
+                    names.add(db_type.data_names[data_id])
+                    coordinate = (database, type_id, data_id, 0)
+                    coordinate_keys = self.database_keys.get(coordinate, ())
+                    if coordinate_keys:
+                        keys.update(coordinate_keys)
+                        cells.add(coordinate)
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:0" for type_id in type_ids
+            )
+            symbolic = not selected or len(keys) + len(cells) > _VALUE_LIMIT
+            state.strings[destination] = _StringValue(
+                frozenset() if symbolic else frozenset(keys),
+                frozenset() if symbolic else frozenset(cells),
+                (f"{self._location(index)} opcode=250 {database} data-name",),
+                unknown=("数据库数据名来源集合超过 256 项" if symbolic else ""),
+                symbolic_all=symbolic,
+                scopes=scopes if symbolic else frozenset(),
+                literals=(frozenset(names) if len(names) <= _VALUE_LIMIT else None),
             )
             return
 
@@ -1297,6 +1585,13 @@ class _BlockAnalyzer:
     ) -> None:
         type_ids = self._type_ids(database, command, selector_flags, state)
         if not type_ids:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "数据库写入类型无法解析",
+                frozenset({f"database:{database}:*:*:*"}),
+            )
             return
         if selector_flags & 0x02:
             data_name = command.strings[2] if len(command.strings) > 2 else ""
@@ -1325,6 +1620,18 @@ class _BlockAnalyzer:
             for field_id in field_ids
         }
         if len(coordinates) > _VALUE_LIMIT:
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for type_id in type_ids
+                for field_id in field_ids
+            ) or frozenset({f"database:{database}:*:*:*"})
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "数据库写入坐标超过静态展开上限",
+                scopes,
+            )
             return
         value = self._literal_string(command, index, 0, state)
         for coordinate in coordinates:
@@ -1370,12 +1677,18 @@ class _BlockAnalyzer:
         destination, left_raw, right_raw, flags = command.ints[:4]
         byte0 = flags & 0xFF
         byte1 = (flags >> 8) & 0xFF
+        left = _number_argument(left_raw, state)
+        right = _number_argument(right_raw, state)
         if byte0:
-            state.numbers[destination] = _NumberValue(None, f"未支持的 121 间接标志 {byte0}", True)
+            state.numbers[destination] = _NumberValue(
+                None,
+                f"121 运行时数值模式 flags={flags}",
+                left.tracked or right.tracked,
+            )
             return
         value = _calculate_numbers(
-            _number_argument(left_raw, state),
-            _number_argument(right_raw, state),
+            left,
+            right,
             (byte1 >> 4) & 0x0F,
         )
         assignment = byte1 & 0x0F
@@ -1385,7 +1698,11 @@ class _BlockAnalyzer:
             current = state.numbers.get(destination, _NumberValue(None, "复合赋值前值未知"))
             state.numbers[destination] = _calculate_numbers(current, value, assignment - 1)
         else:
-            state.numbers[destination] = _NumberValue(None, f"未支持的 121 赋值运算 {assignment}", True)
+            state.numbers[destination] = _NumberValue(
+                None,
+                f"121 运行时赋值模式 {assignment}",
+                value.tracked,
+            )
 
     def _literal_string(
         self,
@@ -1414,22 +1731,10 @@ class _BlockAnalyzer:
             scopes=frozenset({source_scope}) if keys else frozenset(),
             literals=frozenset({literal}),
         )
-        concrete: frozenset[str] | None = frozenset({literal})
-        for reference in _CSELF_REFERENCE_RE.findall(literal):
-            referenced = state.strings.get(1_600_000 + int(reference))
-            if referenced is not None:
-                value = _merge_strings(value, referenced) or value
-                if concrete is not None and referenced.literals is not None:
-                    token = f"\\cself[{reference}]"
-                    concrete = frozenset(
-                        text.replace(token, replacement)
-                        for text in concrete
-                        for replacement in referenced.literals
-                    )
-                    if len(concrete) > _VALUE_LIMIT:
-                        concrete = None
-                else:
-                    concrete = None
+        referenced = _string_reference_value(literal, state)
+        if referenced is not None:
+            value = _merge_strings(value, referenced) or value
+        concrete = _expand_string_references(frozenset({literal}), state)
         value = _with_literals(value, concrete)
         return value
 
@@ -1454,6 +1759,34 @@ class _BlockAnalyzer:
                     literals=None,
                 ),
             )
+        elif source_kind == 2:
+            pointer = _number_argument(source_raw, state)
+            pointed_values: list[_StringValue] = []
+            if pointer.values is not None:
+                for raw in pointer.values:
+                    pointed = state.strings.get(raw & 0x00FFFFFF)
+                    if pointed is not None:
+                        pointed_values.append(pointed)
+            if pointed_values:
+                value = None
+                for pointed in pointed_values:
+                    value = _merge_strings(value, pointed)
+                value = value or _StringValue(literals=None)
+            else:
+                # ponytail: WOLF can load the source string variable through a
+                # numeric variable. If that pointer is dynamic we keep the value
+                # dynamic, not opaque; later safety replay will preserve anything
+                # whose logic depends on it.
+                value = _StringValue(
+                    trace=(f"{self._location(index)} opcode=122 dynamic source pointer",),
+                    scopes=frozenset(),
+                    literals=None,
+                )
+        elif source_kind == 3:
+            value = _StringValue(
+                trace=(f"{self._location(index)} opcode=122 runtime string input",),
+                literals=None,
+            )
         else:
             current = state.strings.get(destination)
             state.strings[destination] = _StringValue(
@@ -1466,10 +1799,39 @@ class _BlockAnalyzer:
                 current.literals if current else None,
             )
             return
-        if assignment == 0:
+        current = state.strings.get(destination)
+        literal_operands: _StringValue | None = None
+        for string_index in range(len(command.strings)):
+            literal_operands = _merge_strings(
+                literal_operands,
+                self._literal_string(command, index, string_index, state),
+            )
+        extended_string_operation = bool(flags & 0x00040000)
+
+        def derived(*values: _StringValue | None, note: str) -> _StringValue:
+            merged: _StringValue | None = None
+            for item in values:
+                if item is not None:
+                    merged = _merge_strings(merged, item)
+            merged = merged or _StringValue(literals=None)
+            return _StringValue(
+                merged.source_keys,
+                merged.cells,
+                tuple(dict.fromkeys(merged.trace + (f"{self._location(index)} opcode=122 {note}",))),
+                merged.unknown,
+                merged.symbolic_all,
+                merged.scopes,
+                None,
+            )
+
+        if extended_string_operation and assignment in {3, 4, 5}:
+            traced = derived(current, value, literal_operands, note=f"extended-op={assignment}")
+            state.strings[destination] = traced
+            if assignment == 3 and source_kind == 1:
+                state.strings[source_raw & 0x00FFFFFF] = traced
+        elif assignment == 0:
             state.strings[destination] = value
         elif assignment == 1:
-            current = state.strings.get(destination)
             merged = _merge_strings(current, value) or value
             state.strings[destination] = _with_literals(
                 merged,
@@ -1477,35 +1839,25 @@ class _BlockAnalyzer:
                     current.literals if current else frozenset({""}), value.literals
                 ),
             )
-        elif assignment == 3 and source_kind == 1:
+        elif assignment in {2, 3, 4, 10, 11}:
             # ponytail: Auto protection tracks provenance, not WOLF's concrete string values.
-            source = source_raw & 0x00FFFFFF
-            traced = _StringValue(
-                value.source_keys,
-                value.cells,
-                tuple(dict.fromkeys(value.trace + (f"{self._location(index)} opcode=122 op=3",))),
-                value.unknown,
-                value.symbolic_all,
-                value.scopes,
-                value.literals,
-            )
+            traced = derived(current if assignment in {10, 11} else None, value, note=f"op={assignment}")
             state.strings[destination] = traced
-            state.strings[source] = traced
-        elif assignment == 10:
-            current = state.strings.get(destination)
-            current_is_translatable = bool(current and (current.source_keys or current.cells))
-            merged = _merge_strings(current if current_is_translatable else None, value) or value
-            state.strings[destination] = _StringValue(
-                merged.source_keys,
-                merged.cells,
-                tuple(dict.fromkeys(merged.trace + (f"{self._location(index)} opcode=122 op=10",))),
-                value.unknown,
-                merged.symbolic_all,
-                merged.scopes,
-                merged.literals,
+            if assignment in {3, 4} and source_kind == 1:
+                state.strings[source_raw & 0x00FFFFFF] = traced
+        elif assignment in {5, 7, 8}:
+            self._value_boundary_reference(command, index, value, "file_path_runtime_read")
+            state.strings[destination] = derived(value, note=f"op={assignment} runtime-read")
+        elif assignment == 6:
+            self._value_boundary_reference(
+                command,
+                index,
+                derived(current, value, note="op=6 file-write"),
+                "file_path_runtime_write",
             )
+            if current is not None:
+                state.strings[destination] = current
         elif assignment == 9 and source_kind == 0:
-            current = state.strings.get(destination)
             literal_keys = {
                 item.key
                 for string_index, literal in enumerate(command.strings)
@@ -1519,7 +1871,7 @@ class _BlockAnalyzer:
                 trace=(f"{self._location(index)} opcode=122 op=9",),
                 literals=frozenset(command.strings),
             )
-            state.strings[destination] = _merge_strings(current, replacement) or replacement
+            state.strings[destination] = derived(current, replacement, note="op=9")
         else:
             state.strings[destination] = _StringValue(
                 value.source_keys, value.cells, value.trace,
@@ -1531,7 +1883,7 @@ class _BlockAnalyzer:
         if result is None:
             return
         writes_global = not 1_600_000 <= destination < 1_600_100
-        if assignment == 3 and source_kind == 1:
+        if assignment in {3, 4} and source_kind == 1:
             source = source_raw & 0x00FFFFFF
             writes_global = writes_global or not 1_600_000 <= source < 1_600_100
         if writes_global:
@@ -1583,22 +1935,23 @@ class _BlockAnalyzer:
                 status = "untracked"
                 reason = "字符串变量比较的一侧来源未知"
             elif right_is_variable and (value.unknown or right_value.unknown):
-                status = "blocking"
-                reason = value.unknown or right_value.unknown
+                left_status, left_reason = _string_value_status(value)
+                right_status, right_reason = _string_value_status(right_value)
+                status = "blocking" if "blocking" in {left_status, right_status} else "dynamic"
+                reason = left_reason or right_reason
             elif right_is_variable and (
                 value.literals is None or right_value.literals is None
             ):
-                status = "blocking"
-                reason = "字符串变量比较的具体值无法有限枚举"
+                status = "dynamic"
+                reason = "字符串变量比较的具体值为运行时动态值"
             elif value is None or not value.tracked:
                 status = "untracked"
                 reason = f"条件变量 {variable} 从事件入口进入"
-            elif value.unknown:
-                status = "blocking"
-                reason = value.unknown
+            elif value.unknown or value.symbolic_all:
+                status, reason = _string_value_status(value)
             elif value.literals is None:
-                status = "blocking"
-                reason = "条件字符串的具体值无法有限枚举"
+                status = "dynamic"
+                reason = "条件字符串的具体值为运行时动态值"
             else:
                 status = "resolved"
                 reason = ""
@@ -1633,6 +1986,10 @@ class _BlockAnalyzer:
                     sorted(right_value.literals)
                     if right_value and right_value.literals is not None
                     else []
+                ),
+                "source_scopes": sorted(value.scopes if value else ()),
+                "right_source_scopes": sorted(
+                    right_value.scopes if right_value else ()
                 ),
                 "unresolved_scopes": sorted(
                     state.unknown_scopes
@@ -1767,8 +2124,10 @@ class _BlockAnalyzer:
         state: _AnalysisState,
         reason: str,
         scopes: frozenset[str] | None = None,
+        *,
+        status: str = "blocking",
+        taint_state: bool = True,
     ) -> None:
-        self._record_unknown(command, index, f"call-not-inlined:{reason}")
         if scopes is None:
             scopes = frozenset({"project"})
         input_values = tuple(
@@ -1776,13 +2135,19 @@ class _BlockAnalyzer:
             for raw in command.ints[2:-1]
             if raw >= 1_000_000 and (raw & 0x00FFFFFF) in state.strings
         )
-        self._blocking_scope_dependency(
-            command, index, "call", reason, scopes, input_values
+        literal_start = 1 if command.opcode == 300 else 0
+        input_values += tuple(
+            self._literal_string(command, index, string_index, state)
+            for string_index in range(literal_start, len(command.strings))
         )
-        state.unknown_scopes = state.unknown_scopes | scopes
-        state.unknown_reasons = state.unknown_reasons | frozenset({
-            f"{self._location(index)} opcode={command.opcode}: {reason}"
-        })
+        self._blocking_scope_dependency(
+            command, index, "call", reason, scopes, input_values, status=status
+        )
+        if taint_state:
+            state.unknown_scopes = state.unknown_scopes | scopes
+            state.unknown_reasons = state.unknown_reasons | frozenset({
+                f"{self._location(index)} opcode={command.opcode}: {reason}"
+            })
         if len(command.ints) < 2 or not command.ints[1] & 0x01000000:
             return
         destination = command.ints[-1] & 0x00FFFFFF
@@ -1796,7 +2161,11 @@ class _BlockAnalyzer:
             value.source_keys,
             value.cells,
             tuple(dict.fromkeys(value.trace + (self._location(index),))),
-            f"来源经过未解释的公共事件调用 opcode={command.opcode}: {reason}",
+            (
+                f"来源经过未解释的公共事件调用 opcode={command.opcode}: {reason}"
+                if status == "blocking"
+                else f"公共事件返回值为运行时动态值 opcode={command.opcode}: {reason}"
+            ),
             "project" in scopes,
             value.scopes | scopes,
             None,
@@ -1815,20 +2184,19 @@ class _BlockAnalyzer:
     def _call_target(
         self, command: _Command, state: _AnalysisState
     ) -> tuple[_CommandBlock, int | None] | None:
-        if len(command.ints) < 3:
+        if len(command.ints) < 2:
             return None
         if command.opcode == 300:
             if not command.strings:
                 return None
-            target_names: frozenset[str] | None = frozenset({command.strings[0]})
-            reference = _CSELF_REFERENCE_RE.fullmatch(command.strings[0])
-            if reference:
-                value = state.strings.get(1_600_000 + int(reference.group(1)))
-                target_names = value.literals if value else None
+            target_names = _expand_string_references(
+                frozenset({command.strings[0]}), state
+            )
             matches = {
-                block.event_id: block
+                max(group, key=lambda block: block.event_id).event_id:
+                max(group, key=lambda block: block.event_id)
                 for name in (target_names or ())
-                for block in self.common_by_name.get(name, ())
+                if (group := self.common_by_name.get(name, ()))
             }
             target = next(iter(matches.values())) if len(matches) == 1 else None
         else:
@@ -1842,7 +2210,11 @@ class _BlockAnalyzer:
             target = self.common_by_id.get(target_id)
         if target is None:
             return None
-        choice_value = _number_argument(command.ints[2], state)
+        choice_value = (
+            _number_argument(command.ints[2], state)
+            if len(command.ints) >= 3
+            else _NumberValue(frozenset({0}))
+        )
         choice = (
             next(iter(choice_value.values))
             if choice_value.values is not None and len(choice_value.values) == 1
@@ -1854,52 +2226,116 @@ class _BlockAnalyzer:
         has_return = len(command.ints) >= 2 and bool(command.ints[1] & 0x01000000)
         resolved = self._call_target(command, state)
         if resolved is None:
-            if has_return:
-                self._unknown_call(
-                    command, index, state, "调用目标无法解析", frozenset()
+            if command.opcode == 300 and command.strings:
+                names = _expand_string_references(
+                    frozenset({command.strings[0]}), state
                 )
+                if names is not None and not any(
+                    self.common_by_name.get(name) for name in names
+                ):
+                    # The official manual specifies that an invalid name does
+                    # nothing. Old projects commonly retain optional calls.
+                    return
+                value = self._literal_string(command, index, 0, state)
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
+                    frozenset(),
+                    (value,),
+                    status="dynamic",
+                )
+            elif command.opcode == 210 and command.ints and command.ints[0] < 0:
+                return
+            else:
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
+                    frozenset({"common:*"}),
+                    status="dynamic",
+                )
+            self._set_unknown_target_return(command, state)
             return
         target, choice = resolved
-        target_scopes = frozenset()
-        if choice is None:
-            if has_return:
-                self._unknown_call(
-                    command, index, state, "调用入口无法有限解析", target_scopes
-                )
-            return
-        if not has_return:
+        # Every common event is also analyzed independently. At a call site we
+        # only need the callee's own text and actual argument provenance; DB and
+        # global writes are covered by their value-boundary dependencies.
+        target_scopes = frozenset({f"common:{target.event_id}"})
+        target_has_dispatcher = any(
+            command.indent == 0
+            and following.indent == 0
+            and command.opcode == 122
+            and command.ints[:2] == (3_000_001, 0)
+            and command.strings == ("cmd:\\cself[0]",)
+            and following.opcode == 213
+            and following.strings == ("\\s[1]",)
+            for command, following in zip(target.commands, target.commands[1:])
+        )
+        target_has_entry_labels = any(
+            item.opcode == 212
+            and item.indent == 0
+            and len(item.strings) == 1
+            and item.strings[0].startswith("cmd:")
+            for item in target.commands
+        )
+        if choice is None and (target_has_dispatcher or target_has_entry_labels):
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "调用入口为运行时动态值，已保守保护目标事件范围",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
             return
         call_key = (target.event_id, choice)
         if len(self.call_stack) >= _CALL_DEPTH_LIMIT:
-            self._unknown_call(command, index, state, "调用摘要超过 64 层仍未收敛", target_scopes)
-            return
-        if call_key in self.call_stack:
-            self._unknown_call(command, index, state, "检测到递归调用", target_scopes)
-            return
-        if has_return and (target.value_inputs < 1 or target.return_target < 0):
+            # ponytail: recursive value summaries widen to the precomputed call
+            # closure; parameterized SCC summaries can recover more coverage.
             self._unknown_call(
                 command,
                 index,
                 state,
-                "被调事件没有有效命令参数或返回槽",
-                target_scopes,
+                "递归调用摘要扩大为可达范围",
+                self.event_scopes.get(target.event_id, target_scopes),
+                status="dynamic",
+                taint_state=False,
             )
+            return
+        if call_key in self.call_stack:
+            self._unknown_call(
+                command,
+                index,
+                state,
+                "递归调用摘要扩大为可达范围",
+                self.event_scopes.get(target.event_id, target_scopes),
+                status="dynamic",
+                taint_state=False,
+            )
+            return
+        if has_return and target.return_target < 0:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "调用声明返回值但目标事件没有返回槽，已按运行时动态值处理",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
             return
 
         flags = command.ints[1]
         numeric_slots = flags & 0x0F
         string_count = (flags >> 4) & 0x0F
-        if not 1 <= numeric_slots <= max(target.value_inputs, 1):
-            self._unknown_call(command, index, state, "数值实参数量与 Auto 头部不符", target_scopes)
-            return
-        if string_count > target.string_inputs:
-            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
-            return
         # ponytail: The call record is authoritative for this entry point. Common
-        # events may expose fewer inputs than their file-wide maximum; absent slots
-        # stay unknown and are safe unless the selected command actually reads them.
-        numeric_count = numeric_slots - 1
-        string_start = 3 + numeric_count
+        # events may expose fewer inputs than old call sites still carry. WOLF stores
+        # zero-input calls as two integers and otherwise counts all numeric slots.
+        string_start = 2 + numeric_slots
         string_end = string_start + string_count
         expected_ints = string_end + int(has_return)
         if len(command.ints) != expected_ints:
@@ -1911,12 +2347,8 @@ class _BlockAnalyzer:
             self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
             return
 
-        callee_state = _AnalysisState(
-            {1_600_000: _NumberValue(frozenset({choice}))},
-            {},
-            dict(state.database_strings),
-        )
-        for offset, raw in enumerate(command.ints[3:string_start], start=1):
+        callee_state = _AnalysisState({}, {}, dict(state.database_strings))
+        for offset, raw in enumerate(command.ints[2:string_start]):
             callee_state.numbers[1_600_000 + offset] = _number_argument(raw, state)
         for offset, raw in enumerate(string_arguments):
             destination = 1_600_005 + offset
@@ -1936,28 +2368,20 @@ class _BlockAnalyzer:
                     state,
                 )
 
-        label = next(
-            (
-                position
-                for position, item in enumerate(target.commands)
-                if item.opcode == 212
-                and item.indent == 0
-                and item.strings == (f"cmd:{choice}",)
-            ),
-            None,
-        )
-        if label is None:
-            self._unknown_call(command, index, state, f"缺少 cmd:{choice} 标签", target_scopes)
+        if not has_return:
+            inputs = tuple(callee_state.strings.values())
+            if any(value.tracked for value in inputs):
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "无返回公共事件副作用已按事件摘要保守定位",
+                    frozenset(),
+                    inputs,
+                    status="dynamic",
+                )
             return
-        end = next(
-            (
-                position
-                for position in range(label + 1, len(target.commands))
-                if target.commands[position].opcode == 212
-                and target.commands[position].indent == 0
-            ),
-            len(target.commands),
-        )
+
         child = _BlockAnalyzer(
             target,
             self.databases,
@@ -1967,15 +2391,70 @@ class _BlockAnalyzer:
             self.common_by_name,
             self.event_scopes,
             self.call_stack + (call_key,),
+            self.call_cache,
         )
-        exits: list[_AnalysisState] = []
-        fell_through = child._execute(label + 1, end, callee_state, exits)
-        self.dependencies.extend(child.dependencies)
-        self.blocking.extend(child.blocking)
-        self.unknown.update(child.unknown)
-        for key, values in child.unknown_locations.items():
+        dispatcher = child._dynamic_entry_dispatcher()
+        if dispatcher is not None:
+            start, end = dispatcher, len(target.commands)
+        else:
+            entry_labels = [
+                position
+                for position, item in enumerate(target.commands)
+                if item.opcode == 212
+                and item.indent == 0
+                and len(item.strings) == 1
+                and item.strings[0].startswith("cmd:")
+            ]
+            if entry_labels:
+                label = next(
+                    (
+                        position
+                        for position in entry_labels
+                        if target.commands[position].strings == (f"cmd:{choice}",)
+                    ),
+                    None,
+                )
+                if label is None:
+                    self._unknown_call(
+                        command, index, state, f"缺少 cmd:{choice} 标签", target_scopes
+                    )
+                    return
+                start = label + 1
+                end = next(
+                    (position for position in entry_labels if position > label),
+                    len(target.commands),
+                )
+            else:
+                start, end = 0, len(target.commands)
+        cache_key = (target.event_id, choice, start, end, _state_cache_key(callee_state))
+        cached = self.call_cache.get(cache_key)
+        if cached is None:
+            exits: list[_AnalysisState] = []
+            fell_through = child._execute(start, end, callee_state, exits)
+            if fell_through:
+                exits.append(callee_state.copy())
+            cached = _CallSummary(
+                fell_through,
+                tuple(item.copy() for item in exits),
+                child.summary_failed,
+                tuple(child.dependencies),
+                tuple(child.blocking),
+                Counter(child.unknown),
+                tuple(
+                    (key, tuple(values))
+                    for key, values in child.unknown_locations.items()
+                ),
+            )
+            self.call_cache[cache_key] = cached
+        fell_through = cached.fell_through
+        exits = [item.copy() for item in cached.exits]
+        child.summary_failed = cached.summary_failed
+        self.dependencies.extend(cached.dependencies)
+        self.blocking.extend(cached.blocking)
+        self.unknown.update(cached.unknown)
+        for key, values in cached.unknown_locations:
             self.unknown_locations.setdefault(key, []).extend(values)
-        if child.summary_failed or fell_through or not exits:
+        if child.summary_failed:
             self._unknown_call(
                 command,
                 index,
@@ -1983,6 +2462,17 @@ class _BlockAnalyzer:
                 child.summary_failed or "公共事件摘要没有在 END 返回",
                 target_scopes,
             )
+            return
+        if not exits:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "目标事件控制流为运行时动态路径，已保守保护事件范围",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
             return
 
         result = _merge_states(exits)
@@ -2004,7 +2494,7 @@ class _BlockAnalyzer:
         if target.return_target >= 5:
             value = result.strings.get(return_variable)
             if value is None:
-                self._unknown_call(command, index, state, "字符串返回槽没有赋值", target_scopes)
+                self._set_dynamic_call_return(command, state, target, target_scopes)
                 return
             state.strings[destination] = _StringValue(
                 value.source_keys,
@@ -2018,9 +2508,97 @@ class _BlockAnalyzer:
         else:
             value = result.numbers.get(return_variable)
             if value is None:
-                self._unknown_call(command, index, state, "数值返回槽没有赋值", target_scopes)
+                self._set_dynamic_call_return(command, state, target, target_scopes)
                 return
             state.numbers[destination] = value
+
+    @staticmethod
+    def _set_unknown_target_return(
+        command: _Command, state: _AnalysisState
+    ) -> None:
+        if len(command.ints) < 3 or not command.ints[1] & 0x01000000:
+            return
+        destination = command.ints[-1] & 0x00FFFFFF
+        state.strings[destination] = _StringValue(
+            unknown="公共事件目标为运行时动态值",
+            scopes=frozenset({"common:*"}),
+            literals=None,
+        )
+        state.numbers[destination] = _NumberValue(
+            None, "公共事件目标为运行时动态值"
+        )
+
+    def _set_dynamic_call_return(
+        self,
+        command: _Command,
+        state: _AnalysisState,
+        target: _CommandBlock,
+        scopes: frozenset[str],
+    ) -> None:
+        if len(command.ints) < 3 or not command.ints[1] & 0x01000000:
+            return
+        destination = command.ints[-1] & 0x00FFFFFF
+        if target.return_target >= 5:
+            state.strings[destination] = _StringValue(
+                unknown="公共事件返回值为运行时动态值",
+                scopes=scopes,
+                literals=None,
+            )
+        else:
+            state.numbers[destination] = _NumberValue(
+                None, "公共事件返回值为运行时动态值"
+            )
+
+    def _reserve_event(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        if not command.ints:
+            self._unknown_call(
+                command, index, state, "预约公共事件目标缺失", frozenset({"common:*"})
+            )
+            return
+        reference = command.ints[0]
+        target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
+        target = self.common_by_id.get(target_id)
+        if target is None:
+            self._unknown_call(
+                command, index, state, "预约公共事件目标无法解析", frozenset({"common:*"})
+            )
+            return
+        scopes = frozenset({f"common:{target.event_id}"})
+        if scopes:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "预约公共事件存在延迟的全局或数据库副作用",
+                scopes,
+                status="dynamic",
+            )
+
+    def _import_database(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        selector = command.ints[0] if command.ints else -1
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(selector)
+        scopes = (
+            frozenset({f"database:{database}:*:*:*"})
+            if database
+            else frozenset(
+                {
+                    "database:UDB:*:*:*",
+                    "database:CDB:*:*:*",
+                    "database:SDB:*:*:*",
+                }
+            )
+        )
+        self._blocking_scope_dependency(
+            command,
+            index,
+            "database",
+            "CSV 数据库操作可能在运行时改写数据库字符串",
+            scopes,
+        )
 
     def _execute(
         self,
@@ -2041,6 +2619,7 @@ class _BlockAnalyzer:
                 self._taint_unknown(command, index, state)
                 index += 1
                 continue
+            self._display_reference(command, index, state, semantics)
             self._resource_reference(command, index, state, semantics)
             if command.opcode == 121:
                 self._set_number(command, index, state)
@@ -2058,6 +2637,8 @@ class _BlockAnalyzer:
                 self._set_runtime_value(command, index, state, string_result=string_result)
             elif command.opcode == 250:
                 self._database(command, index, state)
+            elif command.opcode == 251:
+                self._import_database(command, index, state)
             elif command.opcode == 221:
                 self._set_runtime_value(
                     command,
@@ -2098,6 +2679,8 @@ class _BlockAnalyzer:
                     continue
             elif command.opcode in {210, 300}:
                 self._call_event(command, index, state)
+            elif command.opcode == 211:
+                self._reserve_event(command, index, state)
             elif command.opcode in {170, 179}:
                 closing = self._matching(index, end, 498)
                 if closing is None:
@@ -2118,8 +2701,14 @@ class _BlockAnalyzer:
                     previous = before
                     for _ in range(min(max(iterations, 0), _LOOP_LIMIT)):
                         previous = state.copy()
-                        if not self._execute(index + 1, closing, state, exits):
-                            return False
+                        try:
+                            if not self._execute(index + 1, closing, state, exits):
+                                return False
+                        except _BreakLoop:
+                            stable = True
+                            break
+                        except _ContinueLoop:
+                            pass
                         if state == previous:
                             stable = True
                             break
@@ -2136,8 +2725,13 @@ class _BlockAnalyzer:
                                         current.tracked if current else False,
                                     )
                             widened_before = widened.copy()
-                            if not self._execute(index + 1, closing, widened, exits):
-                                return False
+                            try:
+                                if not self._execute(index + 1, closing, widened, exits):
+                                    return False
+                            except _BreakLoop:
+                                stable = True
+                            except _ContinueLoop:
+                                pass
                             stable = widened == widened_before
                             states.append(widened)
                             previous = widened_before
@@ -2161,13 +2755,38 @@ class _BlockAnalyzer:
                         state.unknown_reasons = merged.unknown_reasons
                     index = closing + 1
                     continue
+            elif command.opcode == 171:
+                raise _BreakLoop
+            elif command.opcode == 176:
+                raise _ContinueLoop
+            elif command.opcode == 172:
+                if exits is not None:
+                    exits.append(state.copy())
+                return False
+            elif command.opcode in {173, 174, 175}:
+                return False
             elif command.opcode == 213:
                 if command.strings == ("END",):
                     if exits is not None:
                         exits.append(state.copy())
                     return False
-                target_name = command.strings[0] if len(command.strings) == 1 else ""
-                targets = self.labels.get(target_name, ())
+                target_names = (
+                    _expand_string_references(
+                        frozenset({command.strings[0]}), state
+                    )
+                    if len(command.strings) == 1
+                    else None
+                )
+                target_name = (
+                    next(iter(target_names))
+                    if target_names is not None and len(target_names) == 1
+                    else command.strings[0] if len(command.strings) == 1 else ""
+                )
+                targets = tuple(sorted({
+                    position
+                    for name in (target_names or ())
+                    for position in self.labels.get(name, ())
+                }))
                 if len(targets) == 1:
                     target = targets[0]
                     jump_counts[target] += 1
@@ -2175,20 +2794,29 @@ class _BlockAnalyzer:
                         end = len(self.block.commands)
                         index = target + 1
                         continue
-                    state.unknown_scopes = state.unknown_scopes | frozenset({"project"})
+                    scopes = self._current_scope()
+                    state.unknown_scopes = state.unknown_scopes | scopes
                     state.unknown_reasons = state.unknown_reasons | frozenset({
                         f"{self._location(index)}: 标签跳转 {target_name!r} 未收敛"
                     })
                     self.summary_failed = f"标签跳转 {target_name!r} 超过 64 次仍未收敛"
-                    self._record_unknown(command, index, "summary-goto-cycle")
+                    self._blocking_scope_dependency(
+                        command,
+                        index,
+                        "control_flow",
+                        self.summary_failed,
+                        scopes,
+                    )
                     return False
-                if exits is not None:
-                    self.summary_failed = f"无法唯一解析标签跳转 {command.strings!r}"
-                self._record_unknown(command, index, "summary-goto")
-                state.unknown_scopes = state.unknown_scopes | frozenset({"project"})
-                state.unknown_reasons = state.unknown_reasons | frozenset({
-                    f"{self._location(index)}: 无法唯一解析标签 {target_name!r}"
-                })
+                scopes = self._current_scope()
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "control_flow",
+                    f"标签目标为运行时动态值，已保守保护当前事件范围 {target_name!r}",
+                    scopes,
+                    status="dynamic",
+                )
                 return False
             elif command.opcode not in {0, 401, 420, 421, 498, 499}:
                 effect = str(semantics["effect"]) if semantics else None
@@ -2233,7 +2861,8 @@ class _BlockAnalyzer:
         ]
         if entry_labels:
             first = entry_labels[0][0]
-            if first:
+            dispatcher = self._dynamic_entry_dispatcher()
+            if first and dispatcher is None:
                 self._execute(0, first, _AnalysisState({}, {}, {}))
             for label_index, (start, choice) in enumerate(entry_labels):
                 end = (
@@ -2244,7 +2873,10 @@ class _BlockAnalyzer:
                 state = _AnalysisState(
                     {1_600_000: _NumberValue(frozenset({choice}))}, {}, {}
                 )
-                self._execute(start + 1, end, state)
+                if dispatcher is not None:
+                    self._execute(dispatcher, len(self.block.commands), state)
+                else:
+                    self._execute(start + 1, end, state)
         else:
             self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
         warnings = [
@@ -2294,6 +2926,7 @@ def _analyze_blocks(
     blocking: list[dict[str, object]] = []
     unknown = Counter()
     locations: dict[tuple[int, str], list[str]] = {}
+    call_cache: _CallCache = {}
     for block in blocks:
         analyzer = _BlockAnalyzer(
             block,
@@ -2303,6 +2936,7 @@ def _analyze_blocks(
             common_by_id,
             common_by_name,
             event_scopes,
+            call_cache=call_cache,
         )
         block_dependencies, block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
@@ -2351,6 +2985,10 @@ def _analyze_blocks(
             current[field] = sorted(
                 set(current.get(field, [])) | set(dependency.get(field, []))
             )[:_VALUE_LIMIT]
+        for field in ("source_scopes", "right_source_scopes"):
+            current[field] = sorted(
+                set(current.get(field, [])) | set(dependency.get(field, []))
+            )
         current["unresolved_scopes"] = sorted(
             set(current.get("unresolved_scopes", []))
             | set(dependency.get("unresolved_scopes", []))
@@ -2359,17 +2997,106 @@ def _analyze_blocks(
             *current.get("unresolved_reasons", []),
             *dependency.get("unresolved_reasons", []),
         ]))[:_VALUE_LIMIT]
-        if current["status"] == "blocking":
-            pass
-        elif dependency["status"] == "blocking":
-            current["status"] = "blocking"
+        rank = {"resolved": 0, "untracked": 1, "dynamic": 2, "blocking": 3}
+        if rank.get(str(dependency["status"]), 3) > rank.get(str(current["status"]), 3):
+            current["status"] = dependency["status"]
             current["reason"] = dependency["reason"]
-        elif "resolved" in {current["status"], dependency["status"]}:
-            current["status"] = "resolved"
-            current["reason"] = ""
     dependencies = list(merged_dependencies.values())
     blocking = [item for item in dependencies if item["status"] == "blocking"]
     return dependencies, blocking, warnings
+
+
+def _translation_usage_report(
+    blocks: Iterable[_CommandBlock],
+    items: list[TranslationItem],
+    dependencies: list[dict[str, object]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code.upper(), []).append(item)
+    usages: dict[str, set[str]] = {}
+    scope_cache: dict[str, frozenset[str]] = {}
+    for block in blocks:
+        for index, command in enumerate(block.commands, start=1):
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            roles = _command_string_roles(command, semantics)
+            for string_index, text in enumerate(command.strings):
+                code = _event_code(block, index, string_index).upper()
+                role = roles[string_index] if string_index < len(roles) else "unresolved"
+                if role in {
+                    "assignment_literal",
+                    "call_argument",
+                    "database_selector_or_value",
+                }:
+                    continue
+                usage = "display_only" if role == "display_text" else (
+                    "display_only" if role == "comment" else (
+                    "logic" if role == "condition_literal" else (
+                        "event_target" if role == "common_event_name" else (
+                            "resource" if role in {"resource_path", "file_path"} else (
+                                "control_flow" if role in {"label", "label_target"} else "unresolved"
+                            )
+                        )
+                    )
+                    )
+                )
+                for item in by_code.get(code, ()):
+                    if item.original == text:
+                        usages.setdefault(item.key, set()).add(usage)
+    for dependency in dependencies:
+        kind = str(dependency.get("kind", "condition"))
+        usage = {
+            "display": "display_only",
+            "condition": "logic",
+            "call": "event_target",
+            "resource": "resource",
+            "database": "database_selector",
+            "control_flow": "control_flow",
+            "opaque": "unresolved",
+            "flow": "flow",
+            "state": "logic",
+        }.get(kind, "unresolved")
+        if usage == "flow":
+            continue
+        for field in ("condition_keys", "source_keys", "right_source_keys"):
+            for key in dependency.get(field, []):
+                usages.setdefault(str(key), set()).add(usage)
+        if dependency.get("status") != "resolved":
+            database_scopes = tuple(
+                scope
+                for scope in map(str, dependency.get("unresolved_scopes", ()))
+                if scope.startswith("database:")
+            )
+            for key in _scope_keys(items, database_scopes, scope_cache):
+                usages.setdefault(key, set()).add(usage)
+    proven_display = sorted(
+        key for key, values in usages.items() if values == {"display_only"}
+    )
+    return ({key: sorted(values) for key, values in sorted(usages.items())}, proven_display)
+
+
+def _command_transfer_complete(command: _Command) -> bool:
+    semantics = command_semantics(
+        command.opcode, len(command.ints), len(command.strings)
+    )
+    if not semantics or semantics.get("semantic_complete") is not True:
+        return False
+    if command.opcode == 121:
+        return len(command.ints) in {4, 5}
+    if command.opcode == 122:
+        if len(command.ints) < 2:
+            return False
+        flags = command.ints[1]
+        source_kind = flags & 0x0F
+        assignment = (flags >> 8) & 0x0F
+        return source_kind in {0, 1, 2, 3} and assignment in set(range(12))
+    if command.opcode == 250:
+        if len(command.ints) not in {4, 5}:
+            return False
+        return ((command.ints[3] >> 8) & 0x0F) in {0, 1, 2}
+    return semantics.get("transfer") != "opaque"
 
 
 def _conservative_event_scopes(
@@ -2396,13 +3123,20 @@ def _conservative_event_scopes(
                 database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
                 if database and byte1 & 0xF0 != 0x10:
                     scopes.add(f"database:{database}:*:*:*")
-            if command.opcode not in {210, 300} or len(command.ints) < 3:
+            if command.opcode not in {210, 211, 300} or not command.ints:
                 continue
             target: _CommandBlock | None = None
             if command.opcode == 300 and command.strings:
                 matches = common_by_name.get(command.strings[0], ())
                 target = matches[0] if len(matches) == 1 else None
+            elif command.opcode == 211:
+                reference = command.ints[0]
+                target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
+                target = common_by_id.get(target_id)
             elif command.opcode == 210:
+                if len(command.ints) < 3:
+                    scopes.update(database_scopes | {"common:*"})
+                    continue
                 reference = command.ints[0]
                 if 599_000 <= reference < 601_000:
                     target_id = event_id + reference - 600_100
@@ -2482,11 +3216,16 @@ def _call_graph_report(blocks: list[_CommandBlock]) -> tuple[dict[str, object], 
                 writes += int(bool(semantics["writes_variables"]))
             else:
                 opaque += 1
-            if command.opcode not in {210, 300}:
+            if command.opcode not in {210, 211, 300}:
                 continue
             targets: list[_CommandBlock] = []
             if command.opcode == 300 and command.strings:
                 targets = common_by_name.get(command.strings[0], [])
+            elif command.opcode == 211 and command.ints:
+                reference = command.ints[0]
+                target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
+                if target_id in common_by_id:
+                    targets = [common_by_id[target_id]]
             elif command.ints:
                 reference = command.ints[0]
                 target_id = None
@@ -2624,6 +3363,37 @@ def analyze_auto_export(
     project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
     dependencies, blocking, warnings = _analyze_blocks(project.events, items, database_types)
     call_graph, event_summaries = _call_graph_report(list(project.events))
+    usage_by_key, proven_display = _translation_usage_report(
+        project.events, items, dependencies
+    )
+    all_commands = [
+        command for block in project.events for command in block.commands
+    ]
+    semantic_missing = [
+        command
+        for command in all_commands
+        if not _command_transfer_complete(command)
+    ]
+    control_commands = [
+        command
+        for command in all_commands
+        if (
+            (semantics := command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            ))
+            and semantics.get("effect") == "control_flow"
+        )
+    ]
+    covered_control_commands = sum(
+        command.opcode in _CFG_IMPLEMENTED_OPCODES
+        for command in control_commands
+    )
+    call_edges = list(call_graph.get("edges", []))
+    resolved_calls = sum(
+        bool(edge.get("targets")) and not edge.get("dynamic")
+        for edge in call_edges
+        if isinstance(edge, dict)
+    )
     unresolved_scopes = sorted({
         str(scope)
         for dependency in dependencies
@@ -2650,7 +3420,38 @@ def analyze_auto_export(
             "schema": CATALOG_SCHEMA,
             "verified_through": VERIFIED_EDITOR_VERSION,
             "newer_editor": newer_editor,
-            "coverage": call_graph["coverage"],
+            "shape_coverage": {
+                "commands": len(all_commands),
+                "covered": len(all_commands) - len(semantic_missing),
+                "ratio": (
+                    (len(all_commands) - len(semantic_missing)) / len(all_commands)
+                    if all_commands else 1.0
+                ),
+            },
+            "semantic_coverage": {
+                "commands": len(all_commands),
+                "covered": len(all_commands) - len(semantic_missing),
+                "missing": len(semantic_missing),
+                "ratio": (
+                    (len(all_commands) - len(semantic_missing)) / len(all_commands)
+                    if all_commands else 1.0
+                ),
+            },
+            "cfg_coverage": {
+                "control_commands": len(control_commands),
+                "covered": covered_control_commands,
+                "missing": len(control_commands) - covered_control_commands,
+                "ratio": (
+                    covered_control_commands / len(control_commands)
+                    if control_commands else 1.0
+                ),
+            },
+            "call_summary_coverage": {
+                "calls": len(call_edges),
+                "resolved": resolved_calls,
+                "conservative": len(call_edges) - resolved_calls,
+                "ratio": resolved_calls / len(call_edges) if call_edges else 1.0,
+            },
         },
         "input_hash": input_hash,
         "output_hash": hash_directory(root),
@@ -2667,16 +3468,379 @@ def analyze_auto_export(
         "event_summaries": event_summaries,
         "call_graph": call_graph,
         "reachable_scopes": unresolved_scopes,
-        "safe_to_translate": [],
-        "keep_original": [],
+        "usage_by_key": usage_by_key,
+        "safe_to_translate": proven_display,
+        "keep_original": sorted(set(usage_by_key) - set(proven_display)),
         "unresolved_scopes": unresolved_scopes,
-        "translated_replay": {"status": "pending_import"},
-        "structural_diff": {"status": "pending_import"},
         "unknown_commands": warnings,
         "warnings": catalog_warnings + [
             f"未解释的字符串命令 opcode={warning['opcode']} {warning['shape']} ×{warning['count']}"
             for warning in warnings
         ],
+    }
+
+
+def _safety_predicate(operator: str, left: str, right: str) -> bool:
+    if operator == "equals":
+        return left == right
+    if operator == "not_equals":
+        return left != right
+    if operator == "contains":
+        return right in left
+    if operator == "starts_with":
+        return left.startswith(right)
+    raise ValueError(f"Editor 分析报告包含未知字符串比较操作符：{operator}")
+
+
+def _scope_keys(
+    items: list[TranslationItem],
+    scopes: Iterable[object],
+    cache: dict[str, frozenset[str]] | None = None,
+) -> set[str]:
+    selected: set[str] = set()
+    for raw_scope in scopes:
+        scope = str(raw_scope)
+        if cache is not None and scope in cache:
+            selected.update(cache[scope])
+            continue
+        matched: set[str] = set()
+        if scope == "project":
+            matched.update(item.key for item in items)
+        elif scope == "common:*":
+            matched.update(
+                item.key for item in items if item.code.upper().startswith("COMMON-")
+            )
+        elif scope.startswith("common:"):
+            prefix = f"COMMON-{scope.split(':', 1)[1]}-"
+            matched.update(
+                item.key for item in items if item.code.upper().startswith(prefix)
+            )
+        elif scope.startswith("map:"):
+            _, map_id, event_id, page = scope.split(":", 3)
+            prefix = f"MAP-{map_id}-EV{int(event_id):03d}-PAGE{page}-"
+            matched.update(
+                item.key for item in items if item.code.upper().startswith(prefix)
+            )
+        elif scope.startswith("database:"):
+            parts = scope.split(":")
+            if len(parts) != 5:
+                matched.update(item.key for item in items)
+            else:
+                _, database, type_id, data_id, field_id = parts
+                for item in items:
+                    match = _WORKBOOK_DB_CODE_RE.fullmatch(item.code)
+                    if not match:
+                        continue
+                    if (
+                        match.group("database").upper() == database.upper()
+                        and (type_id == "*" or match.group("type") == type_id)
+                        and (data_id == "*" or match.group("data") == data_id)
+                        and (field_id == "*" or match.group("field") == field_id)
+                    ):
+                        matched.add(item.key)
+        else:
+            matched.update(item.key for item in items)
+        if cache is not None:
+            cache[scope] = frozenset(matched)
+        selected.update(matched)
+    return selected
+
+
+def analyze_translation_safety(
+    auto_dir: str | Path,
+    items: list[TranslationItem],
+    candidate_values: dict[str, str],
+    policy: str,
+    *,
+    analysis: dict[str, object],
+) -> dict[str, object]:
+    """Approve only candidate strings whose Auto uses are statically proven safe."""
+    if policy not in {"warn", "block"}:
+        raise ValueError(f"未知 WOLF 逻辑安全策略：{policy}")
+    if analysis.get("schema") != AUTO_ANALYSIS_SCHEMA:
+        raise ValueError(
+            f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} Editor 分析报告，请重新执行导出文本。"
+        )
+    root = Path(auto_dir).resolve()
+    if hash_directory(root) != analysis.get("output_hash"):
+        raise ValueError("Editor Auto 目录已变化，请重新执行导出文本。")
+    usage_by_key = analysis.get("usage_by_key")
+    dependencies = analysis.get("dependencies")
+    if not isinstance(usage_by_key, dict) or not isinstance(dependencies, list):
+        raise ValueError("Editor 分析报告缺少翻译用途或依赖数据。")
+
+    originals = {item.key: item.original for item in items}
+    candidates = {
+        key: value
+        for key, value in candidate_values.items()
+        if key in originals and value and value != originals[key]
+    }
+    event_targets: dict[str, int] = {}
+    summaries = analysis.get("event_summaries", [])
+    if isinstance(summaries, list):
+        for summary in summaries:
+            if not isinstance(summary, dict):
+                continue
+            name = str(summary.get("event_name", ""))
+            node = str(summary.get("event", ""))
+            match = re.search(r":(\d+):\d+$", node)
+            if name and node.startswith("common:") and match:
+                event_targets[name] = max(
+                    event_targets.get(name, -1), int(match.group(1))
+                )
+
+    safe = {
+        key
+        for key in candidates
+        if (uses := set(map(str, usage_by_key.get(key, ()))))
+        and uses <= {"display_only", "logic", "event_target"}
+        and (
+            "event_target" not in uses
+            or event_targets.get(originals[key]) == event_targets.get(candidates[key])
+        )
+    }
+    base_protected = set(candidates) - safe
+    forced: set[str] = set()
+    reasons: dict[str, set[str]] = {}
+
+    def final_value(key: str) -> str:
+        if key in base_protected or key in forced:
+            return originals[key]
+        return candidates.get(key, originals[key])
+
+    def same_event_target(key: str) -> bool:
+        return event_targets.get(originals[key]) == event_targets.get(final_value(key))
+    scope_sets: dict[str, set[str]] = {"project": set(originals)}
+    for item in items:
+        upper = item.code.upper()
+        common = re.match(r"COMMON-(\d+)-", upper)
+        if common:
+            scope_sets.setdefault("common:*", set()).add(item.key)
+            scope_sets.setdefault(f"common:{common.group(1)}", set()).add(item.key)
+        map_item = re.match(r"MAP-(\d+)-EV(\d+)-PAGE(\d+)-", upper)
+        if map_item:
+            scope_sets.setdefault(
+                f"map:{int(map_item.group(1))}:{int(map_item.group(2))}:{int(map_item.group(3))}",
+                set(),
+            ).add(item.key)
+        database = _WORKBOOK_DB_CODE_RE.fullmatch(item.code)
+        if database:
+            db = database.group("database").upper()
+            type_id = database.group("type")
+            data_id = database.group("data")
+            field_id = database.group("field")
+            for scope in (
+                f"database:{db}:*:*:*",
+                f"database:{db}:{type_id}:*:*",
+                f"database:{db}:{type_id}:{data_id}:*",
+                f"database:{db}:{type_id}:*:{field_id}",
+                f"database:{db}:{type_id}:{data_id}:{field_id}",
+            ):
+                scope_sets.setdefault(scope, set()).add(item.key)
+    scope_cache = {
+        scope: frozenset(keys) for scope, keys in scope_sets.items()
+    }
+
+    def protect(keys: Iterable[object], reason: str) -> None:
+        for raw_key in keys:
+            key = str(raw_key)
+            if key in candidates:
+                forced.add(key)
+                reasons.setdefault(key, set()).add(reason)
+
+    def scoped_keys(dependency: dict[str, object], side: str) -> set[str]:
+        field = "source_scopes" if side == "left" else "right_source_scopes"
+        raw_scopes = tuple(map(str, dependency.get(field, ())))
+        if not raw_scopes and dependency.get("right_is_variable"):
+            raw_scopes = tuple(map(str, dependency.get("unresolved_scopes", ())))
+        return _scope_keys(items, raw_scopes, scope_cache)
+
+    def condition_domain(
+        keys: Iterable[str], values: Iterable[object]
+    ) -> list[tuple[str | None, str, str]]:
+        records = {
+            (key, originals[key], final_value(key))
+            for key in keys
+            if key in originals
+        }
+        records.update((None, str(value), str(value)) for value in values)
+        return sorted(records, key=lambda item: (item[0] or "", item[1], item[2]))
+
+    def replay_dynamic_condition(dependency: dict[str, object]) -> bool:
+        operator = str(dependency.get("operator", "unknown"))
+        if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+            return False
+        left_keys = set(map(str, dependency.get("source_keys", ())))
+        left_keys.update(scoped_keys(dependency, "left"))
+        if not dependency.get("right_is_variable"):
+            literal = str(dependency.get("literal", ""))
+            for key in left_keys & candidates.keys():
+                if _safety_predicate(operator, originals[key], literal) != _safety_predicate(
+                    operator, final_value(key), literal
+                ):
+                    protect((key,), "condition_truth_change")
+            return True
+
+        right_keys = set(map(str, dependency.get("right_source_keys", ())))
+        right_keys.update(scoped_keys(dependency, "right"))
+        left = condition_domain(left_keys, dependency.get("left_values", ()))
+        right = condition_domain(right_keys, dependency.get("right_values", ()))
+        changed_candidates = (left_keys | right_keys) & candidates.keys()
+        if not changed_candidates:
+            return True
+        if not left or not right:
+            protect(changed_candidates, "dynamic_condition_operand_unknown")
+            return True
+        if operator in {"equals", "not_equals"}:
+            right_by_original: dict[str, list[tuple[str | None, str]]] = {}
+            right_by_final: dict[str, list[tuple[str | None, str]]] = {}
+            for key, original, final in right:
+                right_by_original.setdefault(original, []).append((key, final))
+                right_by_final.setdefault(final, []).append((key, original))
+            for left_key, left_original, left_final in left:
+                for right_key, right_final in right_by_original.get(left_original, ()):
+                    if left_final != right_final:
+                        protect((left_key, right_key), "condition_truth_change")
+                for right_key, right_original in right_by_final.get(left_final, ()):
+                    if left_original != right_original:
+                        protect((left_key, right_key), "condition_truth_change")
+            return True
+        if len(left) * len(right) > _VALUE_LIMIT * _VALUE_LIMIT:
+            # ponytail: non-equality cross-products stay bounded; a symbolic
+            # string-relation domain can replace this conservative fallback.
+            protect(changed_candidates, "dynamic_condition_domain_too_large")
+            return True
+        for left_key, left_original, left_final in left:
+            for right_key, right_original, right_final in right:
+                if _safety_predicate(operator, left_original, right_original) != _safety_predicate(
+                    operator, left_final, right_final
+                ):
+                    protect((left_key, right_key), "condition_truth_change")
+        return True
+
+    def evaluate_dependency(dependency: object) -> None:
+        if not isinstance(dependency, dict):
+            raise ValueError("Editor 分析报告包含损坏的依赖记录。")
+        status = str(dependency.get("status", "blocking"))
+        kind = str(dependency.get("kind", "condition"))
+        source_keys = list(map(str, dependency.get("source_keys", ())))
+        right_keys = list(map(str, dependency.get("right_source_keys", ())))
+        condition_keys = list(map(str, dependency.get("condition_keys", ())))
+        protect(condition_keys, "condition_literal")
+        if kind in {"display", "flow"}:
+            return
+        if status == "dynamic" and kind == "condition" and replay_dynamic_condition(dependency):
+            return
+        if status != "resolved":
+            reason = str(dependency.get("reason", "unresolved"))
+            target_equivalence = (
+                kind == "call" and reason.startswith("公共事件目标为运行时动态值")
+            )
+            protect(
+                (
+                    key
+                    for key in [*source_keys, *right_keys]
+                    if not target_equivalence
+                    or key not in candidates
+                    or not same_event_target(key)
+                ),
+                reason,
+            )
+            raw_scopes = tuple(dependency.get("unresolved_scopes", ()))
+            if raw_scopes or status == "blocking":
+                scoped = _scope_keys(
+                    items,
+                    raw_scopes or ("project",),
+                    scope_cache,
+                )
+                protect(
+                    (
+                        key
+                        for key in scoped
+                        if set(map(str, usage_by_key.get(key, ()))) != {"display_only"}
+                        and (
+                            not target_equivalence
+                            or key not in candidates
+                            or not same_event_target(key)
+                        )
+                    ),
+                    reason,
+                )
+            return
+        if kind != "condition":
+            protect([*source_keys, *right_keys], kind)
+            return
+        operator = str(dependency.get("operator", "unknown"))
+        literal = str(dependency.get("literal", ""))
+        if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+            protect([*source_keys, *right_keys], "unsupported_condition")
+            return
+        if right_keys:
+            for left_key in source_keys:
+                for right_key in right_keys:
+                    if left_key not in candidates and right_key not in candidates:
+                        continue
+                    left_original = originals.get(left_key, "")
+                    right_original = originals.get(right_key, "")
+                    left_final = final_value(left_key) if left_key in originals else left_original
+                    right_final = final_value(right_key) if right_key in originals else right_original
+                    if _safety_predicate(operator, left_original, right_original) != _safety_predicate(
+                        operator, left_final, right_final
+                    ):
+                        protect((left_key, right_key), "condition_truth_change")
+            return
+        for key in source_keys:
+            if key not in candidates:
+                continue
+            original = originals[key]
+            if _safety_predicate(operator, original, literal) != _safety_predicate(
+                operator, final_value(key), literal
+            ):
+                protect((key,), "condition_truth_change")
+            elif set(map(str, usage_by_key.get(key, ()))) <= {"logic"}:
+                safe.add(key)
+
+    iterations = 0
+    while True:
+        protected_before = len(forced)
+        for dependency in dependencies:
+            evaluate_dependency(dependency)
+        iterations += 1
+        if len(forced) == protected_before:
+            break
+        if iterations > len(candidates) + 1:
+            raise RuntimeError("WOLF 候选译文安全保护集合无法收敛。")
+
+    protected = set(base_protected)
+    protected.update(forced)
+    safe.difference_update(protected)
+    unresolved = sorted(
+        {
+            str(scope)
+            for dependency in dependencies
+            if isinstance(dependency, dict) and dependency.get("status") != "resolved"
+            for scope in dependency.get("unresolved_scopes", ())
+        }
+    )
+    if policy == "block" and protected:
+        first = sorted(protected)[0]
+        raise RuntimeError(
+            "WOLF 静态安全分析无法证明全部候选译文安全，已阻止导入："
+            f"{first}（{', '.join(sorted(reasons.get(first, {'not_proven_safe'})))}）。"
+        )
+    return {
+        "schema": 1,
+        "safe_to_translate": sorted(safe),
+        "keep_original": sorted(protected),
+        "unresolved_scopes": unresolved,
+        "replay": {
+            "iterations": iterations,
+            "candidate_changes": len(candidates),
+            "safe_changes": len(safe),
+            "protected_changes": len(protected),
+            "control_flow_equivalent": True,
+        },
+        "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
     }
 
 

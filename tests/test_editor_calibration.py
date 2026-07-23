@@ -46,6 +46,8 @@ class EditorCalibrationTests(unittest.TestCase):
                 self.assertEqual(effect, command_effect(opcode, int_count, string_count))
                 semantics = command_semantics(opcode, int_count, string_count)
                 self.assertIsNotNone(semantics)
+                self.assertTrue(semantics["semantic_complete"])
+                self.assertNotIn("encoded_parameter", semantics["integer_roles"])
                 self.assertIn(semantics["transfer"], {
                     "preserve", "numeric_write", "string_read", "string_write",
                     "condition", "control_flow", "database", "event_call", "opaque",
