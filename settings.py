@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, QStandardPaths
 
 from models import AppSettings
+from wolf_editor import inspect_wolf_editor
 
 
 APP_NAME = "WOLFLator"
@@ -161,6 +162,10 @@ def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
         errors.append("请选择官方 WOLF Translation Support Tool。")
     elif not (wolf_path.parent / "LibXL.dll").is_file():
         errors.append("官方工具目录缺少 LibXL.dll。")
+    try:
+        inspect_wolf_editor(item.wolf_editor_path)
+    except (OSError, ValueError) as error:
+        errors.append(f"请选择有效的 WOLF RPG Editor：{error}")
     if not item.ainiee_source or not Path(item.ainiee_source).exists():
         errors.append("请选择或安装 AiNiee-Next。")
     if require_api:

@@ -17,11 +17,19 @@ from ainiee import (
     prepare_managed_runtime,
     test_api,
 )
-from models import MAX_EXTERNAL_FILE_LIMIT_KB, STAGE_ORDER, AppSettings, ImportScope, Stage
+from models import (
+    MAX_EXTERNAL_FILE_LIMIT_KB,
+    STAGE_ORDER,
+    AppSettings,
+    ImportProtectionRules,
+    ImportScope,
+    Stage,
+)
 from pipeline import Pipeline, add_version, create_project, load_manifest
 from safe_io import ResourceBusyError, project_lock, project_lock_status
 from settings import SettingsStore, local_data_dir, validate_settings
 from wolf_tools import CancelledError
+from wolf_editor import inspect_wolf_editor, install_supported_editor
 
 
 def _stage(value: str) -> Stage:
@@ -79,11 +87,20 @@ def _check_settings(settings: AppSettings) -> tuple[str, str]:
 
 
 def _print_progress(current: int, total: int, stage: Stage) -> None:
-    print(f"progress stage={stage.value} {current}/{total}", flush=True)
+    _print_pipeline_line(f"progress stage={stage.value} {current}/{total}")
 
 
 def _print_log(message: str) -> None:
-    print(f"log {message}", flush=True)
+    _print_pipeline_line(f"log {message}")
+
+
+def _print_pipeline_line(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except OSError as error:
+        # ponytail: The detailed file log is authoritative when a pipe consumer exits.
+        if error.errno not in {22, 32}:
+            raise
 
 
 def _pipeline(
@@ -101,6 +118,8 @@ def _pipeline(
         api_key = _api_key(settings)
     elif stage is Stage.GLOSSARY:
         glossary_api_key = _glossary_api_key(settings)
+    elif stage is Stage.EXTRACT:
+        inspect_wolf_editor(settings.wolf_editor_path)
     return Pipeline(
         args.manifest,
         settings,
@@ -138,6 +157,7 @@ def _status(args: argparse.Namespace) -> int:
         "export_scope": manifest.export_scope.__dict__,
         "translation_scope": manifest.translation_scope.__dict__,
         "import_scope": manifest.import_scope.__dict__,
+        "import_protection": manifest.import_protection.__dict__,
         "busy": busy,
         "lock": safe_owner if busy else {},
         "stages": records,
@@ -170,7 +190,25 @@ def _status(args: argparse.Namespace) -> int:
 def _settings_check(args: argparse.Namespace) -> int:
     _, settings = _load_settings(args)
     errors = validate_settings(settings, require_api=not args.no_api)
-    result = {"valid": not errors, "errors": errors}
+    try:
+        editor = inspect_wolf_editor(settings.wolf_editor_path)
+        editor_result = {
+            "status": "ready",
+            "path": str(editor.path),
+            "version": editor.version,
+            "sha256": editor.sha256,
+        }
+    except (OSError, ValueError) as error:
+        editor_result = {
+            "status": "invalid",
+            "path": settings.wolf_editor_path,
+            "error": str(error),
+        }
+    result = {
+        "valid": not errors,
+        "errors": errors,
+        "tools": {"wolf_editor": editor_result},
+    }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
@@ -225,8 +263,26 @@ def _prepare_ainiee(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_editor(args: argparse.Namespace) -> int:
+    store, settings = _load_settings(args)
+    executable = install_supported_editor(
+        local_data_dir() / "packages" / "editor",
+        repair=args.repair,
+        progress=_progress_download,
+        log=_print_log,
+    )
+    settings.wolf_editor_path = str(executable)
+    store.save(settings)
+    print(f"editor={executable}")
+    print("WOLF RPG Editor 已就绪。")
+    return 0
+
+
 def _create_project(args: argparse.Namespace) -> int:
     store, settings = _load_settings(args)
+    errors = validate_settings(settings)
+    if errors:
+        raise RuntimeError("设置未完成：\n" + "\n".join(f"- {error}" for error in errors))
     projects_root = args.projects_root or settings.projects_root
     path = create_project(projects_root, args.game, args.name or "")
     settings.last_project = str(path)
@@ -284,6 +340,16 @@ def _scope(args: argparse.Namespace) -> int:
     )
     if filter_requested and args.target != "export":
         raise ValueError("大文件自动排除选项仅适用于 --target export。")
+    protection_names = (
+        "protect_external_references",
+        "protect_paths_and_commands",
+        "allow_copy_condition_groups",
+        "protect_logic_references",
+        "suspicious_identifiers",
+    )
+    protection_requested = any(getattr(args, name) is not None for name in protection_names)
+    if protection_requested and args.target != "import":
+        raise ValueError("导入保护规则仅适用于 --target import。")
     with project_lock(args.manifest, f"set-{args.target}-scope"):
         pipeline = _pipeline(args)
         current = {
@@ -314,6 +380,16 @@ def _scope(args: argparse.Namespace) -> int:
             pipeline.set_translation_scope(scope)
         else:
             pipeline.set_import_scope(scope)
+            current_rules = pipeline.manifest.import_protection
+            rule_values = {
+                name: (
+                    getattr(args, name)
+                    if getattr(args, name) is not None
+                    else getattr(current_rules, name)
+                )
+                for name in protection_names
+            }
+            pipeline.set_import_protection(ImportProtectionRules(**rule_values))
     result = {"target": args.target, **values}
     if args.target == "export":
         result.update(
@@ -322,6 +398,8 @@ def _scope(args: argparse.Namespace) -> int:
                 "external_file_limit_kb": limit_kb,
             }
         )
+    elif args.target == "import":
+        result["import_protection"] = rule_values
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -349,6 +427,9 @@ def build_parser() -> argparse.ArgumentParser:
     ainiee = subparsers.add_parser("ainiee-prepare", help="安装或选择 AiNiee，并准备隔离依赖运行时")
     ainiee.add_argument("--source", help="已有 AiNiee GUI、安装目录或源码目录")
     ainiee.add_argument("--repair", action="store_true", help="强制重新同步 uv 依赖")
+
+    editor = subparsers.add_parser("editor-install", help="检测并安装官网最新版 WOLF RPG Editor")
+    editor.add_argument("--repair", action="store_true", help="重新下载并替换托管版本")
 
     create = subparsers.add_parser("project-create", help="从 WOLF 游戏目录创建项目")
     create.add_argument("game", help="包含 Game.exe 和 Data.wolf/Data 的游戏目录")
@@ -395,6 +476,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=_external_file_limit,
         help="自动排除的大小上限（KB）",
     )
+    for name, help_text in (
+        ("protect_external_references", "保留外部脚本引用名称"),
+        ("protect_paths_and_commands", "保留路径与脚本命令"),
+        ("allow_copy_condition_groups", "允许 COPY-FROM 条件/混合范围组整体翻译"),
+        ("protect_logic_references", "按 WOLF 事件逻辑保护分支相关文本"),
+    ):
+        scope.add_argument(
+            f"--{name.replace('_', '-')}",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=help_text,
+        )
+    scope.add_argument(
+        "--suspicious-identifiers",
+        choices=("ignore", "warn", "protect"),
+        help="可疑标识符策略",
+    )
     return parser
 
 
@@ -414,6 +512,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _api_test(args)
         if args.command == "ainiee-prepare":
             return _prepare_ainiee(args)
+        if args.command == "editor-install":
+            return _install_editor(args)
         if args.command == "project-create":
             return _create_project(args)
         if args.command == "project-add-version":

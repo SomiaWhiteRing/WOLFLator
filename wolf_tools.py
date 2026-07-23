@@ -24,6 +24,7 @@ from fonts import FONT_CODES
 from models import (
     MAX_EXTERNAL_FILE_LIMIT_KB,
     ImportCategory,
+    ImportProtectionRules,
     ImportScope,
     ToolResult,
     TranslationItem,
@@ -52,6 +53,15 @@ PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
 COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
+EXTERNAL_DIRECTIVE_RE = re.compile(
+    r"^[ \t]*@(?P<command>[slr])(?P<value>[^\s#]+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+PATH_OR_COMMAND_RE = re.compile(
+    r"(?:^[ \t]*@[A-Za-z]+)|(?:\bData[\\/][^\r\n]+)|(?:[A-Za-z]:[\\/][^\r\n]+)|"
+    r"(?:[^\s<>]+\.(?:png|jpe?g|webp|ogg|wav|mp3|md|txt|csv|json|ini)$)",
+    re.IGNORECASE,
+)
 
 
 def full_export_scope() -> ImportScope:
@@ -1146,6 +1156,8 @@ def _copy_source(item: TranslationItem, by_code: dict[str, list[TranslationItem]
 def selected_translation_requirements(
     items: list[TranslationItem],
     scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
 ) -> dict[str, set[ImportCategory]]:
     by_code: dict[str, list[TranslationItem]] = {}
     for item in items:
@@ -1158,6 +1170,12 @@ def selected_translation_requirements(
         if category is None:
             continue
         source = _copy_source(item, by_code) if item.category is ImportCategory.COPY else item
+        if (
+            allow_copy_condition_groups
+            and item.category is ImportCategory.COPY
+            and item.copy_category is ImportCategory.OPTIONAL_NAME
+        ):
+            category = _content_category(source.code, source.flag, source.type)
         sources[source.key] = source
         categories = groups.setdefault(source.key, set())
         categories.add(category)
@@ -1179,17 +1197,29 @@ def selected_translation_requirements(
 def selected_translation_items(
     items: list[TranslationItem],
     scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
 ) -> list[TranslationItem]:
-    required = selected_translation_requirements(items, scope)
+    required = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    )
     return [item for item in items if item.key in required]
 
 
 def to_paratranz(
     items: list[TranslationItem],
     scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
 ) -> list[dict[str, object]]:
     output: list[dict[str, object]] = []
-    for item in selected_translation_items(items, scope):
+    for item in selected_translation_items(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    ):
         protected, tokens = protect_control_tokens(item.original)
         if tokens != item.control_signature:
             raise ValueError(f"控制符签名发生变化: {item.code}")
@@ -1244,8 +1274,17 @@ def retryable_translation_errors(
     items: list[TranslationItem],
     translated: list[dict[str, object]],
     scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
 ) -> dict[str, str]:
-    expected = {item.key: item for item in selected_translation_items(items, scope)}
+    expected = {
+        item.key: item
+        for item in selected_translation_items(
+            items,
+            scope,
+            allow_copy_condition_groups=allow_copy_condition_groups,
+        )
+    }
     actual = _index_ainiee_rows(translated)
     extra = set(actual) - set(expected)
     if extra:
@@ -1266,8 +1305,17 @@ def merge_ainiee_output(
     items: list[TranslationItem],
     translated: list[dict[str, object]],
     scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
 ) -> list[TranslationItem]:
-    expected = {item.key: item for item in selected_translation_items(items, scope)}
+    expected = {
+        item.key: item
+        for item in selected_translation_items(
+            items,
+            scope,
+            allow_copy_condition_groups=allow_copy_condition_groups,
+        )
+    }
     actual = _index_ainiee_rows(translated)
     missing = set(expected) - set(actual)
     extra = set(actual) - set(expected)
@@ -1393,8 +1441,329 @@ def write_font_workbook(
     return _save_workbook_atomic(workbook, output_path)
 
 
-def final_display_texts(items: list[TranslationItem], scope: ImportScope) -> list[str]:
-    requirements = selected_translation_requirements(items, scope)
+def _external_reference_evidence(game_root: str | Path) -> dict[str, str]:
+    # ponytail: This recognizes the compact @s/@l/@r DSL only; add a parser when another grammar is observed.
+    text_root = Path(game_root) / "Data" / "textfile"
+    evidence: dict[str, str] = {}
+    if not text_root.is_dir():
+        return evidence
+    for path in sorted(text_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".md", ".txt", ".csv"}:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            content = path.read_text(encoding="cp932", errors="replace")
+        relative = path.relative_to(Path(game_root)).as_posix()
+        for match in EXTERNAL_DIRECTIVE_RE.finditer(content):
+            value = match.group("value").strip().strip('"\'')
+            if value and value not in evidence:
+                line = content.count("\n", 0, match.start()) + 1
+                evidence[value] = f"{relative}:{line}"
+    return evidence
+
+
+def _looks_like_path_or_command(item: TranslationItem) -> bool:
+    if item.category is ImportCategory.FILENAME:
+        return False
+    return bool(PATH_OR_COMMAND_RE.search(item.original.strip()))
+
+
+def _looks_like_identifier(value: str) -> bool:
+    # ponytail: This is warning-only by default; promote project-specific patterns through exact rules, not a larger heuristic.
+    text = value.strip()
+    return (
+        1 < len(text) <= 200
+        and not any(char.isspace() for char in text)
+        and "_" in text
+        and any(char.isascii() and char.isalnum() for char in text)
+        and any(not char.isascii() for char in text)
+    )
+
+
+def _logic_predicate(operator: str, value: str, literal: str) -> bool:
+    if operator == "equals":
+        return value == literal
+    if operator == "not_equals":
+        return value != literal
+    if operator == "contains":
+        return literal in value
+    if operator == "starts_with":
+        return value.startswith(literal)
+    raise ValueError(f"Editor 分析报告包含未知比较操作符：{operator}")
+
+
+def analyze_import_protection(
+    items: list[TranslationItem],
+    scope: ImportScope,
+    game_root: str | Path,
+    rules: ImportProtectionRules,
+    logic_analysis: dict[str, object] | None = None,
+    *,
+    block_on_logic_issue: bool = True,
+) -> dict[str, object]:
+    requirements = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=rules.allow_copy_condition_groups,
+    )
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
+    source_by_item = {
+        item.key: _copy_source(item, by_code) if item.category is ImportCategory.COPY else item
+        for item in items
+    }
+    protected: set[str] = set()
+    entries: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    logic_dependencies = (
+        logic_analysis.get("dependencies", []) if isinstance(logic_analysis, dict) else []
+    )
+    logic_blocking = (
+        logic_analysis.get("blocking_issues", []) if isinstance(logic_analysis, dict) else []
+    )
+    relevant_logic_blocking: list[dict[str, object]] = []
+
+    def add(
+        item: TranslationItem,
+        action: str,
+        reason: str,
+        evidence: str = "",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        source = source_by_item[item.key]
+        if source.key not in requirements:
+            return
+        if action != "atomic_translate" and not source.translation:
+            return
+        marker = (source.key, action, reason)
+        if marker in seen:
+            return
+        seen.add(marker)
+        if action == "keep_original":
+            protected.add(source.key)
+        entry: dict[str, object] = {
+            "action": action,
+            "reason": reason,
+            "key": source.key,
+            "code": source.code,
+            "matched_code": item.code,
+            "original": source.original,
+            "translation": source.translation,
+            "evidence": evidence,
+        }
+        if details:
+            entry.update(details)
+        entries.append(entry)
+
+    for item in items:
+        if (
+            item.category is ImportCategory.COPY
+            and rules.allow_copy_condition_groups
+            and (
+                item.copy_category is ImportCategory.OPTIONAL_NAME
+                or "(Condition[String])" in item.context
+            )
+        ):
+            add(item, "atomic_translate", "copy_mixed_scope_group")
+
+    if rules.protect_external_references:
+        references = _external_reference_evidence(game_root)
+        for item in items:
+            evidence = references.get(item.original)
+            if evidence:
+                add(item, "keep_original", "external_reference", evidence)
+
+    source_items = {source.key: source for source in source_by_item.values()}.values()
+    if rules.protect_paths_and_commands:
+        for item in source_items:
+            if _looks_like_path_or_command(item):
+                add(item, "keep_original", "path_or_command")
+
+    if rules.protect_logic_references:
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 2:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 2 Editor 分析报告，请重新执行导出文本。")
+        dependencies = logic_analysis.get("dependencies")
+        blocking_issues = logic_analysis.get("blocking_issues")
+        if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
+            raise ValueError("Editor 分析报告缺少条件依赖或阻断问题。")
+        by_key = {item.key: item for item in items}
+        relevant_blocking: list[dict[str, object]] = []
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                raise ValueError("Editor 分析报告的条件依赖格式错误。")
+            operator = str(dependency.get("operator", ""))
+            literal = str(dependency.get("literal", ""))
+            source_keys = dependency.get("source_keys", [])
+            right_source_keys = dependency.get("right_source_keys", [])
+            condition_keys = dependency.get("condition_keys", [])
+            cells = dependency.get("database_cells", [])
+            if (
+                not isinstance(source_keys, list)
+                or not isinstance(right_source_keys, list)
+                or not isinstance(condition_keys, list)
+                or not isinstance(cells, list)
+            ):
+                raise ValueError("Editor 分析报告的条件来源格式错误。")
+            coordinates = ", ".join(
+                f"{cell.get('database')}[{cell.get('type')},{cell.get('data')},{cell.get('field')}]"
+                for cell in cells[:5]
+                if isinstance(cell, dict)
+            )
+            evidence = (
+                f"{dependency.get('auto_file', '')} event={dependency.get('event_id', '')} "
+                f"page={dependency.get('page', '')} command={dependency.get('command', '')}: "
+                f"{operator} {literal!r}"
+                + (f" <- {coordinates}" if coordinates else "")
+            )
+            details = {
+                "auto_file": dependency.get("auto_file", ""),
+                "event_type": dependency.get("event_type", ""),
+                "event_id": dependency.get("event_id", -1),
+                "event_name": dependency.get("event_name", ""),
+                "page": dependency.get("page", -1),
+                "command": dependency.get("command", -1),
+                "operator": operator,
+                "literal": literal,
+                "database_cells": cells,
+                "right_database_cells": dependency.get("right_database_cells", []),
+                "dependency_status": dependency.get("status", ""),
+            }
+            for key in condition_keys:
+                item = by_key.get(str(key))
+                if item:
+                    add(item, "keep_original", "logic_condition", evidence, details)
+                    if dependency.get("status") == "untracked":
+                        add(item, "warn", "logic_untracked", str(dependency.get("reason", "")), details)
+            source_candidates: dict[str, TranslationItem] = {}
+            relevant_sources = []
+            for key in source_keys:
+                item = by_key.get(str(key))
+                if item is None:
+                    continue
+                source = source_by_item[item.key]
+                source_candidates[source.key] = item
+                if source.key not in requirements or not source.translation:
+                    continue
+                relevant_sources.append(item)
+            right_candidates: dict[str, TranslationItem] = {}
+            relevant_right_sources = []
+            for key in right_source_keys:
+                item = by_key.get(str(key))
+                if item is None:
+                    continue
+                source = source_by_item[item.key]
+                right_candidates[source.key] = item
+                if source.key in requirements and source.translation:
+                    relevant_right_sources.append(item)
+            if dependency.get("status") == "blocking" and (relevant_sources or relevant_right_sources):
+                relevant_blocking.append(dependency)
+                for item in [*relevant_sources, *relevant_right_sources]:
+                    add(item, "warn", "logic_blocking", evidence, details)
+                continue
+            if dependency.get("status") == "untracked" and dependency.get("right_is_variable"):
+                for item in [*relevant_sources, *relevant_right_sources]:
+                    add(item, "keep_original", "logic_untracked_source", evidence, details)
+            if dependency.get("status") != "resolved":
+                continue
+            if right_source_keys:
+                # ponytail: Auto dependencies are small in practice; if a project
+                # proves this O(n^2) comparison costly, preserve selector correlation.
+                for left in source_candidates.values():
+                    left_source = source_by_item[left.key]
+                    left_final = (
+                        left_source.translation
+                        if left_source.key in requirements and left_source.translation
+                        else left_source.original
+                    )
+                    for right in right_candidates.values():
+                        right_source = source_by_item[right.key]
+                        right_final = (
+                            right_source.translation
+                            if right_source.key in requirements and right_source.translation
+                            else right_source.original
+                        )
+                        if left_final == left_source.original and right_final == right_source.original:
+                            continue
+                        if _logic_predicate(operator, left_source.original, right_source.original) != _logic_predicate(
+                            operator, left_final, right_final
+                        ):
+                            add(left, "keep_original", "logic_value_change", evidence, details)
+                            add(right, "keep_original", "logic_value_change", evidence, details)
+                continue
+            for item in relevant_sources:
+                source = source_by_item[item.key]
+                if _logic_predicate(operator, source.original, literal) != _logic_predicate(
+                    operator, source.translation, literal
+                ):
+                    add(item, "keep_original", "logic_value_change", evidence, details)
+        relevant_logic_blocking = relevant_blocking
+        if relevant_blocking and block_on_logic_issue:
+            first = relevant_blocking[0]
+            raise RuntimeError(
+                "WOLF 事件逻辑依赖在分析途中失去可证明来源，已阻止导入："
+                f"{first.get('auto_file', '')} event={first.get('event_id', '')} "
+                f"page={first.get('page', '')} command={first.get('command', '')}，"
+                f"{first.get('reason', '')}。可关闭“WOLF 事件逻辑保护”强制继续。"
+            )
+
+    if rules.suspicious_identifiers != "ignore":
+        action = "keep_original" if rules.suspicious_identifiers == "protect" else "warn"
+        for item in source_items:
+            if item.key not in protected and _looks_like_identifier(item.original):
+                add(item, action, "suspicious_identifier")
+
+    action_order = {"keep_original": 0, "warn": 1, "atomic_translate": 2}
+    entries.sort(key=lambda entry: (action_order[entry["action"]], entry["code"], entry["original"]))
+    return {
+        "schema": 3,
+        "protected_keys": sorted(protected),
+        "entries": entries,
+        "summary": {
+            "protected": len(protected),
+            "warnings": sum(entry["action"] == "warn" for entry in entries),
+            "atomic_groups": sum(entry["action"] == "atomic_translate" for entry in entries),
+            "logic_dependencies": len(
+                logic_dependencies
+            ),
+            "logic_protected": len({
+                entry["key"]
+                for entry in entries
+                if entry["reason"] in {"logic_condition", "logic_value_change"}
+            }),
+            "logic_blocking": len(
+                logic_blocking
+            ),
+            "logic_blocking_relevant": len(relevant_logic_blocking),
+            "logic_protection_enabled": rules.protect_logic_references,
+            "logic_risk": len(logic_blocking) if not rules.protect_logic_references else 0,
+            "unknown_logic_semantics": len(
+                logic_analysis.get("unknown_commands", [])
+                if isinstance(logic_analysis, dict)
+                else []
+            ),
+        },
+    }
+
+
+def final_display_texts(
+    items: list[TranslationItem],
+    scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
+    protected_keys: set[str] | None = None,
+) -> list[str]:
+    requirements = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    )
+    requirements = {
+        key: categories
+        for key, categories in requirements.items()
+        if key not in (protected_keys or set())
+    }
     by_code: dict[str, list[TranslationItem]] = {}
     for item in items:
         by_code.setdefault(item.code, []).append(item)
@@ -1431,11 +1800,23 @@ def write_scoped_workbook(
     scope: ImportScope,
     game_root: str | Path,
     items: list[TranslationItem],
+    *,
+    allow_copy_condition_groups: bool = False,
+    protected_keys: set[str] | None = None,
 ) -> Path:
     workbook = load_workbook(full_path)
     worksheet = workbook.active
     _header_row, headers = _header_map(worksheet)
-    requirements = selected_translation_requirements(items, scope)
+    requirements = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    )
+    requirements = {
+        key: categories
+        for key, categories in requirements.items()
+        if key not in (protected_keys or set())
+    }
     items_by_key = {item.key: item for item in items}
     by_code: dict[str, list[TranslationItem]] = {}
     for item in items:

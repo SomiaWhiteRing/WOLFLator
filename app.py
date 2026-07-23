@@ -7,8 +7,16 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QFontDatabase, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QDesktopServices,
+    QFont,
+    QFontDatabase,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -67,6 +75,7 @@ from fonts import (
 from models import (
     DEFAULT_EXTERNAL_FILE_LIMIT_KB,
     MAX_EXTERNAL_FILE_LIMIT_KB,
+    ImportProtectionRules,
     ImportScope,
     RunMode,
     STAGE_ORDER,
@@ -77,7 +86,17 @@ from models import (
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
 from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
-from wolf_tools import final_display_texts, load_items, read_font_slots
+from wolf_editor import (
+    EDITOR_DOWNLOAD_URL,
+    inspect_wolf_editor,
+    install_supported_editor,
+)
+from wolf_tools import (
+    analyze_import_protection,
+    final_display_texts,
+    load_items,
+    read_font_slots,
+)
 
 
 STAGE_LABELS = {
@@ -100,7 +119,7 @@ STATUS_LABELS = {
 STAGE_DESCRIPTIONS = {
     Stage.COPY: "建立源副本与工作副本",
     Stage.UNPACK: "使用 UberWolf 准备松散 Data",
-    Stage.EXTRACT: "通过官方工具导出 XLSX",
+    Stage.EXTRACT: "导出 XLSX 并分析全部事件",
     Stage.GLOSSARY: "从完整语料生成角色与术语",
     Stage.TRANSLATE: "调用 AiNiee 翻译文本",
     Stage.VALIDATE: "校验键、译文与控制符",
@@ -127,6 +146,31 @@ STAGE_RESULT_ARTIFACTS = {
     Stage.IMPORT: "translated_game",
     Stage.RELEASE: "release",
 }
+IMPORT_PROTECTION_ACTION_LABELS = {
+    "keep_original": "保留原文",
+    "warn": "仅警告",
+    "atomic_translate": "整体翻译",
+}
+IMPORT_PROTECTION_REASON_LABELS = {
+    "external_reference": "外部脚本引用",
+    "path_or_command": "路径或脚本命令",
+    "logic_condition": "WOLF 条件字面量",
+    "logic_value_change": "WOLF 条件真值变化",
+    "logic_untracked": "WOLF 条件来源未追踪",
+    "logic_blocking": "WOLF 条件来源阻断",
+    "suspicious_identifier": "可疑标识符",
+    "copy_mixed_scope_group": "COPY-FROM 条件/混合范围组",
+}
+
+
+def _load_editor_analysis(manifest) -> dict[str, object] | None:
+    path = manifest.version.stage(Stage.EXTRACT).artifacts.get("editor_analysis", "")
+    if not path or not Path(path).is_file():
+        return None
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("Editor 分析报告根节点不是对象。")
+    return value
 
 
 class PipelineThread(QThread):
@@ -183,6 +227,28 @@ class InstallThread(QThread):
                 path,
                 self.runtime_root,
                 force_sync=self.repair,
+                log=self.log_line.emit,
+            )
+            self.installed.emit(str(path))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class EditorInstallThread(QThread):
+    progress_changed = Signal(int, int)
+    log_line = Signal(str)
+    installed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, packages_root: Path):
+        super().__init__()
+        self.packages_root = packages_root
+
+    def run(self) -> None:
+        try:
+            path = install_supported_editor(
+                self.packages_root,
+                progress=self.progress_changed.emit,
                 log=self.log_line.emit,
             )
             self.installed.emit(str(path))
@@ -248,15 +314,31 @@ class FontScanThread(QThread):
             if original_record is None:
                 raise RuntimeError("无法建立当前版本的原字体记录。")
             original_slots = list(original_record["slots"])
-            required = required_characters(final_display_texts(items, manifest.import_scope))
-            if self.isInterruptionRequested():
-                return
             version_dir = self.manifest_path.parent / "versions" / manifest.active_version
             game_root = version_dir / "work"
             if not game_root.is_dir():
                 game_root = version_dir / "source"
             if not game_root.is_dir():
                 game_root = Path(manifest.version.original_path)
+            protection = analyze_import_protection(
+                items,
+                manifest.import_scope,
+                game_root,
+                manifest.import_protection,
+                _load_editor_analysis(manifest),
+            )
+            required = required_characters(
+                final_display_texts(
+                    items,
+                    manifest.import_scope,
+                    allow_copy_condition_groups=(
+                        manifest.import_protection.allow_copy_condition_groups
+                    ),
+                    protected_keys=set(protection["protected_keys"]),
+                )
+            )
+            if self.isInterruptionRequested():
+                return
             candidates = discover_font_candidates(
                 game_root,
                 required,
@@ -334,6 +416,7 @@ class SettingsDialog(QDialog):
         self.store = store
         self.settings = store.load()
         self.install_thread: InstallThread | None = None
+        self.editor_install_thread: EditorInstallThread | None = None
         self.api_thread: ApiTestThread | None = None
         self.api_test_target = "translation"
         self.setWindowTitle("WOLFLator 设置")
@@ -350,7 +433,31 @@ class SettingsDialog(QDialog):
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(12)
         self.wolf_path = QLineEdit(self.settings.wolf_tool_path)
-        form.addRow("官方 WOLF 工具", _path_row(self.wolf_path, "选择 EXE", self._choose_wolf))
+        form.addRow("官方翻译工具", _path_row(self.wolf_path, "选择 EXE", self._choose_wolf))
+
+        self.editor_path = QLineEdit(self.settings.wolf_editor_path)
+        editor_widget = QWidget()
+        editor_layout = QHBoxLayout(editor_widget)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(8)
+        editor_layout.addWidget(self.editor_path, 1)
+        self.select_editor_button = QPushButton("选择 Editor.exe")
+        self.select_editor_button.clicked.connect(self._choose_editor)
+        self.editor_install_button = QPushButton("安装最新版")
+        self.editor_install_button.clicked.connect(self._install_editor)
+        download_editor = QPushButton("官方下载页")
+        download_editor.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(EDITOR_DOWNLOAD_URL))
+        )
+        editor_layout.addWidget(self.select_editor_button)
+        editor_layout.addWidget(self.editor_install_button)
+        editor_layout.addWidget(download_editor)
+        form.addRow("WOLF RPG Editor", editor_widget)
+        self.editor_status = QLabel("")
+        self.editor_status.setObjectName("secondaryText")
+        form.addRow("", self.editor_status)
+        self.editor_path.editingFinished.connect(self._probe_editor)
+        self._probe_editor()
 
         self.ainiee_path = QLineEdit(self.settings.ainiee_source)
         ainiee_widget = QWidget()
@@ -575,6 +682,24 @@ class SettingsDialog(QDialog):
         if path:
             self.wolf_path.setText(path)
 
+    def _choose_editor(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 WOLF RPG Editor",
+            self.editor_path.text(),
+            "Editor.exe (Editor.exe)",
+        )
+        if path:
+            self.editor_path.setText(path)
+            self._probe_editor()
+
+    def _probe_editor(self) -> None:
+        try:
+            info = inspect_wolf_editor(self.editor_path.text().strip())
+            self.editor_status.setText(f"已识别 WOLF RPG Editor {info.version}")
+        except (OSError, ValueError) as error:
+            self.editor_status.setText(str(error) if self.editor_path.text().strip() else "尚未指定 Editor.exe")
+
     def _choose_ainiee(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择 AiNiee 安装或源码目录", self.ainiee_path.text())
         if not path:
@@ -584,6 +709,33 @@ class SettingsDialog(QDialog):
             self._start_ainiee_setup(False, source)
         except Exception as exc:
             QMessageBox.critical(self, "AiNiee 不兼容", str(exc))
+
+    def _install_editor(self) -> None:
+        if self._installation_running():
+            return
+        self._set_install_controls_enabled(False)
+        self.install_progress.setRange(0, 0)
+        self.install_progress.show()
+        self.activity.setText("正在安装 WOLF RPG Editor...")
+        self.editor_install_thread = EditorInstallThread(
+            local_data_dir() / "packages" / "editor"
+        )
+        self.editor_install_thread.progress_changed.connect(self._install_progress_changed)
+        self.editor_install_thread.log_line.connect(self.activity.setText)
+        self.editor_install_thread.installed.connect(self._editor_installed)
+        self.editor_install_thread.failed.connect(self._editor_install_failed)
+        self.editor_install_thread.start()
+
+    def _editor_installed(self, path: str) -> None:
+        self.editor_path.setText(path)
+        self._probe_editor()
+        self.activity.setText(f"WOLF RPG Editor 已就绪：{path}")
+        self._finish_install()
+
+    def _editor_install_failed(self, detail: str) -> None:
+        self.activity.setText("WOLF RPG Editor 安装失败")
+        self._finish_install()
+        QMessageBox.critical(self, "安装失败", detail[-4000:])
 
     def _choose_projects_root(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择项目目录", self.projects_root.text())
@@ -599,12 +751,9 @@ class SettingsDialog(QDialog):
         self._start_ainiee_setup(repair)
 
     def _start_ainiee_setup(self, repair: bool, source: str = "") -> None:
-        if self.install_thread and self.install_thread.isRunning():
+        if self._installation_running():
             return
-        self.install_button.setEnabled(False)
-        self.select_ainiee_button.setEnabled(False)
-        self.repair_button.setEnabled(False)
-        self.save_button.setEnabled(False)
+        self._set_install_controls_enabled(False)
         self.install_progress.setRange(0, 0)
         self.install_progress.show()
         self.activity.setText("正在准备 AiNiee 源码与运行依赖...")
@@ -630,20 +779,30 @@ class SettingsDialog(QDialog):
     def _ainiee_installed(self, path: str) -> None:
         self.ainiee_path.setText(path)
         self.activity.setText(f"AiNiee 已就绪：{path}")
-        self.install_progress.hide()
-        self.install_button.setEnabled(True)
-        self.select_ainiee_button.setEnabled(True)
-        self.repair_button.setEnabled(True)
-        self.save_button.setEnabled(True)
+        self._finish_install()
 
     def _ainiee_install_failed(self, detail: str) -> None:
         self.activity.setText("AiNiee 安装失败")
-        self.install_progress.hide()
-        self.install_button.setEnabled(True)
-        self.select_ainiee_button.setEnabled(True)
-        self.repair_button.setEnabled(True)
-        self.save_button.setEnabled(True)
+        self._finish_install()
         QMessageBox.critical(self, "安装失败", detail[-4000:])
+
+    def _installation_running(self) -> bool:
+        return bool(
+            (self.install_thread and self.install_thread.isRunning())
+            or (self.editor_install_thread and self.editor_install_thread.isRunning())
+        )
+
+    def _set_install_controls_enabled(self, enabled: bool) -> None:
+        self.install_button.setEnabled(enabled)
+        self.select_ainiee_button.setEnabled(enabled)
+        self.repair_button.setEnabled(enabled)
+        self.select_editor_button.setEnabled(enabled)
+        self.editor_install_button.setEnabled(enabled)
+        self.save_button.setEnabled(enabled)
+
+    def _finish_install(self) -> None:
+        self.install_progress.hide()
+        self._set_install_controls_enabled(True)
 
     def _open_ainiee(self) -> None:
         path = Path(self.ainiee_path.text())
@@ -671,6 +830,7 @@ class SettingsDialog(QDialog):
     def _current_settings(self):
         item = self.settings
         item.wolf_tool_path = self.wolf_path.text().strip()
+        item.wolf_editor_path = self.editor_path.text().strip()
         item.ainiee_source = self.ainiee_path.text().strip()
         item.api_base_url = self.api_url.text().strip().rstrip("/")
         item.api_model = self.api_model.text().strip()
@@ -742,9 +902,7 @@ class SettingsDialog(QDialog):
             QMessageBox.critical(self, "无法保存设置", str(exc))
 
     def reject(self) -> None:
-        running = (self.install_thread and self.install_thread.isRunning()) or (
-            self.api_thread and self.api_thread.isRunning()
-        )
+        running = self._installation_running() or (self.api_thread and self.api_thread.isRunning())
         if running:
             QMessageBox.information(self, "任务运行中", "请等待当前安装或测试结束。")
             return
@@ -1112,9 +1270,10 @@ class MainWindow(QMainWindow):
                 self.external_file_limit_kb = QSpinBox()
                 self.external_file_limit_kb.setRange(1, MAX_EXTERNAL_FILE_LIMIT_KB)
                 self.external_file_limit_kb.setValue(DEFAULT_EXTERNAL_FILE_LIMIT_KB)
-                self.external_file_limit_kb.setSuffix(" KB 的文件")
+                filter_suffix = QLabel("KB 的文件")
                 filter_layout.addWidget(self.exclude_large_external_files)
                 filter_layout.addWidget(self.external_file_limit_kb)
+                filter_layout.addWidget(filter_suffix)
                 filter_layout.addStretch(1)
                 panel_layout.addWidget(self.external_filter_options)
                 check.toggled.connect(self._update_external_filter_controls)
@@ -1128,7 +1287,10 @@ class MainWindow(QMainWindow):
                 warning = QLabel("启用文件名导入前，发布副本中必须存在对应的目标文件。")
                 warning.setObjectName("warningText")
                 panel_layout.addWidget(warning)
-        panel_layout.addStretch(1)
+        if target == "import":
+            self._add_import_protection_controls(panel_layout)
+        else:
+            panel_layout.addStretch(1)
         stack.addWidget(panel)
         if target == "export":
             self.external_filter_options.setVisible(checks["external"].isChecked())
@@ -1148,6 +1310,142 @@ class MainWindow(QMainWindow):
     def _external_filter_changed(self, _checked: bool) -> None:
         self._update_external_filter_controls()
         self._save_scope("export")
+
+    def _add_import_protection_controls(self, layout: QVBoxLayout) -> None:
+        title = QLabel("导入保护规则")
+        title.setObjectName("panelTitle")
+        layout.addWidget(title)
+        self.protect_external_references = QCheckBox("保留外部脚本引用名称")
+        self.protect_paths_and_commands = QCheckBox("保留路径与脚本命令")
+        self.protect_logic_references = QCheckBox("按 WOLF 事件逻辑保护分支相关文本")
+        self.allow_copy_condition_groups = QCheckBox("允许 COPY-FROM 条件/混合范围组整体翻译")
+        for control in (
+            self.protect_external_references,
+            self.protect_paths_and_commands,
+            self.protect_logic_references,
+            self.allow_copy_condition_groups,
+        ):
+            control.setChecked(True)
+            control.toggled.connect(self._save_import_protection)
+            layout.addWidget(control)
+        copy_note = QLabel("COPY-FROM 选项会改变 AiNiee 输入；修改后将重置术语及后续阶段。")
+        copy_note.setObjectName("secondaryText")
+        layout.addWidget(copy_note)
+
+        identifier_row = QHBoxLayout()
+        identifier_row.addWidget(QLabel("可疑标识符"))
+        self.suspicious_identifier_action = QComboBox()
+        self.suspicious_identifier_action.addItem("不处理", "ignore")
+        self.suspicious_identifier_action.addItem("仅警告", "warn")
+        self.suspicious_identifier_action.addItem("保留原文", "protect")
+        self.suspicious_identifier_action.setCurrentIndex(1)
+        self.suspicious_identifier_action.currentIndexChanged.connect(
+            self._save_import_protection
+        )
+        identifier_row.addWidget(self.suspicious_identifier_action)
+        identifier_row.addStretch(1)
+        layout.addLayout(identifier_row)
+
+        preview_row = QHBoxLayout()
+        self.import_protection_summary = QLabel("完成翻译后可预览实际匹配项")
+        self.import_protection_summary.setObjectName("secondaryText")
+        preview_row.addWidget(self.import_protection_summary, 1)
+        self.preview_import_protection_button = QPushButton("预览匹配项")
+        self.preview_import_protection_button.clicked.connect(
+            self._preview_import_protection
+        )
+        preview_row.addWidget(self.preview_import_protection_button)
+        layout.addLayout(preview_row)
+
+        self.import_protection_table = QTableWidget(0, 4)
+        self.import_protection_table.setHorizontalHeaderLabels(
+            ["动作", "代码", "原文", "原因"]
+        )
+        self.import_protection_table.setMinimumHeight(180)
+        _configure_table(self.import_protection_table)
+        layout.addWidget(self.import_protection_table, 1)
+
+    def _current_import_protection_rules(self) -> ImportProtectionRules:
+        return ImportProtectionRules(
+            protect_external_references=self.protect_external_references.isChecked(),
+            protect_paths_and_commands=self.protect_paths_and_commands.isChecked(),
+            protect_logic_references=self.protect_logic_references.isChecked(),
+            allow_copy_condition_groups=self.allow_copy_condition_groups.isChecked(),
+            suspicious_identifiers=str(
+                self.suspicious_identifier_action.currentData() or "warn"
+            ),
+        )
+
+    def _save_import_protection(self, _value: object = None) -> None:
+        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
+            return
+        pipeline = Pipeline(
+            self.current_manifest_path,
+            self.settings,
+            "",
+            local_data_dir(),
+            glossary_api_key="",
+        )
+        pipeline.set_import_protection(self._current_import_protection_rules())
+        if self.pipeline:
+            self.pipeline.manifest = pipeline.manifest
+        self.import_protection_summary.setText("规则已保存；点击预览重新分析")
+
+    def _preview_import_protection(self) -> None:
+        self.import_protection_table.setRowCount(0)
+        if not self.current_manifest_path:
+            self.import_protection_summary.setText("请先选择项目")
+            return
+        try:
+            manifest = load_manifest(self.current_manifest_path)
+            artifacts = manifest.version.stage(Stage.VALIDATE).artifacts
+            items_path = artifacts.get("items", "")
+            if not items_path or not Path(items_path).is_file():
+                items_path = manifest.version.stage(Stage.TRANSLATE).artifacts.get("items", "")
+            if not items_path or not Path(items_path).is_file():
+                raise RuntimeError("完成翻译后才能预览实际匹配项。")
+            version_dir = self.current_manifest_path.parent / "versions" / manifest.active_version
+            game_root = version_dir / "work"
+            if not game_root.is_dir():
+                game_root = version_dir / "source"
+            report = analyze_import_protection(
+                load_items(items_path),
+                manifest.import_scope,
+                game_root,
+                manifest.import_protection,
+                _load_editor_analysis(manifest),
+                block_on_logic_issue=False,
+            )
+            entries = report["entries"]
+            self.import_protection_table.setRowCount(min(len(entries), 500))
+            for row, entry in enumerate(entries[:500]):
+                reason = IMPORT_PROTECTION_REASON_LABELS.get(
+                    entry["reason"], entry["reason"]
+                )
+                if entry.get("evidence"):
+                    reason += f"（{entry['evidence']}）"
+                values = (
+                    IMPORT_PROTECTION_ACTION_LABELS.get(entry["action"], entry["action"]),
+                    entry["code"],
+                    entry["original"],
+                    reason,
+                )
+                for column, value in enumerate(values):
+                    self.import_protection_table.setItem(
+                        row, column, QTableWidgetItem(str(value))
+                    )
+            summary = report["summary"]
+            suffix = "；表格仅显示前 500 项" if len(entries) > 500 else ""
+            self.import_protection_summary.setText(
+                f"保留 {summary['protected']} 组，警告 {summary['warnings']} 组，"
+                f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
+                f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
+                f"阻断问题 {summary.get('logic_blocking_relevant', 0)} 组，"
+                f"未知语义 {summary.get('unknown_logic_semantics', 0)} 类，"
+                f"整体翻译 {summary['atomic_groups']} 组{suffix}"
+            )
+        except Exception as exc:
+            self.import_protection_summary.setText(str(exc))
 
     def _font_tab(self) -> QWidget:
         page = QWidget()
@@ -1649,12 +1947,19 @@ class MainWindow(QMainWindow):
             record = manifest.version.stage(stage)
             official_warning = record.artifacts.get("official_warning_count", "0")
             font_warning = record.artifacts.get("font_warning_count", "0")
+            editor_warning = record.artifacts.get("editor_warning_count", "0")
             warning_count = sum(
-                int(value) if value.isdigit() else 0 for value in (official_warning, font_warning)
+                int(value) if value.isdigit() else 0
+                for value in (official_warning, font_warning, editor_warning)
             )
             detail = record.error or record.artifacts.get(
                 "official_warnings",
-                record.artifacts.get("font_warnings", next(iter(record.artifacts.values()), "")),
+                record.artifacts.get(
+                    "font_warnings",
+                    record.artifacts.get(
+                        "editor_warnings", next(iter(record.artifacts.values()), "")
+                    ),
+                ),
             )
             self._update_stage_status(
                 self.easy_stage_status[stage], record.status, detail, warning_count
@@ -1717,6 +2022,24 @@ class MainWindow(QMainWindow):
         self.external_file_limit_kb.setValue(manifest.external_file_limit_kb)
         self.external_file_limit_kb.blockSignals(False)
         self._update_external_filter_controls()
+        protection_controls = (
+            (self.protect_external_references, manifest.import_protection.protect_external_references),
+            (self.protect_paths_and_commands, manifest.import_protection.protect_paths_and_commands),
+            (self.protect_logic_references, manifest.import_protection.protect_logic_references),
+            (self.allow_copy_condition_groups, manifest.import_protection.allow_copy_condition_groups),
+        )
+        for control, checked in protection_controls:
+            control.blockSignals(True)
+            control.setChecked(checked)
+            control.blockSignals(False)
+        self.suspicious_identifier_action.blockSignals(True)
+        identifier_index = self.suspicious_identifier_action.findData(
+            manifest.import_protection.suspicious_identifiers
+        )
+        self.suspicious_identifier_action.setCurrentIndex(max(identifier_index, 0))
+        self.suspicious_identifier_action.blockSignals(False)
+        self.import_protection_table.setRowCount(0)
+        self.import_protection_summary.setText("点击预览分析当前译文")
         self._load_glossary()
         self._refresh_font_tab()
 
@@ -1912,6 +2235,15 @@ class MainWindow(QMainWindow):
                 check.setEnabled(enabled)
         self.exclude_large_external_files.setEnabled(enabled)
         self.external_file_limit_kb.setEnabled(enabled)
+        for control in (
+            self.protect_external_references,
+            self.protect_paths_and_commands,
+            self.protect_logic_references,
+            self.allow_copy_condition_groups,
+            self.suspicious_identifier_action,
+            self.preview_import_protection_button,
+        ):
+            control.setEnabled(enabled)
         self.export_scope_button.setEnabled(enabled)
         self.translation_scope_button.setEnabled(enabled)
         self.import_scope_button.setEnabled(enabled)
@@ -1928,6 +2260,11 @@ class MainWindow(QMainWindow):
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
             return
         errors = validate_settings(self.settings) if stage is None else []
+        if stage is Stage.EXTRACT:
+            try:
+                inspect_wolf_editor(self.settings.wolf_editor_path)
+            except (OSError, ValueError) as error:
+                errors.append(f"WOLF RPG Editor：{error}")
         if errors:
             QMessageBox.warning(self, "设置未完成", "\n".join(errors))
             return

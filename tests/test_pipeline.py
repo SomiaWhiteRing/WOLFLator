@@ -7,7 +7,16 @@ from unittest import mock
 from openpyxl import Workbook
 
 from fonts import BUNDLED_FONT_FAMILY, BUNDLED_FONT_ID, default_font_scheme, load_font_scheme
-from models import STAGE_ORDER, AppSettings, ImportScope, RunMode, Stage, StageStatus, TranslationItem
+from models import (
+    STAGE_ORDER,
+    AppSettings,
+    ImportProtectionRules,
+    ImportScope,
+    RunMode,
+    Stage,
+    StageStatus,
+    TranslationItem,
+)
 from pipeline import Pipeline, create_project, load_manifest
 from wolf_tools import dump_items, full_export_scope, load_items
 
@@ -39,6 +48,24 @@ class FailingPipeline(FakePipeline):
 
 
 class PipelineTests(unittest.TestCase):
+    def _attach_editor_analysis(self, pipeline: Pipeline) -> Path:
+        path = pipeline.artifacts_dir / "editor-analysis.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 2,
+                    "dependencies": [],
+                    "blocking_issues": [],
+                    "unknown_commands": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_analysis"] = str(path)
+        return path
+
     def _translation_pipeline(self, root: Path) -> Pipeline:
         manifest_path = create_project(root / "projects", make_game(root / "game"))
         pipeline = Pipeline(
@@ -59,6 +86,7 @@ class PipelineTests(unittest.TestCase):
         ]
         items_path = dump_items(pipeline.artifacts_dir / "items-extracted.json", items)
         pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
+        self._attach_editor_analysis(pipeline)
         (pipeline.project_dir / "glossary.json").write_text("{}", encoding="utf-8")
         return pipeline
 
@@ -231,6 +259,7 @@ class PipelineTests(unittest.TestCase):
             workbook.save(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["workbook"] = str(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
+            self._attach_editor_analysis(pipeline)
 
             verification = root / "verification.xlsx"
             verify_book = Workbook()
@@ -314,6 +343,7 @@ class PipelineTests(unittest.TestCase):
                 "workbook": str(baseline),
                 "items": str(items_path),
             }
+            self._attach_editor_analysis(pipeline)
             translated = make_game(root / "translated")
             generated = root / "generated"
             runner = mock.Mock()
@@ -433,19 +463,22 @@ class PipelineTests(unittest.TestCase):
             legacy.pop("export_scope")
             legacy.pop("exclude_large_external_files")
             legacy.pop("external_file_limit_kb")
+            legacy.pop("import_protection")
             Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
             migrated = load_manifest(manifest_path)
-            self.assertEqual(3, migrated.schema)
+            self.assertEqual(5, migrated.schema)
             self.assertFalse(migrated.export_scope.external)
             self.assertTrue(migrated.export_scope.optional_name)
             self.assertTrue(migrated.exclude_large_external_files)
             self.assertEqual(128, migrated.external_file_limit_kb)
+            self.assertFalse(migrated.import_protection.allow_copy_condition_groups)
 
             schema_two = json.loads(json.dumps(migrated.to_dict()))
             schema_two["schema"] = 2
             schema_two["export_scope"]["external"] = True
             schema_two.pop("exclude_large_external_files")
             schema_two.pop("external_file_limit_kb")
+            schema_two.pop("import_protection")
             Path(manifest_path).write_text(json.dumps(schema_two), encoding="utf-8")
             migrated = load_manifest(manifest_path)
             self.assertTrue(migrated.export_scope.external)
@@ -619,6 +652,40 @@ class PipelineTests(unittest.TestCase):
             second.executed = executed
             self.assertEqual("completed", second.run())
             self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]), executed)
+
+    def test_import_protection_resets_only_affected_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            self.assertEqual("completed", pipeline.run())
+            current = pipeline.manifest.import_protection
+            pipeline.set_import_protection(
+                ImportProtectionRules(
+                    **{**current.__dict__, "protect_paths_and_commands": False}
+                )
+            )
+            changed = load_manifest(manifest_path)
+            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.VALIDATE).status)
+            self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.IMPORT).status)
+            self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.RELEASE).status)
+
+            with pipeline._mutation("restore-completed"):
+                pipeline.manifest = changed
+                for stage in Stage:
+                    pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
+                pipeline.save()
+            current = pipeline.manifest.import_protection
+            pipeline.set_import_protection(
+                ImportProtectionRules(
+                    **{**current.__dict__, "allow_copy_condition_groups": False}
+                )
+            )
+            changed = load_manifest(manifest_path)
+            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.EXTRACT).status)
+            self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.GLOSSARY).status)
 
     def test_translation_and_export_scope_changes_reset_expected_stages(self):
         with tempfile.TemporaryDirectory() as directory:

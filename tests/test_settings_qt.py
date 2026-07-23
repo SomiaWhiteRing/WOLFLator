@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from app import STAGE_RESULT_LABELS, InstallThread, MainWindow, SettingsDialog
+from app import EditorInstallThread, STAGE_RESULT_LABELS, InstallThread, MainWindow, SettingsDialog
 from fonts import FontCandidate
 from models import AppSettings, RunMode, Stage, StageStatus
 from pipeline import PipelineStateEvent, create_project, load_manifest
@@ -36,11 +36,24 @@ class SettingsQtTests(unittest.TestCase):
     def test_dialog_loads_persisted_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.ini")
-            item = AppSettings(wolf_tool_path=r"C:\Tools\Wolf.exe", ainiee_source=r"C:\Tools\AiNiee")
+            item = AppSettings(
+                wolf_tool_path=r"C:\Tools\Wolf.exe",
+                wolf_editor_path=r"C:\Tools\Editor.exe",
+                ainiee_source=r"C:\Tools\AiNiee",
+            )
             store.save(item)
             dialog = SettingsDialog(store)
             self.assertEqual(item.wolf_tool_path, dialog.wolf_path.text())
+            self.assertEqual(item.wolf_editor_path, dialog.editor_path.text())
             self.assertEqual(item.ainiee_source, dialog.ainiee_path.text())
+            self.assertIn(
+                "官方下载页",
+                [button.text() for button in dialog.findChildren(QPushButton)],
+            )
+            self.assertIn(
+                "安装最新版",
+                [button.text() for button in dialog.findChildren(QPushButton)],
+            )
             dialog.close()
 
     def test_missing_glossary_settings_do_not_inherit_translation_api(self):
@@ -113,6 +126,19 @@ class SettingsQtTests(unittest.TestCase):
                 log=thread.log_line.emit,
             )
 
+    def test_editor_install_thread_uses_managed_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            editor = root / "packages" / "3.713" / "Editor.exe"
+            with patch("app.install_supported_editor", return_value=editor) as install:
+                thread = EditorInstallThread(root / "packages")
+                thread.run()
+            install.assert_called_once_with(
+                root / "packages",
+                progress=thread.progress_changed.emit,
+                log=thread.log_line.emit,
+            )
+
     def test_first_run_dialog_waits_until_window_can_be_shown(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.ini")
@@ -150,10 +176,23 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertFalse(window.external_filter_options.isHidden())
                 self.assertTrue(window.exclude_large_external_files.isChecked())
                 self.assertEqual(128, window.external_file_limit_kb.value())
+                self.assertEqual("", window.external_file_limit_kb.suffix())
+                self.assertTrue(
+                    any(
+                        label.text() == "KB 的文件"
+                        for label in window.external_filter_options.findChildren(QLabel)
+                    )
+                )
                 window.exclude_large_external_files.setChecked(False)
                 self.assertFalse(window.external_file_limit_kb.isEnabled())
                 window.export_scope_checks["external"].setChecked(False)
                 self.assertTrue(window.external_filter_options.isHidden())
+                self.assertTrue(window.protect_logic_references.isChecked())
+                self.assertTrue(window.protect_external_references.isChecked())
+                self.assertTrue(window.protect_paths_and_commands.isChecked())
+                self.assertTrue(window.allow_copy_condition_groups.isChecked())
+                self.assertEqual("warn", window.suspicious_identifier_action.currentData())
+                self.assertEqual(4, window.import_protection_table.columnCount())
                 self.assertEqual(8, len(window.step_buttons))
                 self.assertEqual(8, len(window.step_result_buttons))
                 self.assertTrue(all(button.text() == "执行" for button in window.step_buttons.values()))

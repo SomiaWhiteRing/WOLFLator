@@ -1,6 +1,6 @@
 # WOLFLator
 
-WOLFLator 将 UberWolf、WOLF Translation Support Tool for FreeGames 和 AiNiee-Next 组合为一个可恢复的 Windows 桌面翻译流程。v1 只支持日文到简体中文，发布结果是带松散 `Data` 目录的完整游戏副本。
+WOLFLator 将 UberWolf、WOLF Translation Support Tool for FreeGames、WOLF RPG Editor 和 AiNiee-Next 组合为一个可恢复的 Windows 桌面翻译流程。v1 只支持日文到简体中文，发布结果是带松散 `Data` 目录的完整游戏副本。
 
 ## 开发运行
 
@@ -16,6 +16,7 @@ python app.py
 python cli.py settings-check
 python cli.py api-test --target glossary
 python cli.py api-test --target translation
+python cli.py editor-install                  # 检测、安装并配置官网最新版 Editor
 python cli.py ainiee-prepare                 # 安装固定版本并准备依赖
 python cli.py project-create "C:\Games\MyWolfGame"
 python cli.py run "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json"
@@ -30,12 +31,13 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 首次启动需要指定：
 
 - 自行取得的 WOLF Translation Support Tool for FreeGames EXE；同目录必须有 `LibXL.dll`。
+- WOLF RPG Editor 3.500 或更高版本。可在设置中自动检测并安装[官方页面](https://silversecond.com/WolfRPGEditor/Download.shtml)提供的最高版本，也可自行下载并指定 `Editor.exe`。Editor 仅在使用时从官方网站下载，不随 WOLFLator 再分发。
 - 已安装/解压的 AiNiee-Next，或在设置窗口点击“安装 V2.7.5”。
 - 两套 OpenAI 兼容 API 配置：术语生成，以及交给 AiNiee 使用的翻译配置。两者可使用不同的地址、模型、密钥、并发和超时；术语生成还可单独设置每块最大输入字符数和最大输出 Token。
 - 项目目录和纯 ASCII 的 UberWolf 执行目录。
 
 原始游戏只读使用。实际解包、官方 XLSX、AiNiee 输入输出和发布物都位于版本化项目工作区中。
-导出、翻译和导入范围彼此独立。新项目默认导出外部 TXT/CSV，并临时排除超过 128 KB 的文件；原游戏和工作副本不会被改动。官方工具额外生成一份关闭名称项及外部文件的内部基准表来精确分类。WOLF 官方工具不会读取 `.md`，这类剧情文件暂不包含在本功能中。
+导出、翻译和导入范围彼此独立。新项目默认导出外部 TXT/CSV，并临时排除超过 128 KB 的文件；原游戏和工作副本不会被改动。官方翻译工具额外生成一份关闭名称项及外部文件的内部基准表来精确分类；Editor 固定导出全部公共事件、地图事件和数据库 Auto.txt，供导入逻辑保护使用。官方工具不会读取 `.md`，这类剧情文件暂不包含在本功能中。
 
 “修改字体”页独立管理 WOLF 的四个字体槽位。字体方案只会使发布阶段失效，不会重跑 AI；新项目默认随附的 Fusion Pixel 12px 简体中文字体，既有项目没有 `font.json` 时保持原字体。系统或游戏字体会按哈希复制到项目后再使用，实际发布前会按最终导入语料检查缺字。
 
@@ -47,7 +49,7 @@ python cli.py scope "C:\Users\me\Documents\WOLFLator\MyWolfGame\project.json" --
 .\scripts\build.ps1
 ```
 
-构建脚本会下载固定版本的 UberWolfCli 与 uv，验证 `vendor/manifest.json` 中的 SHA-256，运行测试，再生成 `dist\WOLFLator`。AiNiee 和官方 WOLF 工具不会打入发行包。
+构建脚本会下载固定版本的 UberWolfCli 与 uv，验证 `vendor/manifest.json` 中的 SHA-256，运行测试，再生成 `dist\WOLFLator`。AiNiee、官方翻译工具和 WOLF RPG Editor 都不会打入发行包；AiNiee 和 Editor 可在设置页按需安装。
 
 ## 项目数据
 

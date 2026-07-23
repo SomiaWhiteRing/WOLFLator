@@ -1,4 +1,5 @@
 import http.server
+import hashlib
 import io
 import json
 import os
@@ -32,7 +33,14 @@ from fonts import (
     save_font_scheme,
     validate_font_scheme,
 )
-from models import AppSettings, ImportCategory, ImportScope, ToolResult, TranslationItem
+from models import (
+    AppSettings,
+    ImportCategory,
+    ImportProtectionRules,
+    ImportScope,
+    ToolResult,
+    TranslationItem,
+)
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
@@ -44,6 +52,7 @@ from wolf_tools import (
     _process_startupinfo,
     _silent_official_executable,
     _write_console_snapshot,
+    analyze_import_protection,
     classify_optional_name_delta,
     dump_items,
     final_display_texts,
@@ -60,11 +69,21 @@ from wolf_tools import (
     restore_control_tokens,
     retryable_translation_errors,
     run_process,
+    selected_translation_requirements,
     temporary_external_filter_view,
     to_paratranz,
     write_font_workbook,
     write_full_workbook,
     write_scoped_workbook,
+)
+from wolf_editor import (
+    EditorRelease,
+    EditorInfo,
+    _copy_editor_sandbox,
+    analyze_auto_export,
+    inspect_wolf_editor,
+    install_supported_editor,
+    latest_editor_release_from_html,
 )
 
 
@@ -536,6 +555,510 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual("系统设置", names_sheet["G2"].value)
             self.assertEqual("系统设置", names_sheet["G3"].value)
             self.assertEqual("系统设置", names_sheet["G4"].value)
+
+    def test_import_protection_keeps_conditions_and_external_references_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(
+                [
+                    "COMMON-63-167-2",
+                    "",
+                    "◆操作盤3",
+                    r"CEv63 [index167](Condition[String])\n\cself[9] to compare",
+                    "",
+                    "HPバー",
+                    "",
+                ]
+            )
+            sheet.append(["UDB-35-92-0", "", "◆スチル", "名称", "", "再起動_1", ""])
+            sheet.append(["UDB-35-93-0", "", "◆スチル", "名称", "", "SHORT1", ""])
+            sheet.append(["DISPLAY-1", "", "Event", "Show Message", "", "通常表示", ""])
+            workbook.save(source)
+            items = read_translation_items(source)
+            items[0].translation = "HP条"
+            items[1].translation = "重新启动_1"
+            items[2].translation = "短片1"
+            items[3].translation = "正常显示"
+            game = root / "game"
+            scenario = game / "Data" / "textfile" / "01_scenario.md"
+            scenario.parent.mkdir(parents=True)
+            scenario.write_text("@s再起動_1\n@sSHORT1\n", encoding="utf-8")
+
+            report = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(protect_logic_references=False),
+            )
+            protected_codes = {
+                entry["code"]
+                for entry in report["entries"]
+                if entry["action"] == "keep_original"
+            }
+            self.assertEqual(
+                {"UDB-35-92-0", "UDB-35-93-0"},
+                protected_codes,
+            )
+
+            full = write_full_workbook(source, root / "full.xlsx", items)
+            scoped = write_scoped_workbook(
+                full,
+                root / "scoped.xlsx",
+                ImportScope(),
+                game,
+                items,
+                allow_copy_condition_groups=True,
+                protected_keys=set(report["protected_keys"]),
+            )
+            output = load_workbook(scoped).active
+            self.assertEqual("HP条", output["G2"].value)
+            self.assertIsNone(output["G3"].value)
+            self.assertIsNone(output["G4"].value)
+            self.assertEqual("正常显示", output["G5"].value)
+
+    def test_import_protection_uses_editor_logic_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            source = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(["UDB-7-1-1", "", "◆[rb]操作盤名", "[1:操作盤1] [リソース名1]", "", "戦_HPバー", ""])
+            sheet.append(["UDB-7-1-2", "", "◆[rb]操作盤名", "[1:操作盤1] [リソース名2]", "", "戦_HPバー2", ""])
+            sheet.append(["CDB-1-11-0", "COPY-FROM-UDB-7-1-1", "汎用リソース管理", "[11:戦_HPバー] [name]", "", "戦_HPバー", ""])
+            sheet.append(["COMMON-63-167-2", "", "◆操作盤3", "(Condition[String])", "", "HPバー", ""])
+            sheet.append(["DISPLAY-1", "", "画面", "名称", "", "再起動_1", ""])
+            workbook.save(source)
+            items = read_translation_items(source)
+            for item in items:
+                if item.code.startswith("UDB-7-1"):
+                    item.translation = "翻译后的键"
+                elif item.code == "COMMON-63-167-2":
+                    item.translation = "HP 条"
+                elif item.code == "DISPLAY-1":
+                    item.translation = "重新启动_1"
+            by_code = {item.code: item for item in items}
+            with self.assertRaisesRegex(ValueError, "schema 2"):
+                analyze_import_protection(
+                    items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
+                )
+            dependency = {
+                "auto_file": "BasicData/CommonEvent.dat.Auto.txt",
+                "event_type": "common",
+                "event_id": 63,
+                "event_name": "◆[rb]操作盤3",
+                "page": 1,
+                "command": 168,
+                "operator": "contains",
+                "literal": "HPバー",
+                "condition_keys": [by_code["COMMON-63-167-2"].key],
+                "source_keys": [
+                    by_code["UDB-7-1-1"].key,
+                    by_code["UDB-7-1-2"].key,
+                ],
+                "right_source_keys": [],
+                "database_cells": [
+                    {"database": "UDB", "type": 7, "data": 1, "field": 1},
+                    {"database": "UDB", "type": 7, "data": 1, "field": 2},
+                ],
+                "status": "resolved",
+                "reason": "",
+            }
+            analysis = {
+                "schema": 2,
+                "unknown_commands": [],
+                "blocking_issues": [],
+                "dependencies": [dependency],
+            }
+            report = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(),
+                analysis,
+            )
+            protected_codes = {
+                entry["code"]
+                for entry in report["entries"]
+                if entry["action"] == "keep_original"
+            }
+            self.assertIn("UDB-7-1-1", protected_codes)
+            self.assertIn("UDB-7-1-2", protected_codes)
+            self.assertIn("COMMON-63-167-2", protected_codes)
+            self.assertNotIn("DISPLAY-1", protected_codes)
+            variable_side = {
+                **dependency,
+                "status": "untracked",
+                "reason": "字符串变量比较的一侧来源未知",
+                "right_is_variable": True,
+                "condition_keys": [],
+                "source_keys": [],
+                "right_source_keys": [by_code["UDB-7-1-1"].key],
+            }
+            variable_report = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(),
+                {**analysis, "dependencies": [variable_side]},
+            )
+            self.assertIn(by_code["UDB-7-1-1"].key, variable_report["protected_keys"])
+            for operator, literal in (
+                ("equals", "戦_HPバー"),
+                ("not_equals", "戦_HPバー"),
+                ("contains", "HPバー"),
+                ("starts_with", "戦_"),
+            ):
+                trial = analyze_import_protection(
+                    items,
+                    ImportScope(),
+                    game,
+                    ImportProtectionRules(),
+                    {**analysis, "dependencies": [{**dependency, "operator": operator, "literal": literal}]},
+                )
+                self.assertIn(by_code["UDB-7-1-1"].key, trial["protected_keys"])
+            blocking_dependency = {
+                **dependency,
+                "status": "blocking",
+                "reason": "来源经过未支持命令 opcode=999",
+            }
+            blocking_analysis = {
+                **analysis,
+                "dependencies": [blocking_dependency],
+                "blocking_issues": [blocking_dependency],
+            }
+            with self.assertRaisesRegex(RuntimeError, "可关闭.*强制继续"):
+                analyze_import_protection(
+                    items, ImportScope(), game, ImportProtectionRules(), blocking_analysis
+                )
+            forced = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(protect_logic_references=False),
+                blocking_analysis,
+            )
+            self.assertEqual(1, forced["summary"]["logic_risk"])
+            full = write_full_workbook(source, root / "full.xlsx", items)
+            scoped = write_scoped_workbook(
+                full,
+                root / "scoped.xlsx",
+                ImportScope(),
+                game,
+                items,
+                protected_keys=set(report["protected_keys"]),
+            )
+            output = load_workbook(scoped).active
+            self.assertIsNone(output["G2"].value)
+            self.assertIsNone(output["G3"].value)
+            self.assertEqual("戦_HPバー", output["G4"].value)
+            self.assertIsNone(output["G5"].value)
+            self.assertEqual("重新启动_1", output["G6"].value)
+
+    def test_copy_mixed_scope_group_can_follow_the_display_source(self):
+        source = TranslationItem(
+            key="source",
+            original="装填レバー",
+            translation="装填杆",
+            code="UDB-11-21-0",
+            type="武装一覧",
+        )
+        condition = TranslationItem(
+            key="condition",
+            original="装填レバー",
+            code="COMMON-75-1016-2",
+            flag="COPY-FROM-UDB-11-21-0",
+            context="Event | CEv75 [index1016](DB Management)",
+            category=ImportCategory.COPY,
+            copy_category=ImportCategory.OPTIONAL_NAME,
+        )
+        self.assertEqual({}, selected_translation_requirements([source, condition], ImportScope()))
+        selected = selected_translation_requirements(
+            [source, condition],
+            ImportScope(),
+            allow_copy_condition_groups=True,
+        )
+        self.assertEqual({"source"}, set(selected))
+        source.translation = ""
+        report = analyze_import_protection(
+            [source, condition],
+            ImportScope(),
+            Path("missing-game"),
+            ImportProtectionRules(
+                allow_copy_condition_groups=True,
+                protect_logic_references=False,
+            ),
+        )
+        self.assertEqual(1, report["summary"]["atomic_groups"])
+
+    def test_editor_auto_analysis_contract_and_runtime_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auto = root / "Auto"
+            basic = auto / "BasicData"
+            maps = auto / "MapData"
+            basic.mkdir(parents=True)
+            maps.mkdir()
+            common = basic / "CommonEvent.dat.Auto.txt"
+            common.write_text(
+                "\n".join(
+                    [
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=2",
+                        "COMMON_ID=63",
+                        "COMMON_NAME=◆[rb]操作盤3",
+                        # Editor 3.713 calibration: sample CEv70 command 333 emitted
+                        # 0x301 for first-line cut; RIMWING CEv92 command 156 emitted
+                        # 0xA01 for cut-up-to-text; RIMWING CEv52 command 865
+                        # emitted 0x900 and described replacement in pretty output.
+                        "COMMAND_NUM=21",
+                        "WoditorEvCOMMAND_START",
+                        '[122][3,1]<0>(1600005,0,0)("校准")',
+                        '[122][3,0]<0>(1600006,1,1600005)()',
+                        '[112][2,1]<0>(1,1600006)("校准")',
+                        '[250][5,4]<0>(7,-3,0,332288,1600096)("","任意类型","","任意字段甲")',
+                        '[121][4,0]<0>(1600016,0,0,0)()',
+                        '[179][1,0]<0>(2)()',
+                        '[121][4,0]<1>(1600081,1600096,1600016,0)()',
+                        '[250][5,4]<1>(7,1600071,1600081,70144,1600007)("","任意类型","","")',
+                        # Editor 3.713 call flags expose four numeric slots (the
+                        # command selector plus three inputs) and two string inputs.
+                        # Opcode 210 reserves string slot 0 for its target just like 300.
+                        '[210][9,3]<1>(500008,16785444,151,0,0,0,1600007,0,1600008)("","","")',
+                        '[122][3,0]<1>(1600006,769,1600008)()',
+                        '[122][3,0]<1>(1600006,2561,1600007)()',
+                        '[122][3,1]<1>(1600006,2560,0)("\\cself[7]")',
+                        '[122][3,2]<1>(1600006,2304,0)("HP","")',
+                        '[170][0,0]<1>()()',
+                        '[122][3,1]<2>(1600006,0,0)("\\cself[6]")',
+                        '[171][0,0]<2>()()',
+                        '[498][0,0]<1>()()',
+                        # RIMWING CEv92 command 279 used flags=36 and had no
+                        # assignment in pretty output, so its inputs stay intact.
+                        '[210][8,0]<1>(600100,36,11,0,0,0,1600006,1600007)()',
+                        '[112][2,1]<1>(1,538470918)("HPバー")',
+                        '[121][4,0]<1>(1600016,1,0,256)()',
+                        '[498][0,0]<0>()()',
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=8",
+                        "COMMON_NAME=Formatter",
+                        "VALINPUT_NUM=4",
+                        "STRINPUT_NUM=2",
+                        "RETURN_VAL_TARGET=5",
+                        "COMMAND_NUM=2",
+                        "WoditorEvCOMMAND_START",
+                        '[212][0,1]<0>()("cmd:151")',
+                        '[213][0,1]<0>()("END")',
+                        "WoditorEvCOMMAND_END",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (maps / "Test.mps.Auto.txt").write_text(
+                "\n".join(
+                    [
+                        "[MAPDATA_TEXT_OUTPUT]",
+                        "EVENT_NUM=1",
+                        "EVENT_ID=1",
+                        "EVENT_NAME=Map event",
+                        "COMMAND_NUM=1",
+                        "WoditorEvCOMMAND_START",
+                        '[999][0,1]<0>()("未知,\\路径")',
+                        "WoditorEvCOMMAND_END",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (basic / "DataBase.Auto.txt").write_text(
+                "\n".join(
+                    [
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=7",
+                        "ITEM_NUM=3",
+                        "DATATYPE_0=2000",
+                        "DATATYPE_1=2001",
+                        "DATATYPE_2=2002",
+                        "DATA_NUM=2",
+                        "TYPENAME=任意类型",
+                        "ITEMNAME_NUM=3",
+                        "ITEMNAME0=名称",
+                        "ITEMNAME1=任意字段甲",
+                        "ITEMNAME2=无关字段",
+                        "<<--CSV_START-->>",
+                        '"名称","任意字段甲","无关字段",',
+                        '"一","戦_HPバー",",\\空",',
+                        '"二","戦_HPバー2","通常",',
+                        "<<--CSV_END-->>",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            items = [
+                TranslationItem(
+                    key="hp1",
+                    original="戦_HPバー",
+                    code="UDB-7-0-1",
+                    type="任意类型",
+                    info="[0:一] [任意字段甲]",
+                ),
+                TranslationItem(
+                    key="hp2",
+                    original="戦_HPバー2",
+                    code="UDB-7-1-1",
+                    type="任意类型",
+                    info="[1:二] [任意字段甲]",
+                ),
+                TranslationItem(
+                    key="condition",
+                    original="HPバー",
+                    code="COMMON-63-18-0",
+                    type="事件",
+                    info="条件",
+                ),
+                TranslationItem(
+                    key="calibration_source",
+                    original="校准",
+                    code="COMMON-63-0-0",
+                    type="事件",
+                    info="字符串赋值",
+                ),
+                TranslationItem(
+                    key="calibration_condition",
+                    original="校准",
+                    code="COMMON-63-2-0",
+                    type="事件",
+                    info="字符串条件",
+                ),
+                TranslationItem(key="plain", original="通常表示", type="画面", info="名称"),
+            ]
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
+            report = analyze_auto_export(auto, items, editor, input_hash="input")
+            self.assertEqual(2, report["schema"])
+            dependency = next(
+                item for item in report["dependencies"] if item["literal"] == "HPバー"
+            )
+            self.assertEqual({"hp1", "hp2"}, set(dependency["source_keys"]))
+            self.assertEqual(["condition"], dependency["condition_keys"])
+            self.assertEqual("contains", dependency["operator"])
+            self.assertEqual("BasicData/CommonEvent.dat.Auto.txt", dependency["auto_file"])
+            self.assertEqual({1}, {cell["field"] for cell in dependency["database_cells"]})
+            self.assertTrue(any("common=8 cmd=151" in entry for entry in dependency["trace"]))
+            self.assertEqual(1, report["counts"]["map_maps"])
+            self.assertIn(999, {entry["opcode"] for entry in report["unknown_commands"]})
+
+            common.write_text(common.read_text(encoding="utf-8").replace("任意类型", "English Type").replace("任意字段甲", "field_name"), encoding="utf-8")
+            database = basic / "DataBase.Auto.txt"
+            database.write_text(database.read_text(encoding="utf-8").replace("任意类型", "English Type").replace("任意字段甲", "field_name"), encoding="utf-8")
+            renamed = analyze_auto_export(auto, items, editor, input_hash="input")
+            renamed_hp = next(
+                item for item in renamed["dependencies"] if item["literal"] == "HPバー"
+            )
+            self.assertEqual({"hp1", "hp2"}, set(renamed_hp["source_keys"]))
+
+            database_text = database.read_text(encoding="utf-8")
+            database.write_text(database_text.replace("DATA_NUM=2", "DATA_NUM=3"), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "DATA_NUM"):
+                analyze_auto_export(auto, items, editor, input_hash="input")
+            database.write_text(database_text, encoding="utf-8")
+
+            common.write_text(common.read_text(encoding="utf-8").replace("COMMAND_NUM=21", "COMMAND_NUM=22", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "COMMAND_NUM"):
+                analyze_auto_export(auto, items, editor, input_hash="input")
+
+    def test_editor_version_and_sandbox_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            editor = root / "Editor.exe"
+            editor.write_bytes(b"editor")
+            with mock.patch(
+                "wolf_editor._windows_version_resource",
+                return_value=("3.220", (3, 220, 0, 0), "WOLF RPG Editor"),
+            ):
+                with self.assertRaisesRegex(ValueError, "版本过旧"):
+                    inspect_wolf_editor(editor)
+            for version in ("3.631", "3.713"):
+                parts = tuple(int(value) for value in version.split(".")) + (0, 0)
+                with mock.patch(
+                    "wolf_editor._windows_version_resource",
+                    return_value=(version, parts[:4], "WOLF RPG Editor"),
+                ):
+                    self.assertEqual(version, inspect_wolf_editor(editor).version)
+
+            game = root / "game"
+            basic = game / "Data" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "Game.dat").write_bytes(b"data")
+            (basic / "icon.png").write_bytes(b"image")
+            (game / "Data" / "MapData").mkdir()
+            (game / "Data" / "MapData" / "Map001.mps").write_bytes(b"map")
+            (game / "Data" / "story.txt").write_text("story", encoding="utf-8")
+            (game / "Data" / "work_temp").mkdir()
+            sandbox = root / "sandbox"
+            sandbox.mkdir()
+            maps_found = _copy_editor_sandbox(editor, game, sandbox)
+            self.assertEqual([Path("MapData/Map001.mps")], maps_found)
+            self.assertTrue((sandbox / "Data" / "BasicData" / "Game.dat").is_file())
+            self.assertFalse((sandbox / "Data" / "BasicData" / "icon.png").exists())
+            self.assertFalse((sandbox / "Data" / "story.txt").exists())
+            self.assertFalse((sandbox / "Data" / "work_temp").exists())
+
+    def test_editor_release_page_chooses_highest_and_prefers_mini(self):
+        release = latest_editor_release_from_html(
+            """
+            <a href="Data/WolfRPGEditor_3.713mini.zip">old</a>
+            <a href="https://silversecond.com/WolfRPGEditor/Data/WolfRPGEditor_3.800.zip">full</a>
+            <a href="https://www.silversecond.com/WolfRPGEditor/Data/WolfRPGEditor_3.800mini.zip">mini</a>
+            <a href="https://example.com/WolfRPGEditor_9.999mini.zip">foreign</a>
+            """
+        )
+        self.assertEqual("3.800", release.version)
+        self.assertTrue(release.mini)
+        self.assertIn("3.800mini.zip", release.url)
+
+    def test_managed_editor_install_validates_and_repairs_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "editor.zip"
+            editor_bytes = b"verified editor"
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("Editor.exe", editor_bytes)
+            archive_bytes = archive.read_bytes()
+            archive_hash = hashlib.sha256(archive_bytes).hexdigest()
+            release = EditorRelease(
+                "3.800",
+                (3, 800),
+                "https://silversecond.com/WolfRPGEditor/Data/WolfRPGEditor_3.800mini.zip",
+                True,
+            )
+
+            def download(actual_release, target, *, progress=None):
+                self.assertEqual(release, actual_release)
+                target.write_bytes(archive_bytes)
+                if progress:
+                    progress(len(archive_bytes), len(archive_bytes))
+                return archive_hash, len(archive_bytes)
+
+            with mock.patch(
+                "wolf_editor.discover_latest_editor_release",
+                return_value=release,
+            ), mock.patch(
+                "wolf_editor._windows_version_resource",
+                return_value=("3.800.2026.800", (3, 800, 2026, 800), "WOLF RPG Editor"),
+            ), mock.patch("wolf_editor._download_editor_archive", side_effect=download) as fetch:
+                executable = install_supported_editor(root / "packages")
+                self.assertEqual(editor_bytes, executable.read_bytes())
+                executable.write_bytes(b"damaged")
+                repaired = install_supported_editor(root / "packages")
+                self.assertEqual(editor_bytes, repaired.read_bytes())
+                self.assertEqual(2, fetch.call_count)
 
     def test_merge_and_scoped_workbook_preserve_table(self):
         with tempfile.TemporaryDirectory() as directory:

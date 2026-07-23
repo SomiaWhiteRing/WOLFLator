@@ -41,6 +41,7 @@ from models import (
     MAX_EXTERNAL_FILE_LIMIT_KB,
     STAGE_ORDER,
     AppSettings,
+    ImportProtectionRules,
     ImportScope,
     ProjectManifest,
     RunMode,
@@ -56,10 +57,12 @@ from safe_io import (
     read_text_with_retry,
     replace_with_retry,
 )
+from wolf_editor import AUTO_ANALYSIS_SCHEMA, export_and_analyze, inspect_wolf_editor
 from wolf_tools import (
     CancelledError,
     OfficialToolRunner,
     UberWolfRunner,
+    analyze_import_protection,
     classify_optional_name_delta,
     dump_items,
     final_display_texts,
@@ -88,7 +91,7 @@ from wolf_tools import (
 )
 
 
-EXPORT_SCHEMA = 3
+EXPORT_SCHEMA = 4
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -302,6 +305,7 @@ class Pipeline:
             for value in (
                 record.artifacts.get("official_warning_count", "0"),
                 record.artifacts.get("font_warning_count", "0"),
+                record.artifacts.get("editor_warning_count", "0"),
             )
         )
         self.state(PipelineStateEvent(stage, status, current, total, detail, warnings))
@@ -405,6 +409,23 @@ class Pipeline:
                 record.error = ""
             self.save()
 
+    def set_import_protection(self, rules: ImportProtectionRules) -> None:
+        with self._mutation("set-import-protection"):
+            previous = self.manifest.import_protection
+            if previous == rules:
+                return
+            self.manifest.import_protection = rules
+            first = (
+                Stage.GLOSSARY
+                if previous.allow_copy_condition_groups != rules.allow_copy_condition_groups
+                else Stage.IMPORT
+            )
+            for stage in STAGE_ORDER[STAGE_ORDER.index(first):]:
+                record = self.manifest.version.stage(stage)
+                record.status = StageStatus.PENDING
+                record.error = ""
+            self.save()
+
     def set_export_scope(
         self,
         scope: ImportScope,
@@ -491,8 +512,19 @@ class Pipeline:
             extra["ascii_runner_dir"] = self.settings.ascii_runner_dir
         elif stage is Stage.EXTRACT:
             tool = Path(self.settings.wolf_tool_path)
+            editor_path = Path(self.settings.wolf_editor_path)
             extra["wolf_tool"] = str(tool.resolve()) if tool.exists() else str(tool)
             extra["wolf_tool_size"] = tool.stat().st_size if tool.is_file() else 0
+            try:
+                editor = inspect_wolf_editor(editor_path)
+                extra["wolf_editor"] = str(editor.path)
+                extra["wolf_editor_version"] = editor.version
+                extra["wolf_editor_sha256"] = editor.sha256
+            except (OSError, ValueError):
+                extra["wolf_editor"] = str(editor_path)
+                extra["wolf_editor_version"] = ""
+                extra["wolf_editor_sha256"] = ""
+            extra["editor_analysis_schema"] = AUTO_ANALYSIS_SCHEMA
             extra["export_schema"] = EXPORT_SCHEMA
             extra["export_scope"] = self.manifest.export_scope.__dict__
             extra["exclude_large_external_files"] = self.manifest.exclude_large_external_files
@@ -509,6 +541,8 @@ class Pipeline:
                     "translation_scope": self.manifest.translation_scope.__dict__,
                 }
             )
+            if self.manifest.import_protection.allow_copy_condition_groups:
+                extra["allow_copy_condition_groups"] = True
         elif stage is Stage.TRANSLATE:
             glossary = self.project_dir / "glossary.json"
             extra.update(
@@ -520,8 +554,11 @@ class Pipeline:
                     "translation_scope": self.manifest.translation_scope.__dict__,
                 }
             )
+            if self.manifest.import_protection.allow_copy_condition_groups:
+                extra["allow_copy_condition_groups"] = True
         elif stage is Stage.IMPORT:
             extra["import_scope"] = self.manifest.import_scope.__dict__
+            extra["import_protection"] = self.manifest.import_protection.__dict__
         elif stage is Stage.RELEASE:
             scheme = load_font_scheme(self.project_dir)
             extra["font_scheme"] = scheme_hash(scheme)
@@ -536,7 +573,11 @@ class Pipeline:
                 items_path = self.manifest.version.stage(Stage.VALIDATE).artifacts.get("items", "")
                 if items_path and Path(items_path).is_file():
                     corpus = final_display_texts(
-                        load_items(items_path), self.manifest.import_scope
+                        load_items(items_path),
+                        self.manifest.import_scope,
+                        allow_copy_condition_groups=(
+                            self.manifest.import_protection.allow_copy_condition_groups
+                        ),
                     )
                     extra["font_corpus_sha256"] = hashlib.sha256(
                         json.dumps(corpus, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -616,6 +657,17 @@ class Pipeline:
         index = keys.index(self.manifest.active_version)
         return self.manifest.versions[keys[index - 1]] if index > 0 else None
 
+    def _editor_analysis(self) -> dict[str, object] | None:
+        path = self.manifest.version.stage(Stage.EXTRACT).artifacts.get(
+            "editor_analysis", ""
+        )
+        if not path or not Path(path).is_file():
+            return None
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Editor 分析报告根节点不是对象。")
+        return value
+
     def _official_runner(self, scope: ImportScope) -> OfficialToolRunner:
         executable = prepare_official_tool(
             self.settings.wolf_tool_path,
@@ -694,77 +746,131 @@ class Pipeline:
 
     def _extract(self) -> dict[str, str]:
         runner = self._official_runner(self.manifest.export_scope)
-        self.log("正在按导出范围生成 WOLF 翻译工作簿...")
-        previous = self._previous_version()
-        previous_full = None
-        conflicts: list[dict[str, object]] = []
-        if previous:
-            previous_full = previous.stage(Stage.VALIDATE).artifacts.get("full_workbook")
-        if previous_full and Path(previous_full).is_file():
-            support = self.work_dir / SUPPORT_DIR
-            support.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(previous_full, support / WORKBOOK_NAME)
-            workbook = self._run_scoped_export(runner, "UPDATE_EXCEL")
-            current_items = read_translation_items(workbook)
-            current_items, conflicts = reconcile_incremental(read_translation_items(previous_full), current_items)
-            write_full_workbook(workbook, workbook, current_items)
-            self.log("已通过官方 UPDATE_EXCEL 迁移上一版本译文。")
-        else:
-            workbook = self._run_scoped_export(runner, "EXTRACT")
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        extracted = self.artifacts_dir / "source.xlsx"
-        shutil.copy2(workbook, extracted)
+        token = f"{int(time.time())}-{os.getpid()}-{time.time_ns() & 0xFFFFFF:x}"
+        staging = self.artifacts_dir / f".extract-{token}"
+        final_dir = self.artifacts_dir / f"extract-{token}"
+        staging.mkdir()
+        try:
+            self.log("正在按导出范围生成 WOLF 翻译工作簿...")
+            previous = self._previous_version()
+            previous_full = None
+            conflicts: list[dict[str, object]] = []
+            if previous:
+                previous_full = previous.stage(Stage.VALIDATE).artifacts.get("full_workbook")
+            if previous_full and Path(previous_full).is_file():
+                support = self.work_dir / SUPPORT_DIR
+                support.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(previous_full, support / WORKBOOK_NAME)
+                workbook = self._run_scoped_export(runner, "UPDATE_EXCEL")
+                current_items = read_translation_items(workbook)
+                current_items, conflicts = reconcile_incremental(
+                    read_translation_items(previous_full), current_items
+                )
+                write_full_workbook(workbook, workbook, current_items)
+                self.log("已通过官方 UPDATE_EXCEL 迁移上一版本译文。")
+            else:
+                workbook = self._run_scoped_export(runner, "EXTRACT")
+            extracted = staging / "source.xlsx"
+            shutil.copy2(workbook, extracted)
 
-        self.log("正在生成名称分类基准工作簿...")
-        baseline_workbook = self._official_runner(name_baseline_scope(self.manifest.export_scope)).extract(
-            self.work_dir,
-            cancel_event=self.cancel_event,
-            log=self.log,
-            diagnostic_log=self.detail,
-            warning=self.warning,
-        )
-        baseline = self.artifacts_dir / "source-baseline.xlsx"
-        shutil.copy2(baseline_workbook, baseline)
-        shutil.copy2(extracted, self.work_dir / SUPPORT_DIR / WORKBOOK_NAME)
+            self.log("正在生成名称分类基准工作簿...")
+            baseline_workbook = self._official_runner(
+                name_baseline_scope(self.manifest.export_scope)
+            ).extract(
+                self.work_dir,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+                warning=self.warning,
+            )
+            baseline = staging / "source-baseline.xlsx"
+            shutil.copy2(baseline_workbook, baseline)
+            shutil.copy2(extracted, self.work_dir / SUPPORT_DIR / WORKBOOK_NAME)
 
-        items = read_translation_items(extracted)
-        baseline_items = read_translation_items(baseline)
-        optional_name_rows = classify_optional_name_delta(items, baseline_items)
-        items_path = dump_items(self.artifacts_dir / "items-extracted.json", items)
-        original_fonts = record_original_fonts(
-            self.project_dir,
-            self.manifest.active_version,
-            read_font_slots(items),
-            self.manifest.version.source_hash,
-            extracted,
-        )
-        categories: dict[str, int] = {}
-        for item in items:
-            categories[item.category.value] = categories.get(item.category.value, 0) + 1
-        self.detail(
-            f"extract.complete workbook={extracted} baseline={baseline} rows={len(items)} "
-            f"baseline_rows={len(baseline_items)} optional_name_rows={optional_name_rows} categories="
-            + json.dumps(categories, ensure_ascii=False, sort_keys=True)
-        )
-        artifacts = {
-            "workbook": str(extracted),
-            "baseline_workbook": str(baseline),
-            "items": str(items_path),
-            "optional_name_rows": str(optional_name_rows),
-            "original_fonts": str(original_fonts),
-        }
-        if conflicts:
-            conflicts_path = self.artifacts_dir / "incremental-conflicts.json"
-            _atomic_json(conflicts_path, conflicts)
-            artifacts["incremental_conflicts"] = str(conflicts_path)
-            artifacts["incremental_conflict_count"] = str(len(conflicts))
-            self.log(f"发现 {len(conflicts)} 条无法安全迁移的重复原文，已清空旧译并交给 AiNiee 重新翻译。")
-        return artifacts
+            items = read_translation_items(extracted)
+            baseline_items = read_translation_items(baseline)
+            optional_name_rows = classify_optional_name_delta(items, baseline_items)
+            dump_items(staging / "items-extracted.json", items)
+
+            self.log("正在通过 WOLF RPG Editor 导出并分析全部事件...")
+            editor_result = export_and_analyze(
+                self.settings.wolf_editor_path,
+                self.work_dir,
+                staging / "editor",
+                items,
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+                warning=self.warning,
+            )
+            if editor_result.warning_count:
+                self.warning(
+                    f"Editor 事件分析完成，但有 {editor_result.warning_count} 类未知字符串命令；"
+                    "这些命令未被盲目加入保护。"
+                )
+
+            categories: dict[str, int] = {}
+            for item in items:
+                categories[item.category.value] = categories.get(item.category.value, 0) + 1
+            if conflicts:
+                _atomic_json(staging / "incremental-conflicts.json", conflicts)
+            replace_with_retry(staging, final_dir)
+
+            extracted = final_dir / "source.xlsx"
+            baseline = final_dir / "source-baseline.xlsx"
+            items_path = final_dir / "items-extracted.json"
+            editor_auto = final_dir / "editor" / "editor-auto"
+            editor_analysis = final_dir / "editor" / "editor-analysis.json"
+            original_fonts = record_original_fonts(
+                self.project_dir,
+                self.manifest.active_version,
+                read_font_slots(items),
+                self.manifest.version.source_hash,
+                extracted,
+            )
+            self.detail(
+                f"extract.complete workbook={extracted} baseline={baseline} rows={len(items)} "
+                f"baseline_rows={len(baseline_items)} optional_name_rows={optional_name_rows} categories="
+                + json.dumps(categories, ensure_ascii=False, sort_keys=True)
+            )
+            artifacts = {
+                "workbook": str(extracted),
+                "baseline_workbook": str(baseline),
+                "items": str(items_path),
+                "optional_name_rows": str(optional_name_rows),
+                "original_fonts": str(original_fonts),
+                "editor_auto_dir": str(editor_auto),
+                "editor_analysis": str(editor_analysis),
+                "editor_version": editor_result.editor.version,
+                "editor_sha256": editor_result.editor.sha256,
+                "editor_warning_count": str(editor_result.warning_count),
+            }
+            if editor_result.warning_count:
+                artifacts["editor_warnings"] = str(editor_analysis)
+            if conflicts:
+                conflicts_path = final_dir / "incremental-conflicts.json"
+                artifacts["incremental_conflicts"] = str(conflicts_path)
+                artifacts["incremental_conflict_count"] = str(len(conflicts))
+                self.log(
+                    f"发现 {len(conflicts)} 条无法安全迁移的重复原文，已清空旧译并交给 AiNiee 重新翻译。"
+                )
+            return artifacts
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(final_dir, ignore_errors=True)
+            raise
 
     def _glossary(self) -> dict[str, str]:
         items_path = self.manifest.version.stage(Stage.EXTRACT).artifacts["items"]
         glossary_path = self.project_dir / "glossary.json"
-        items = selected_translation_items(load_items(items_path), self.manifest.translation_scope)
+        items = selected_translation_items(
+            load_items(items_path),
+            self.manifest.translation_scope,
+            allow_copy_condition_groups=(
+                self.manifest.import_protection.allow_copy_condition_groups
+            ),
+        )
         rules = generate_glossary(
             items,
             glossary_path,
@@ -779,7 +885,12 @@ class Pipeline:
     def _translate(self) -> dict[str, str]:
         extract = self.manifest.version.stage(Stage.EXTRACT).artifacts
         items = load_items(extract["items"])
-        paratranz = to_paratranz(items, self.manifest.translation_scope)
+        allow_copy_conditions = self.manifest.import_protection.allow_copy_condition_groups
+        paratranz = to_paratranz(
+            items,
+            self.manifest.translation_scope,
+            allow_copy_condition_groups=allow_copy_conditions,
+        )
         input_path = self.artifacts_dir / "ainiee-input.json"
         _atomic_json(input_path, paratranz)
         self.detail(
@@ -805,7 +916,10 @@ class Pipeline:
                 diagnostic_log=self.detail,
             )
             retry_errors = retryable_translation_errors(
-                items, raw, self.manifest.translation_scope
+                items,
+                raw,
+                self.manifest.translation_scope,
+                allow_copy_condition_groups=allow_copy_conditions,
             )
             if retry_errors:
                 first_output_path = self.artifacts_dir / "ainiee-output-pass1.json"
@@ -819,7 +933,11 @@ class Pipeline:
                     raise RuntimeError("无法按失败键完整生成 AiNiee 重跑输入。")
                 selected_by_key = {
                     item.key: item
-                    for item in selected_translation_items(items, self.manifest.translation_scope)
+                    for item in selected_translation_items(
+                        items,
+                        self.manifest.translation_scope,
+                        allow_copy_condition_groups=allow_copy_conditions,
+                    )
                 }
                 retry_reasons = [
                     {
@@ -855,7 +973,10 @@ class Pipeline:
                 _atomic_json(retry_output_path, retry_raw)
                 retry_items = [selected_by_key[str(row["key"])] for row in retry_input]
                 remaining_errors = retryable_translation_errors(
-                    retry_items, retry_raw, self.manifest.translation_scope
+                    retry_items,
+                    retry_raw,
+                    self.manifest.translation_scope,
+                    allow_copy_condition_groups=allow_copy_conditions,
                 )
                 retry_by_key = {str(row["key"]): row for row in retry_raw}
                 combined_by_key = {
@@ -894,7 +1015,12 @@ class Pipeline:
             raw = []
         raw_path = self.artifacts_dir / "ainiee-output.json"
         _atomic_json(raw_path, raw)
-        merged = merge_ainiee_output(items, raw, self.manifest.translation_scope)
+        merged = merge_ainiee_output(
+            items,
+            raw,
+            self.manifest.translation_scope,
+            allow_copy_condition_groups=allow_copy_conditions,
+        )
         items_path = dump_items(self.artifacts_dir / "items-translated.json", merged)
         translated_count = sum(bool(item.translation) for item in merged)
         self.detail(
@@ -915,7 +1041,13 @@ class Pipeline:
         reread = read_translation_items(full)
         if len(reread) != len(items):
             raise RuntimeError("完整工作簿回读行数不一致。")
-        required = selected_translation_requirements(items, self.manifest.translation_scope)
+        required = selected_translation_requirements(
+            items,
+            self.manifest.translation_scope,
+            allow_copy_condition_groups=(
+                self.manifest.import_protection.allow_copy_condition_groups
+            ),
+        )
         reread_by_key = {item.key: item for item in reread}
         missing = [
             item
@@ -933,7 +1065,21 @@ class Pipeline:
     def _import(self) -> dict[str, str]:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
         items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
-        required = selected_translation_requirements(items, self.manifest.import_scope)
+        rules = self.manifest.import_protection
+        protection = analyze_import_protection(
+            items,
+            self.manifest.import_scope,
+            self.work_dir,
+            rules,
+            self._editor_analysis(),
+        )
+        protected_keys = set(protection["protected_keys"])
+        required = selected_translation_requirements(
+            items,
+            self.manifest.import_scope,
+            allow_copy_condition_groups=rules.allow_copy_condition_groups,
+        )
+        required = {key: value for key, value in required.items() if key not in protected_keys}
         missing = [item for item in items if item.key in required and not item.translation]
         if missing:
             sample = "、".join(item.original[:30] for item in missing[:3])
@@ -944,13 +1090,33 @@ class Pipeline:
         self.detail(
             "import.start scope="
             + json.dumps(self.manifest.import_scope.__dict__, ensure_ascii=False, sort_keys=True)
+            + " protection="
+            + json.dumps(rules.__dict__, ensure_ascii=False, sort_keys=True)
         )
+        protection_path = self.artifacts_dir / "import-protection.json"
+        _atomic_json(protection_path, protection)
+        summary = protection["summary"]
+        self.log(
+            f"导入保护：保留 {summary['protected']} 组原文，"
+            f"提示 {summary['warnings']} 组可疑标识符，"
+            f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
+            f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
+            f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
+            f"放行 {summary['atomic_groups']} 个 COPY-FROM 条件/混合范围组。"
+        )
+        for entry in protection["entries"]:
+            self.detail(
+                "import.protection "
+                + json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            )
         scoped = write_scoped_workbook(
             full,
             self.artifacts_dir / "import-scoped.xlsx",
             self.manifest.import_scope,
             self.work_dir,
             items,
+            allow_copy_condition_groups=rules.allow_copy_condition_groups,
+            protected_keys=protected_keys,
         )
         support = self.work_dir / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)
@@ -962,7 +1128,13 @@ class Pipeline:
             log=self.log,
             diagnostic_log=self.detail,
         )
-        artifacts = {"scoped_workbook": str(scoped), "translated_game": str(translated)}
+        artifacts = {
+            "scoped_workbook": str(scoped),
+            "translated_game": str(translated),
+            "import_protection": str(protection_path),
+            "import_protected_count": str(summary["protected"]),
+            "import_protection_warning_count": str(summary["warnings"]),
+        }
         diagnostics = runner.diagnostics
         originals_by_code: dict[str, set[str]] = {}
         for item in items:
@@ -1099,7 +1271,23 @@ class Pipeline:
         ]
         if not desired_slots[0].strip():
             raise RuntimeError("项目原始主字体为空，无法建立可验证的字体方案。")
-        required = required_characters(final_display_texts(validated_items, self.manifest.import_scope))
+        protection = analyze_import_protection(
+            validated_items,
+            self.manifest.import_scope,
+            self.work_dir,
+            self.manifest.import_protection,
+            self._editor_analysis(),
+        )
+        required = required_characters(
+            final_display_texts(
+                validated_items,
+                self.manifest.import_scope,
+                allow_copy_condition_groups=(
+                    self.manifest.import_protection.allow_copy_condition_groups
+                ),
+                protected_keys=set(protection["protected_keys"]),
+            )
+        )
         warnings, resolved = self._font_coverage_warnings(
             scheme, original_slots, required, translated
         )

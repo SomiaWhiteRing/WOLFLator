@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MANIFEST_SCHEMA = 3
+MANIFEST_SCHEMA = 5
 DEFAULT_EXTERNAL_FILE_LIMIT_KB = 128
 MAX_EXTERNAL_FILE_LIMIT_KB = 1_048_576
+SUSPICIOUS_IDENTIFIER_ACTIONS = {"ignore", "warn", "protect"}
 
 
 def utc_now() -> str:
@@ -67,6 +68,20 @@ class ImportScope:
         return bool(getattr(self, category.value))
 
 
+@dataclass
+class ImportProtectionRules:
+    protect_external_references: bool = True
+    protect_paths_and_commands: bool = True
+    allow_copy_condition_groups: bool = True
+    protect_logic_references: bool = True
+    suspicious_identifiers: str = "warn"
+
+
+def legacy_import_protection() -> ImportProtectionRules:
+    # ponytail: Old projects keep their previous AiNiee selection until the user opts in.
+    return ImportProtectionRules(allow_copy_condition_groups=False)
+
+
 def default_export_scope() -> ImportScope:
     return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
 
@@ -89,6 +104,7 @@ def _require_fields(data: object, expected: set[str], label: str) -> None:
 @dataclass
 class AppSettings:
     wolf_tool_path: str = ""
+    wolf_editor_path: str = ""
     ainiee_source: str = ""
     ascii_runner_dir: str = ""
     projects_root: str = ""
@@ -208,6 +224,7 @@ class ProjectManifest:
     external_file_limit_kb: int = DEFAULT_EXTERNAL_FILE_LIMIT_KB
     translation_scope: ImportScope = field(default_factory=ImportScope)
     import_scope: ImportScope = field(default_factory=ImportScope)
+    import_protection: ImportProtectionRules = field(default_factory=ImportProtectionRules)
     versions: dict[str, VersionManifest] = field(default_factory=dict)
 
     @property
@@ -229,7 +246,7 @@ class ProjectManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
         schema = data.get("schema")
-        if type(schema) is not int or schema not in (1, 2, MANIFEST_SCHEMA):
+        if type(schema) is not int or schema not in (1, 2, 3, 4, MANIFEST_SCHEMA):
             raise ValueError(f"不支持的项目清单 schema: {schema}")
         fields = {
             "project_id",
@@ -245,8 +262,10 @@ class ProjectManifest:
         }
         if schema >= 2:
             fields.add("export_scope")
-        if schema == MANIFEST_SCHEMA:
+        if schema >= 3:
             fields.update({"exclude_large_external_files", "external_file_limit_kb"})
+        if schema >= 4:
+            fields.add("import_protection")
         _require_fields(
             data,
             fields,
@@ -290,6 +309,32 @@ class ProjectManifest:
             raise ValueError(
                 f"外部文件大小上限必须是 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 的整数。"
             )
+        protection_data = (
+            data["import_protection"]
+            if schema >= 4
+            else dataclasses.asdict(legacy_import_protection())
+        )
+        if schema >= 4 and isinstance(protection_data, dict):
+            protection_data = dict(protection_data)
+            # ponytail: Schema 4's standalone condition rule is subsumed by the
+            # Editor-backed logic rule and is discarded on the next save.
+            protection_data.pop("protect_standalone_conditions", None)
+            protection_data.setdefault("protect_logic_references", True)
+        protection_fields = {
+            "protect_external_references",
+            "protect_paths_and_commands",
+            "allow_copy_condition_groups",
+            "protect_logic_references",
+            "suspicious_identifiers",
+        }
+        _require_fields(protection_data, protection_fields, "导入保护规则")
+        if any(
+            type(protection_data[name]) is not bool
+            for name in protection_fields - {"suspicious_identifiers"}
+        ):
+            raise ValueError("导入保护规则开关必须是布尔值。")
+        if protection_data["suspicious_identifiers"] not in SUSPICIOUS_IDENTIFIER_ACTIONS:
+            raise ValueError("可疑标识符策略必须是 ignore、warn 或 protect。")
         item = cls(
             project_id=data["project_id"],
             name=data["name"],
@@ -303,6 +348,7 @@ class ProjectManifest:
             external_file_limit_kb=external_file_limit_kb,
             translation_scope=ImportScope(**translation_scope_data),
             import_scope=ImportScope(**import_scope_data),
+            import_protection=ImportProtectionRules(**protection_data),
         )
         versions = data["versions"]
         if not isinstance(versions, dict):
