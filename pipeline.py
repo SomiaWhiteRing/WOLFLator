@@ -74,6 +74,7 @@ from wolf_tools import (
     final_display_texts,
     full_export_scope,
     hash_directory,
+    IMPORT_PROTECTION_SCHEMA,
     load_items,
     locate_workbook,
     merge_ainiee_output,
@@ -653,12 +654,6 @@ class Pipeline:
         )
         self.save()
 
-    def _reset_downstream(self, stage: Stage) -> None:
-        for downstream in STAGE_ORDER[STAGE_ORDER.index(stage) + 1 :]:
-            record = self.manifest.version.stage(downstream)
-            record.status = StageStatus.PENDING
-            record.error = ""
-
     def _previous_version(self) -> VersionManifest | None:
         keys = list(self.manifest.versions)
         index = keys.index(self.manifest.active_version)
@@ -763,6 +758,45 @@ class Pipeline:
         return {"source": str(self.source_dir), "work": str(self.work_dir)}
 
     def _unpack(self) -> dict[str, str]:
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        excluded: list[dict[str, object]] = []
+        excluded_root = self.artifacts_dir / "excluded-legacy"
+        # ponytail: UberWolf enumerates Game.exe siblings here; keep this MTool rule root-scoped.
+        legacy_files = sorted(
+            (
+                path
+                for path in self.work_dir.iterdir()
+                if path.is_file()
+                and path.suffix.casefold() == ".bin"
+                and (
+                    path.name.casefold() == "trsdata.bin"
+                    or path.name.casefold().startswith("trsdata_")
+                )
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+        for source in legacy_files:
+            digest = sha256_file(source)
+            target = excluded_root / f"{digest[:16]}-{source.name}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.unlink(missing_ok=True)
+            shutil.move(str(source), str(target))
+            excluded.append(
+                {
+                    "relative_path": source.name,
+                    "bytes": target.stat().st_size,
+                    "sha256": digest,
+                    "stored_path": str(target),
+                    "reason": "MTool 遗留 TrsData 系列文件，固定不参与 WOLF 解包",
+                }
+            )
+        excluded_artifact = self.artifacts_dir / "excluded-legacy-files.json"
+        _atomic_json(excluded_artifact, {"schema": 1, "files": excluded})
+        if excluded:
+            self.warning(
+                f"已固定排除 {len(excluded)} 个 MTool 遗留 TrsData 系列文件；"
+                f"详情见 {excluded_artifact}。"
+            )
         executable = prepare_uberwolf(self.settings.ascii_runner_dir)
         UberWolfRunner(executable).unpack(
             self.work_dir,
@@ -771,7 +805,11 @@ class Pipeline:
             diagnostic_log=self.detail,
         )
         self.detail(f"unpack.complete data={self.work_dir / 'Data'}")
-        return {"data": str(self.work_dir / "Data"), "uberwolf": str(executable)}
+        return {
+            "data": str(self.work_dir / "Data"),
+            "uberwolf": str(executable),
+            "excluded_legacy_files": str(excluded_artifact),
+        }
 
     def _extract(self) -> dict[str, str]:
         runner = self._official_runner(self.manifest.export_scope)
@@ -1155,7 +1193,7 @@ class Pipeline:
         auto_preserved = int(summary.get("logic_auto_preserved", 0))
         if auto_preserved:
             self.log(
-                f"保守逻辑策略已自动保留 {auto_preserved} 条无法证明安全的原文；"
+                f"保守逻辑策略已自动保留 {auto_preserved} 条风险原文；"
                 "详情已写入导入保护报告。"
             )
         self.log(
@@ -1163,7 +1201,9 @@ class Pipeline:
             f"提示 {summary['warnings']} 组可疑标识符，"
             f"逻辑依赖 {summary.get('logic_dependencies', 0)} 组，"
             f"实际逻辑保护 {summary.get('logic_protected', 0)} 组，"
-            f"正向证明 {summary.get('logic_proven_safe', 0)} 组，"
+            f"直接显示 {summary.get('logic_direct_display', 0)} 组，"
+            f"官方显示契约 {summary.get('logic_display_contract', 0)} 组，"
+            f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
             f"未证明 {summary.get('logic_not_proven', 0)} 组，"
             f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
             f"放行 {summary['atomic_groups']} 个 COPY-FROM 条件/混合范围组。"
@@ -1200,6 +1240,7 @@ class Pipeline:
         previous = self.work_dir / ".wolflator-translated-previous"
         translated: Path | None = None
         post_editor = None
+        merged_translated: Path | None = None
         try:
             staged_translated = runner.translate(
                 staging_game,
@@ -1209,10 +1250,59 @@ class Pipeline:
             )
             if not staged_translated.resolve().is_relative_to(staging_game.resolve()):
                 raise RuntimeError("官方工具的译版输出越过了导入暂存目录。")
+            merged_translated = self.artifacts_dir / f".import-merged-{token}"
+            if merged_translated.exists():
+                self._safe_remove(merged_translated)
+            shutil.copytree(
+                self.work_dir,
+                merged_translated,
+                ignore=lambda _path, names: [
+                    name
+                    for name in names
+                    if (
+                        name.startswith("Translated")
+                        and "Chinese (Simplified)" in name
+                    )
+                    or name == SUPPORT_DIR
+                    or name == ".wolflator-translated-previous"
+                ],
+            )
+            shutil.copytree(
+                staged_translated,
+                merged_translated,
+                dirs_exist_ok=True,
+                copy_function=shutil.copy2,
+            )
+            support = merged_translated / SUPPORT_DIR
+            if support.exists():
+                self._safe_remove(support)
+            (merged_translated / "Data.wolf").unlink(missing_ok=True)
+            if not (merged_translated / "Game.exe").is_file() or not (
+                merged_translated / "Data" / "BasicData" / "Game.dat"
+            ).is_file():
+                raise RuntimeError("合并后的官方译版缺少 Game.exe 或 Data/BasicData/Game.dat。")
+            expected_maps = {
+                path.relative_to(self.work_dir / "Data" / "MapData")
+                for path in (self.work_dir / "Data" / "MapData").rglob("*.mps")
+            } if (self.work_dir / "Data" / "MapData").is_dir() else set()
+            actual_maps = {
+                path.relative_to(merged_translated / "Data" / "MapData")
+                for path in (merged_translated / "Data" / "MapData").rglob("*.mps")
+            } if (merged_translated / "Data" / "MapData").is_dir() else set()
+            missing_maps = sorted(expected_maps - actual_maps, key=lambda path: path.as_posix())
+            if missing_maps:
+                raise RuntimeError(
+                    "合并后的官方译版缺少地图文件："
+                    + "、".join(path.as_posix() for path in missing_maps[:10])
+                )
+            self.detail(
+                f"import.merge translated_layer={staged_translated} "
+                f"maps={len(actual_maps)} loose_data=true"
+            )
             self.log("正在用 WOLF RPG Editor 回读导入结果并验证事件结构...")
             post_editor = export_and_analyze(
                 self.settings.wolf_editor_path,
-                staged_translated,
+                merged_translated,
                 post_editor_dir,
                 items,
                 cancel_event=self.cancel_event,
@@ -1245,7 +1335,8 @@ class Pipeline:
             try:
                 if translated.exists():
                     replace_with_retry(translated, previous)
-                replace_with_retry(staged_translated, translated)
+                replace_with_retry(merged_translated, translated)
+                merged_translated = None
             except Exception:
                 if not translated.exists() and previous.exists():
                     replace_with_retry(previous, translated)
@@ -1257,6 +1348,8 @@ class Pipeline:
                     self.warning(f"旧导入产物清理失败，已保留在 {previous}：{error}")
             self.log("Editor Auto 回读验证通过：未发现未批准的事件或数据库结构变化。")
         finally:
+            if merged_translated is not None and merged_translated.exists():
+                self._safe_remove(merged_translated)
             if staging_game.exists():
                 self._safe_remove(staging_game)
         assert translated is not None and post_editor is not None
@@ -1314,6 +1407,9 @@ class Pipeline:
         warnings: list[dict[str, object]] = []
         coverage_files: list[list[Path]] = []
         for index, slot in enumerate(scheme["slots"]):
+            if not original_slots[index]:
+                coverage_files.append([])
+                continue
             family = original_slots[index] if slot["mode"] == "keep" else str(slot["family"])
             files = resolved[index]
             if slot["mode"] == "keep":
@@ -1366,10 +1462,11 @@ class Pipeline:
         destination: Path,
         scheme: dict[str, object],
         resolved: list[list[Path]],
+        original_slots: list[str],
     ) -> list[dict[str, str]]:
         copied: dict[str, dict[str, str]] = {}
-        for slot, files in zip(scheme["slots"], resolved, strict=True):
-            if slot["mode"] == "keep":
+        for index, (slot, files) in enumerate(zip(scheme["slots"], resolved, strict=True)):
+            if not original_slots[index] or slot["mode"] == "keep":
                 continue
             for source in files:
                 digest = sha256_file(source)
@@ -1400,19 +1497,25 @@ class Pipeline:
             raise RuntimeError("无法建立当前版本的原字体记录。")
         original_slots = list(original_record["slots"])
         desired_slots = [
-            original_slots[index] if slot["mode"] == "keep" else str(slot["family"])
+            ""
+            if not original_slots[index]
+            else original_slots[index] if slot["mode"] == "keep" else str(slot["family"])
             for index, slot in enumerate(scheme["slots"])
         ]
         if not desired_slots[0].strip():
             raise RuntimeError("项目原始主字体为空，无法建立可验证的字体方案。")
-        protection = analyze_import_protection(
-            validated_items,
-            self.manifest.import_scope,
-            self.work_dir,
-            self.manifest.import_protection,
-            self._editor_analysis(),
-            logic_safety=self._translation_safety(validated_items),
+        protection_path = self.manifest.version.stage(Stage.IMPORT).artifacts.get(
+            "import_protection", ""
         )
+        if not protection_path or not Path(protection_path).is_file():
+            raise RuntimeError("缺少已验证的导入保护报告，请先重新执行导入。")
+        protection = json.loads(Path(protection_path).read_text(encoding="utf-8"))
+        if (
+            not isinstance(protection, dict)
+            or protection.get("schema") != IMPORT_PROTECTION_SCHEMA
+            or dict(protection.get("structural_diff", {})).get("status") != "passed"
+        ):
+            raise RuntimeError("导入保护报告未通过官方 Editor 回读验证。")
         required = required_characters(
             final_display_texts(
                 validated_items,
@@ -1480,7 +1583,7 @@ class Pipeline:
                 log=self.log,
                 diagnostic_log=self.detail,
             )
-            copied_files = self._copy_font_files(generated, scheme, resolved)
+            copied_files = self._copy_font_files(generated, scheme, resolved, original_slots)
             verification_workbook = runner.extract(
                 generated,
                 cancel_event=self.cancel_event,
@@ -1665,7 +1768,6 @@ class Pipeline:
     def _run_stage_locked(self, stage: Stage) -> str:
         self.cancel_event.clear()
         self._start_run_log(stage.value)
-        self._reset_downstream(stage)
         input_hash = self._stage_input_hash(stage)
         self._mark_running(stage, input_hash)
         self._emit_state(stage, StageStatus.RUNNING, 0, 1, "正在执行")

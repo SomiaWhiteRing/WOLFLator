@@ -15,8 +15,8 @@ EVIDENCE_RANK = {
 
 # BEGIN WOLFLATOR EDITOR CALIBRATION
 # Generated only from official Editor save/reopen/copy and Auto evidence.
-GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {105: ((0, 0),), 125: ((1, 0), (2, 0), (3, 0)), 177: ((0, 0),), 178: ((0, 0),), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 252: ((5, 4),), 255: ((5, 4),), 257: ((5, 4),), 281: ((3, 0),), 300: ((5, 3),), 402: ((1, 0),)}
-GENERATED_MANUAL_EVIDENCE: dict[int, str] = {105: 'roundtrip', 125: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 252: 'differential', 255: 'differential', 257: 'differential', 281: 'roundtrip', 300: 'differential', 402: 'roundtrip'}
+GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {99: ((0, 0),), 102: ((1, 4), (1, 6), (1, 9), (1, 10)), 104: ((0, 0),), 105: ((0, 0),), 121: ((7, 0),), 125: ((1, 0), (2, 0), (3, 0)), 140: ((7, 0),), 151: ((5, 0),), 177: ((0, 0),), 178: ((0, 0),), 210: ((3, 2), (10, 0), (10, 5)), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 252: ((5, 4),), 255: ((5, 4),), 257: ((5, 4),), 260: ((3, 3),), 270: ((1, 1), (2, 0), (2, 1)), 281: ((3, 0),), 300: ((5, 3), (6, 3), (8, 4), (11, 5)), 402: ((1, 0),)}
+GENERATED_MANUAL_EVIDENCE: dict[int, str] = {99: 'roundtrip', 102: 'roundtrip', 104: 'roundtrip', 105: 'roundtrip', 121: 'roundtrip', 125: 'roundtrip', 140: 'roundtrip', 151: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 210: 'roundtrip', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 252: 'differential', 255: 'differential', 257: 'differential', 260: 'differential', 270: 'differential', 281: 'roundtrip', 300: 'differential', 402: 'roundtrip'}
 # END WOLFLATOR EDITOR CALIBRATION
 
 # The free 3.713 command inventory. ProFeature (1000) is deliberately absent.
@@ -27,6 +27,7 @@ COMMAND_CATALOG: dict[int, tuple[str, str, str]] = {
     101: ("Message", "no_write", "roundtrip"),
     102: ("Choices", "no_write", "roundtrip"),
     103: ("Comment", "no_write", "roundtrip"),
+    104: ("AbortChoice", "control_flow", "roundtrip"),
     105: ("ForceStopMessage", "no_write", "manual"),
     106: ("DebugMessage", "no_write", "roundtrip"),
     107: ("ClearDebugText", "no_write", "roundtrip"),
@@ -75,6 +76,7 @@ COMMAND_CATALOG: dict[int, tuple[str, str, str]] = {
     252: ("DatabaseTransform", "database", "differential"),
     255: ("XYArray", "database", "differential"),
     257: ("XYArrayTransform", "database", "differential"),
+    260: ("Download", "string_write", "differential"),
     270: ("Party", "no_write", "roundtrip"),
     280: ("MapEffect", "no_write", "roundtrip"),
     281: ("ScrollScreen", "no_write", "manual"),
@@ -153,7 +155,7 @@ for _opcode, _evidence in GENERATED_MANUAL_EVIDENCE.items():
         COMMAND_CATALOG[_opcode] = (_name, _effect, _evidence)
 
 PRO_OPCODE = 1000
-SPECIALIZED_OPCODES = frozenset({112, 121, 122, 124, 210, 221, 250, 300})
+SPECIALIZED_OPCODES = frozenset({112, 121, 122, 124, 210, 221, 250, 260, 300})
 
 # These are the only string-bearing command shapes whose parameter semantics
 # are consumed by the analyzer. Other strings are display text, labels, or
@@ -175,6 +177,8 @@ STRING_PARAMETER_ROLES: dict[int, tuple[str, ...]] = {
     252: ("database_selector_or_value",),
     255: ("array_selector_or_value",),
     257: ("array_selector_or_value",),
+    260: ("resource_path", "file_path", "resource_path"),
+    270: ("resource_path",),
     290: ("resource_path",),
     300: ("common_event_name", "call_argument"),
 }
@@ -193,6 +197,7 @@ _TRANSFER_BY_EFFECT = {
 
 _TRANSFER_BY_OPCODE = {
     102: "choice",
+    104: "abort_choice",
     111: "numeric_condition",
     112: "string_condition",
     121: "set_number",
@@ -217,6 +222,7 @@ _TRANSFER_BY_OPCODE = {
     252: "database_transform",
     255: "xy_array",
     257: "xy_array_transform",
+    260: "download",
     300: "call_event_by_name",
     401: "branch_marker",
     402: "branch_marker",
@@ -229,6 +235,7 @@ _TRANSFER_BY_OPCODE = {
 _CONTROL_BY_OPCODE = {
     0: "blank",
     102: "choice",
+    104: "choice_abort",
     111: "condition",
     112: "condition",
     170: "loop",
@@ -328,6 +335,13 @@ def _integer_roles(opcode: int, int_count: int, effect: str) -> list[str]:
             "csv_data_selector",
             "csv_field_selector",
             "csv_flags",
+        )
+    if opcode == 260:
+        return _roles(
+            int_count,
+            "download_mode",
+            "destination_string",
+            "download_flags",
         )
     if effect == "numeric_write":
         return _roles(int_count, "destination_variable", "numeric_operand", "numeric_operand", "numeric_flags")
@@ -444,6 +458,109 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
     },
     {"id": "CAL-281-BASE", "opcode": 281, "record": "[281][3,0]<0>(0,0,0)()"},
     {"id": "CAL-402-BASE", "opcode": 402, "record": "[402][1,0]<0>(0)()"},
+    {
+        "id": "CAL-102-FOUR",
+        "opcode": 102,
+        "record": '[102][1,4]<0>(20)("A","B","C","D")',
+    },
+    {
+        "id": "CAL-102-SIX",
+        "opcode": 102,
+        "record": '[102][1,6]<0>(118)("A","B","C","D","E","F")',
+    },
+    {
+        "id": "CAL-102-TEN",
+        "opcode": 102,
+        "record": '[102][1,10]<0>(186)("0","1","2","3","4","5","6","7","8","9")',
+    },
+    {
+        "id": "CAL-102-NINE",
+        "opcode": 102,
+        "record": '[102][1,9]<0>(9)("0","1","2","3","4","5","6","7","8")',
+    },
+    {
+        "id": "CAL-121-DYNAMIC-TARGET",
+        "opcode": 121,
+        "record": "[121][7,0]<0>(1100000000,0,320,24576,23,0,1100003)()",
+    },
+    {"id": "CAL-140-NO-FILE", "opcode": 140, "record": "[140][7,0]<0>(2592,0,0,0,0,0,0)()"},
+    {"id": "CAL-151-VARIABLE-COLOR", "opcode": 151, "record": "[151][5,0]<0>(0,120,2200000,2200001,2200002)()"},
+    {
+        "id": "CAL-210-STRING-ARG",
+        "opcode": 210,
+        "record": '[210][3,2]<0>(500031,4112,0)("","CAL.txt")',
+    },
+    {
+        "id": "CAL-210-MANY-VARS",
+        "opcode": 210,
+        "record": "[210][10,0]<0>(500266,68,1,19,0,20,3000000,3000000,3000000,3000000)()",
+    },
+    {
+        "id": "CAL-210-MANY-MIXED",
+        "opcode": 210,
+        "record": '[210][10,5]<0>(500266,16452,1,19,-2,20,3000000,3000000,0,3000000)("","","","18","")',
+    },
+    {
+        "id": "CAL-260-DOWNLOAD-A",
+        "opcode": 260,
+        "record": '[260][3,3]<0>(3,1600007,374)("https://example.invalid/A","","payload")',
+        "differential": "url",
+    },
+    {
+        "id": "CAL-260-DOWNLOAD-B",
+        "opcode": 260,
+        "record": '[260][3,3]<0>(3,1600007,374)("https://example.invalid/B","","payload")',
+        "differential": "url",
+    },
+    {"id": "CAL-270-PARTY-NO-FILE", "opcode": 270, "record": "[270][2,0]<0>(0,6)()"},
+    {
+        "id": "CAL-270-PARTY-FILE-A",
+        "opcode": 270,
+        "record": '[270][2,1]<0>(1,2)("CharaChip/CAL-A.png")',
+        "differential": "resource_path",
+    },
+    {
+        "id": "CAL-270-PARTY-FILE-B",
+        "opcode": 270,
+        "record": '[270][2,1]<0>(1,2)("CharaChip/CAL-B.png")',
+        "differential": "resource_path",
+    },
+    {
+        "id": "CAL-300-RETURN-ARGS",
+        "opcode": 300,
+        "record": '[300][6,3]<0>(0,16789537,13,0,0,1600020)("CAL-EVENT","A","")',
+    },
+    {
+        "id": "CAL-300-STRING-OP",
+        "opcode": 300,
+        "record": '[300][8,4]<0>(0,16801842,2,1600014,3000000,0,0,1600007)("CAL-EVENT","",",","")',
+    },
+    {"id": "CAL-099-EMPTY", "opcode": 99, "record": "[99][0,0]<0>()()"},
+    {"id": "CAL-104-ABORT-CHOICE", "opcode": 104, "record": "[104][0,0]<0>()()"},
+    {
+        "id": "CAL-270-SINGLE-FILE-A",
+        "opcode": 270,
+        "record": '[270][1,1]<0>(3)("CharaChip/CAL-A.png")',
+        "differential": "resource_path",
+    },
+    {
+        "id": "CAL-270-SINGLE-FILE-B",
+        "opcode": 270,
+        "record": '[270][1,1]<0>(3)("CharaChip/CAL-B.png")',
+        "differential": "resource_path",
+    },
+    {
+        "id": "CAL-300-MANY-ARGS-A",
+        "opcode": 300,
+        "record": '[300][11,5]<0>(0,16838724,335,20,-2,0,1600005,1600005,1600005,1600005,1600000)("CAL-EVENT","A","115","100","20")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-MANY-ARGS-B",
+        "opcode": 300,
+        "record": '[300][11,5]<0>(0,16838724,335,20,-2,0,1600005,1600005,1600005,1600005,1600000)("CAL-EVENT","B","115","100","20")',
+        "differential": "call_argument",
+    },
 )
 
 # The catalog is deliberately version-scoped. A newer Editor may reuse an

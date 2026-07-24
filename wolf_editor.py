@@ -14,19 +14,26 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections import Counter, deque
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 from models import TranslationItem
-from safe_io import atomic_write_json, package_lock, replace_with_retry
+from safe_io import (
+    ResourceBusyError,
+    ResourceLock,
+    atomic_write_json,
+    package_lock,
+    replace_with_retry,
+)
 from wolf_command_catalog import (
     CATALOG_SCHEMA,
     VERIFIED_EDITOR_VERSION,
     command_semantics,
 )
-from wolf_tools import hash_directory, run_process, sha256_file
+from wolf_tools import COPY_FROM_RE, CancelledError, hash_directory, run_process, sha256_file
 
 
 EDITOR_DOWNLOAD_URL = "https://silversecond.com/WolfRPGEditor/Download.shtml"
@@ -34,15 +41,71 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 5
-TRANSLATION_SAFETY_SCHEMA = 2
+AUTO_ANALYSIS_SCHEMA = 6
+TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
+# ponytail: concrete string names are cheap and materially improve dynamic DB
+# selectors; switch to a symbolic string-set domain if a corpus exceeds this cap.
+_STRING_LITERAL_LIMIT = 4096
 _LOOP_LIMIT = 64
+
+
+@contextmanager
+def _editor_execution_lock(
+    editor: EditorInfo,
+    *,
+    cancel_event: threading.Event | None,
+    diagnostic_log: Callable[[str], None] | None,
+    warning: Callable[[str], None] | None,
+) -> Iterator[None]:
+    lock_root = Path(
+        os.environ.get("LOCALAPPDATA", tempfile.gettempdir())
+    ) / "WOLFLator" / "locks"
+    lock_path = lock_root / f"editor-{editor.sha256}.lock"
+    started = time.monotonic()
+    warned = False
+    queued_logged = False
+    lock: ResourceLock | None = None
+    while lock is None:
+        candidate = ResourceLock(
+            lock_path,
+            "editor-export",
+            resource_path=editor.path,
+        )
+        try:
+            candidate.__enter__()
+        except ResourceBusyError:
+            elapsed = time.monotonic() - started
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("等待 WOLF RPG Editor 时任务已取消。")
+            if elapsed >= 1800:
+                raise TimeoutError("等待 WOLF RPG Editor 独占执行超过 1800 秒。")
+            if diagnostic_log and not queued_logged:
+                queued_logged = True
+                diagnostic_log(f"editor.queue.wait lock={lock_path}")
+            if not warned and elapsed >= 300:
+                warned = True
+                if warning:
+                    warning("等待其他 WOLF RPG Editor 任务已超过 5 分钟。")
+            time.sleep(0.1)
+        else:
+            lock = candidate
+    waited = time.monotonic() - started
+    if diagnostic_log:
+        diagnostic_log(
+            f"editor.queue.acquired lock={lock_path} waited={waited:.3f}s"
+        )
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+        if diagnostic_log:
+            diagnostic_log(f"editor.queue.released lock={lock_path}")
 _CALL_DEPTH_LIMIT = 64
 _CFG_STATE_VISIT_LIMIT = 64
 _CFG_IMPLEMENTED_OPCODES = frozenset(
     {
-        0, 102, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
+        0, 102, 104, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
         212, 213, 401, 402, 420, 421, 498, 499,
     }
 )
@@ -111,6 +174,7 @@ class _CommandBlock:
     value_inputs: int = 0
     string_inputs: int = 0
     return_target: int = -1
+    map_id: int = -1
 
 
 AutoEvent = _CommandBlock
@@ -542,15 +606,32 @@ def _copy_editor_sandbox(editor: Path, game_root: Path, sandbox: Path) -> list[P
         if source.is_file() and source.suffix.lower() in {".dat", ".project"}:
             shutil.copy2(source, target_basic / source.name)
     maps: list[Path] = []
-    for source in sorted(source_data.rglob("*.mps")):
+    for index, source in enumerate(sorted(source_data.rglob("*.mps"))):
         if not source.is_file():
             continue
         relative = source.relative_to(source_data)
-        target = sandbox / "Data" / relative
+        # ponytail: Editor 3.713 fast-fails on some otherwise valid Unicode map
+        # filenames. Auto output is byte-identical after an ASCII sandbox rename;
+        # restore the original relative path immediately after export.
+        target = sandbox / "Data" / "MapData" / f"WOLFLatorMap{index:08d}.mps"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         maps.append(relative)
     return maps
+
+
+def _restore_editor_map_paths(auto_dir: Path, maps: list[Path]) -> None:
+    for index, relative in enumerate(maps):
+        generated = (
+            auto_dir
+            / "MapData"
+            / f"WOLFLatorMap{index:08d}.mps.Auto.txt"
+        )
+        if not generated.is_file():
+            raise ValueError(f"Editor 未生成地图事件 Auto.txt：{relative.as_posix()}")
+        restored = auto_dir / relative.parent / f"{relative.name}.Auto.txt"
+        restored.parent.mkdir(parents=True, exist_ok=True)
+        replace_with_retry(generated, restored)
 
 
 def _read_lines(path: Path) -> Iterator[str]:
@@ -799,11 +880,18 @@ def _database_index(
             else:
                 raise ValueError(f"数据库 CSV 未结束：{path}")
             try:
-                rows = [
-                    tuple(row)
-                    for row in csv.reader((value + "\n" for value in csv_lines), strict=True)
-                    if row
-                ]
+                if item_num == 0 and data_num is not None and not any(csv_lines):
+                    # Editor 3.713 emits padding blank lines for a type with data
+                    # names but no fields. DATA_NUM is the only lossless row count.
+                    rows = [("",) for _index in range(data_num)]
+                else:
+                    rows = [
+                        tuple(row)
+                        for row in csv.reader(
+                            (value + "\n" for value in csv_lines), strict=True
+                        )
+                        if row
+                    ]
             except csv.Error as error:
                 raise ValueError(f"数据库 CSV 损坏：{path}: {error}") from error
     finish_type()
@@ -818,6 +906,7 @@ def _condition_operator(encoded: int) -> tuple[int, str | None, bool]:
         0x10: "not_equals",
         0x20: "contains",
         0x30: "starts_with",
+        0x40: "ends_with",
     }
     flags = (encoded >> 24) & 0xFF
     return encoded & 0x00FFFFFF, operators.get(flags & 0xF0), (flags & 0x0F) == 1
@@ -876,7 +965,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
         left == right
         and left is not None
         and (left.symbolic_all or len(left.source_keys) + len(left.cells) <= _VALUE_LIMIT)
-        and (left.literals is None or len(left.literals) <= _VALUE_LIMIT)
+        and (left.literals is None or len(left.literals) <= _STRING_LITERAL_LIMIT)
         and (left.tracked or not left.unknown)
         and len(left.trace) <= _VALUE_LIMIT
         and len(left.trace) == len(set(left.trace))
@@ -903,7 +992,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
         if left.literals is None or right.literals is None
         else frozenset(set(left.literals) | set(right.literals))
     )
-    if literals is not None and len(literals) > _VALUE_LIMIT:
+    if literals is not None and len(literals) > _STRING_LITERAL_LIMIT:
         literals = None
     if len(keys) + len(cells) > _VALUE_LIMIT and not symbolic_all:
         return _StringValue(
@@ -911,7 +1000,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             unknown="字符串来源集合超过 256 项",
             symbolic_all=True,
             scopes=scopes or frozenset({"project"}),
-            literals=None,
+            literals=literals,
         )
     return _StringValue(
         frozenset(keys),
@@ -1123,12 +1212,46 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
     )
 
 
+def _block_map_id(block: _CommandBlock) -> int:
+    if block.map_id >= 0:
+        return block.map_id
+    match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", block.source, re.IGNORECASE)
+    return int(match.group(1)) if match else -1
+
+
 def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
     if block.event_type == "common":
         return f"COMMON-{block.event_id}-{command_index - 1}-{string_index}"
-    match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", block.source, re.IGNORECASE)
-    map_id = int(match.group(1)) if match else 0
+    map_id = _block_map_id(block)
     return f"MAP-{map_id}-Ev{block.event_id:03d}-Page{block.page}-{command_index - 1}-{string_index}"
+
+
+def _event_name_code(block: _CommandBlock) -> str:
+    if block.event_type == "common":
+        return f"COMMON-{block.event_id}-Name"
+    return f"MAP-{_block_map_id(block)}-Ev{block.event_id:03d}-Name"
+
+
+def _map_ids_from_databases(
+    databases: dict[str, dict[int, _DatabaseType]],
+) -> dict[str, int]:
+    table = databases.get("SDB", {}).get(0)
+    if table is None:
+        return {}
+    result: dict[str, int] = {}
+    for map_id, row in enumerate(table.rows):
+        if not row or not row[0].strip():
+            continue
+        relative = row[0].strip().replace("\\", "/").lstrip("/")
+        if relative.casefold().startswith("data/"):
+            relative = relative[5:]
+        key = f"{relative}.Auto.txt".casefold()
+        previous = result.setdefault(key, map_id)
+        if previous != map_id:
+            raise ValueError(
+                f"SDB 地图文件坐标重复: {relative} -> {previous}, {map_id}"
+            )
+    return result
 
 
 class _BlockAnalyzer:
@@ -1178,6 +1301,19 @@ class _BlockAnalyzer:
 
     def _command_id(self, index: int) -> str:
         return f"{self.block.source}:{self.block.event_type}:{self.block.event_id}:{self.block.page}:{index + 1}"
+
+    def _record_call(
+        self, command_id: str, status: str, targets: Iterable[str]
+    ) -> None:
+        previous = self.audit.calls.get(command_id)
+        merged_targets = set(map(str, targets))
+        if previous is not None:
+            merged_targets.update(previous[1])
+            if previous[0] != "exact":
+                status = "conservative"
+        merged = (status, tuple(sorted(merged_targets)))
+        self.audit.calls[command_id] = merged
+        self.audit.data_effects[command_id] = merged
 
     def _candidate_literal_values(
         self, command: _Command, index: int, string_index: int
@@ -1495,7 +1631,12 @@ class _BlockAnalyzer:
             name = command.strings[1] if len(command.strings) > 1 else ""
             return {type_id for type_id, item in types.items() if item.name == name}
         value = _number_argument(command.ints[0], state)
-        return set(value.values) if value.values is not None else None
+        if value.values is None:
+            return None
+        selected = set(value.values)
+        if any(type_id < 0 for type_id in selected):
+            return None
+        return selected & set(types)
 
     def _selector(
         self, raw: int, state: _AnalysisState, *, unknown_means_all: bool
@@ -1628,7 +1769,11 @@ class _BlockAnalyzer:
                 unknown=("数据库数据名来源集合超过 256 项" if symbolic else ""),
                 symbolic_all=symbolic,
                 scopes=scopes if symbolic else frozenset(),
-                literals=(frozenset(names) if len(names) <= _VALUE_LIMIT else None),
+                literals=(
+                    frozenset(names)
+                    if len(names) <= _STRING_LITERAL_LIMIT
+                    else None
+                ),
             )
             return
 
@@ -1737,7 +1882,7 @@ class _BlockAnalyzer:
                     scopes=scopes if data_all else frozenset(),
                     literals=(
                         frozenset(string_values)
-                        if len(string_values) <= _VALUE_LIMIT
+                        if len(string_values) <= _STRING_LITERAL_LIMIT
                         else None
                     ),
                 )
@@ -1842,9 +1987,46 @@ class _BlockAnalyzer:
                 None, f"数值由运行时命令 opcode={command.opcode} 取得"
             )
 
+    def _download(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        if len(command.ints) != 3 or len(command.strings) != 3:
+            self._record_unknown(command, index, "invalid-260")
+            return
+        destination = command.ints[1]
+        if destination >= 1_000_000:
+            state.strings[destination & 0x00FFFFFF] = _StringValue(
+                trace=(f"{self._location(index)} opcode=260 network response",),
+                unknown="下载响应是运行时字符串",
+                scopes=frozenset({"external:network"}),
+                literals=None,
+            )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            ("resource:network", "string"),
+        )
+
     def _set_number(self, command: _Command, index: int, state: _AnalysisState) -> None:
         if len(command.ints) < 4:
             self._record_unknown(command, index, "invalid-121")
+            return
+        if len(command.ints) == 7:
+            # ponytail: Editor's variable-target form can address any numeric
+            # slot selected at runtime. Invalidating known numbers is the exact
+            # safe abstraction; a decoded numeric address domain can narrow it.
+            tracked = any(value.tracked for value in state.numbers.values())
+            state.numbers = {
+                variable: _NumberValue(
+                    None,
+                    "121 动态代入目标使当前数值变为运行时值",
+                    value.tracked or tracked,
+                )
+                for variable, value in state.numbers.items()
+            }
+            self.audit.data_effects[self._command_id(index)] = (
+                "conservative",
+                ("number:*",),
+            )
             return
         destination, left_raw, right_raw, flags = command.ints[:4]
         byte0 = flags & 0xFF
@@ -2117,8 +2299,17 @@ class _BlockAnalyzer:
                 right_variable = command.ints[right_index] & 0x00FFFFFF if right_index < len(command.ints) else -1
                 right_value = state.strings.get(right_variable)
             if state.unknown_scopes:
-                status = "blocking"
-                reason = "条件执行前经过可能读写字符串的不透明命令"
+                opaque = any(
+                    marker in item
+                    for item in state.unknown_reasons
+                    for marker in ("未校准", "未支持", "不透明")
+                )
+                status = "blocking" if opaque else "dynamic"
+                reason = (
+                    "条件执行前经过可能读写字符串的不透明命令"
+                    if opaque
+                    else "条件执行前存在已保守定位的动态副作用"
+                )
             elif operator is None:
                 status = "blocking" if value and value.tracked else "untracked"
                 reason = "未支持的字符串比较编码"
@@ -2416,7 +2607,12 @@ class _BlockAnalyzer:
         if command.opcode == 300:
             if not command.strings:
                 return None
-            target_names = self._literal_string(command, index, 0, state).literals
+            target_value = self._literal_string(command, index, 0, state)
+            target_names = target_value.literals
+            if target_names is None:
+                referenced = _string_reference_value(command.strings[0], state)
+                if referenced is not None:
+                    target_names = referenced.literals
             matches = {
                 max(group, key=lambda block: block.event_id).event_id:
                 max(group, key=lambda block: block.event_id)
@@ -2459,7 +2655,7 @@ class _BlockAnalyzer:
                 ):
                     # The official manual specifies that an invalid name does
                     # nothing. Old projects commonly retain optional calls.
-                    self.audit.calls[command_id] = ("exact", ("noop",))
+                    self._record_call(command_id, "exact", ("noop",))
                     return
                 value = self._literal_string(command, index, 0, state)
                 self._blocking_scope_dependency(
@@ -2472,7 +2668,7 @@ class _BlockAnalyzer:
                     status="dynamic",
                 )
             elif command.opcode == 210 and command.ints and command.ints[0] < 0:
-                self.audit.calls[command_id] = ("exact", ("noop",))
+                self._record_call(command_id, "exact", ("noop",))
                 return
             else:
                 self._blocking_scope_dependency(
@@ -2483,7 +2679,7 @@ class _BlockAnalyzer:
                     frozenset({"common:*"}),
                     status="dynamic",
                 )
-            self.audit.calls[command_id] = ("conservative", ("common:*",))
+            self._record_call(command_id, "conservative", ("common:*",))
             self._set_unknown_target_return(command, state)
             return
         target, choice = resolved
@@ -2491,9 +2687,19 @@ class _BlockAnalyzer:
         # only need the callee's own text and actual argument provenance; DB and
         # global writes are covered by their value-boundary dependencies.
         target_scopes = frozenset({f"common:{target.event_id}"})
-        self.audit.calls[command_id] = (
-            "exact", (f"common:{target.event_id}",)
-        )
+        self._record_call(command_id, "exact", (f"common:{target.event_id}",))
+        if command.opcode == 300 and command.strings:
+            target_value = self._literal_string(command, index, 0, state)
+            if target_value.tracked:
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件名称已精确解析",
+                    frozenset(),
+                    (target_value,),
+                    status="resolved",
+                )
         target_has_dispatcher = any(
             command.indent == 0
             and following.indent == 0
@@ -2512,9 +2718,7 @@ class _BlockAnalyzer:
             for item in target.commands
         )
         if choice is None and (target_has_dispatcher or target_has_entry_labels):
-            self.audit.calls[command_id] = (
-                "conservative", tuple(sorted(target_scopes))
-            )
+            self._record_call(command_id, "conservative", target_scopes)
             self._blocking_scope_dependency(
                 command,
                 index,
@@ -2538,9 +2742,10 @@ class _BlockAnalyzer:
                 status="dynamic",
                 taint_state=False,
             )
-            self.audit.calls[command_id] = (
+            self._record_call(
+                command_id,
                 "conservative",
-                tuple(sorted(self.event_scopes.get(target.event_id, target_scopes))),
+                self.event_scopes.get(target.event_id, target_scopes),
             )
             return
         if call_key in self.call_stack:
@@ -2553,9 +2758,10 @@ class _BlockAnalyzer:
                 status="dynamic",
                 taint_state=False,
             )
-            self.audit.calls[command_id] = (
+            self._record_call(
+                command_id,
                 "conservative",
-                tuple(sorted(self.event_scopes.get(target.event_id, target_scopes))),
+                self.event_scopes.get(target.event_id, target_scopes),
             )
             return
         if has_return and target.return_target < 0:
@@ -2609,20 +2815,13 @@ class _BlockAnalyzer:
                     state,
                 )
 
-        if not has_return:
-            scopes = self.event_scopes.get(target.event_id, frozenset())
-            inputs = tuple(callee_state.strings.values())
-            tracked_inputs = tuple(value for value in inputs if value.tracked)
-            if scopes or tracked_inputs:
-                self._blocking_scope_dependency(
-                    command,
-                    index,
-                    "call",
-                    "无返回公共事件副作用已按事件摘要保守定位",
-                    scopes or target_scopes,
-                    tracked_inputs,
-                    status="dynamic",
-                )
+        if not has_return and not any(
+            value.tracked for value in callee_state.strings.values()
+        ):
+            # ponytail: every public event is analyzed once on its own. Re-enter
+            # only calls carrying translated provenance; otherwise the callee's
+            # local effects are already in the project ledger and inlining just
+            # multiplies identical work at every call site.
             return
 
         dispatcher = self._dynamic_entry_dispatcher(target)
@@ -2796,30 +2995,43 @@ class _BlockAnalyzer:
     ) -> None:
         command_id = self._command_id(index)
         if not command.ints:
-            self.audit.calls[command_id] = ("conservative", ("common:*",))
+            self._record_call(command_id, "conservative", ("common:*",))
             self._unknown_call(
                 command, index, state, "预约公共事件目标缺失", frozenset({"common:*"})
             )
             return
         reference = command.ints[0]
-        target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
-        target = self.common_by_id.get(target_id)
-        if target is None:
-            self.audit.calls[command_id] = ("conservative", ("common:*",))
+        if reference >= 1_000_000:
+            self._record_call(command_id, "conservative", ("common:*",))
             self._unknown_call(
-                command, index, state, "预约公共事件目标无法解析", frozenset({"common:*"})
+                command,
+                index,
+                state,
+                "预约公共事件目标为运行时动态值",
+                frozenset({"common:*"}),
+                status="dynamic",
             )
             return
-        scopes = self.event_scopes.get(target.event_id, frozenset())
-        self.audit.calls[command_id] = (
-            "exact", (f"common:{target.event_id}",)
+        target_id = (
+            reference - 500_000
+            if 500_000 <= reference < 600_000
+            else reference
         )
+        target = self.common_by_id.get(target_id)
+        if target is None:
+            self._record_call(command_id, "exact", ("noop",))
+            return
+        scopes = self.event_scopes.get(
+            target.event_id, frozenset({f"common:{target.event_id}"})
+        )
+        self._record_call(command_id, "exact", (f"common:{target.event_id}",))
         if scopes:
+            reason = "预约公共事件存在延迟的全局或数据库副作用"
             self._blocking_scope_dependency(
                 command,
                 index,
                 "call",
-                "预约公共事件存在延迟的全局或数据库副作用",
+                reason,
                 scopes,
                 status="dynamic",
             )
@@ -2969,6 +3181,8 @@ class _BlockAnalyzer:
                 self._transform_database(command, index, state)
             elif command.opcode in {255, 257}:
                 self._xy_array(command, index, state)
+            elif command.opcode == 260:
+                self._download(command, index, state)
             elif command.opcode == 221:
                 self._set_runtime_value(
                     command,
@@ -3371,7 +3585,18 @@ class _BlockAnalyzer:
         if command.opcode in {171, 176}:
             loop = self._enclosing_loops.get(index)
             if loop is None:
-                self._cfg_failure(command, index, state, "循环控制命令不在循环结构内")
+                scope = self._current_scope()
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "control_flow",
+                    "循环控制由标签跳转进入，已保守终止当前事件路径",
+                    scope,
+                    status="dynamic",
+                )
+                command_id = self._command_id(index)
+                self.audit.cfg[command_id] = "conservative"
+                self.audit.cfg_edges.add((command_id, "CONSERVATIVE:event"))
                 return ()
             start, closing = loop
             target = closing + 1 if command.opcode == 171 else start
@@ -3471,6 +3696,8 @@ class _BlockAnalyzer:
                 )
                 if successors or terminal:
                     self.audit.cfg[command_id] = "exact"
+                elif self.audit.cfg.get(command_id) == "conservative":
+                    pass
                 elif command.opcode == 213 and self._current_scope():
                     self.audit.cfg[command_id] = "conservative"
                 else:
@@ -3568,6 +3795,8 @@ class _BlockAnalyzer:
             )
             if successors or terminal:
                 self.audit.cfg[command_id] = "exact"
+            elif self.audit.cfg.get(command_id) == "conservative":
+                pass
             elif command.opcode == 213 and self._current_scope():
                 self.audit.cfg[command_id] = "conservative"
             else:
@@ -3820,7 +4049,7 @@ def _command_transfer_complete(command: _Command) -> bool:
     if not semantics or semantics.get("semantic_complete") is not True:
         return False
     if command.opcode == 121:
-        return len(command.ints) in {4, 5}
+        return len(command.ints) in {4, 5, 7}
     if command.opcode == 122:
         if len(command.ints) < 2:
             return False
@@ -4131,6 +4360,14 @@ def analyze_auto_export(
         }
         database_counts[name] = counts
 
+    map_ids = _map_ids_from_databases(database_types)
+    blocks = [
+        replace(block, map_id=map_ids.get(block.source.casefold(), block.map_id))
+        if block.event_type == "map"
+        else block
+        for block in blocks
+    ]
+
     project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
     dependencies, blocking, warnings, audit = _analyze_blocks(
         project.events, items, database_types, candidate_values
@@ -4346,6 +4583,8 @@ def _safety_predicate(operator: str, left: str, right: str) -> bool:
         return right in left
     if operator == "starts_with":
         return left.startswith(right)
+    if operator == "ends_with":
+        return left.endswith(right)
     raise ValueError(f"Editor 分析报告包含未知字符串比较操作符：{operator}")
 
 
@@ -4405,7 +4644,7 @@ def _scope_keys(
 
 def _condition_truth_signature(dependency: dict[str, object]) -> tuple[object, ...]:
     operator = str(dependency.get("operator", ""))
-    if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+    if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
         return ("opaque", operator)
     left = tuple(map(str, dependency.get("left_values", ())))
     right = tuple(map(str, dependency.get("right_values", ())))
@@ -4488,6 +4727,38 @@ def _semantic_replay_signature(report: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _replay_changed_commands(
+    original: dict[str, object], candidate: dict[str, object]
+) -> dict[str, set[str]]:
+    def grouped(
+        records: Iterable[tuple[object, ...]], field: str
+    ) -> dict[str, set[tuple[object, ...]]]:
+        result: dict[str, set[tuple[object, ...]]] = {}
+        for record in records:
+            command_id = (
+                str(record[0])
+                if field in {"cfg_edges", "calls", "data_effects"}
+                else ":".join(map(str, record[:5]))
+            )
+            result.setdefault(command_id, set()).add(record)
+        return result
+
+    changed: dict[str, set[str]] = {}
+    for field in ("cfg_edges", "calls", "data_effects", "conditions", "resources"):
+        left = grouped(original.get(field, ()), field)
+        right = grouped(candidate.get(field, ()), field)
+        command_ids = {
+            command_id
+            for command_id in left.keys() | right.keys()
+            if left.get(command_id, set()) != right.get(command_id, set())
+        }
+        if command_ids:
+            changed[field] = command_ids
+    if original.get("opaque_effects") != candidate.get("opaque_effects"):
+        changed["opaque_effects"] = {"project"}
+    return changed
+
+
 def analyze_translation_safety(
     auto_dir: str | Path,
     items: list[TranslationItem],
@@ -4531,7 +4802,7 @@ def analyze_translation_safety(
                     event_targets.get(name, -1), int(match.group(1))
                 )
 
-    safe = {
+    direct_safe = {
         key
         for key in candidates
         if (uses := set(map(str, usage_by_key.get(key, ()))))
@@ -4541,6 +4812,34 @@ def analyze_translation_safety(
             or event_targets.get(originals[key]) == event_targets.get(candidates[key])
         )
     }
+    catalog = analysis.get("command_catalog", {})
+    coverage_fields = (
+        "semantic_coverage",
+        "cfg_coverage",
+        "call_target_coverage",
+        "data_effect_coverage",
+    )
+    complete_ledger = (
+        isinstance(catalog, dict)
+        and int(catalog.get("opaque_effects", 1)) == 0
+        and all(
+            isinstance(catalog.get(field), dict)
+            and float(catalog[field].get("ratio", 0.0)) == 1.0
+            for field in coverage_fields
+        )
+    )
+    official_display = {
+        item.key
+        for item in items
+        if item.key in candidates
+        and getattr(item.category, "value", str(item.category)) == "display"
+    }
+    safe = set(direct_safe)
+    if complete_ledger:
+        # The official translation workbook defines the display surface. Static
+        # analysis subtracts every observed logic/resource use below; requiring
+        # an Auto read for DB labels would incorrectly reject engine-rendered UI.
+        safe.update(official_display)
     base_protected = set(candidates) - safe
     forced: set[str] = set()
     reasons: dict[str, set[str]] = {}
@@ -4610,7 +4909,7 @@ def analyze_translation_safety(
 
     def replay_dynamic_condition(dependency: dict[str, object]) -> bool:
         operator = str(dependency.get("operator", "unknown"))
-        if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+        if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
             return False
         left_keys = set(map(str, dependency.get("source_keys", ())))
         left_keys.update(scoped_keys(dependency, "left"))
@@ -4709,12 +5008,22 @@ def analyze_translation_safety(
                     reason,
                 )
             return
+        if kind == "call":
+            protect(
+                (
+                    key
+                    for key in [*source_keys, *right_keys]
+                    if key not in candidates or not same_event_target(key)
+                ),
+                "event_target_change",
+            )
+            return
         if kind != "condition":
             protect([*source_keys, *right_keys], kind)
             return
         operator = str(dependency.get("operator", "unknown"))
         literal = str(dependency.get("literal", ""))
-        if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+        if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
             protect([*source_keys, *right_keys], "unsupported_condition")
             return
         if right_keys:
@@ -4755,16 +5064,13 @@ def analyze_translation_safety(
         tuple(int(value) for value in editor_version.split(".") if value.isdigit()),
         str(editor_data.get("sha256", "")),
     )
-    baseline_report = analyze_auto_export(
-        root,
-        items,
-        editor,
-        input_hash=str(analysis.get("input_hash", "")),
-    )
+    baseline_report = analysis
     original_signature = _semantic_replay_signature(baseline_report)
     replay_report = baseline_report
     replay_signature = original_signature
     replay_differences: list[str] = []
+    replay_history: list[dict[str, object]] = []
+    previous_candidates: dict[str, str] | None = None
     iterations = 0
     while True:
         protected_before = len(forced)
@@ -4775,36 +5081,86 @@ def analyze_translation_safety(
             for key in candidates
             if final_value(key) != originals[key]
         }
-        replay_report = analyze_auto_export(
-            root,
-            items,
-            editor,
-            input_hash=str(analysis.get("input_hash", "")),
-            candidate_values=active_candidates,
-        )
-        replay_signature = _semantic_replay_signature(replay_report)
-        replay_differences = [
-            field
-            for field in (
-                "cfg_edges",
-                "calls",
-                "data_effects",
-                "conditions",
-                "resources",
-                "opaque_effects",
+        if active_candidates != previous_candidates:
+            replay_report = analyze_auto_export(
+                root,
+                items,
+                editor,
+                input_hash=str(analysis.get("input_hash", "")),
+                candidate_values=active_candidates,
             )
-            if original_signature[field] != replay_signature[field]
-        ]
+            replay_signature = _semantic_replay_signature(replay_report)
+            previous_candidates = dict(active_candidates)
+        replay_changes = _replay_changed_commands(
+            original_signature, replay_signature
+        )
+        replay_differences = sorted(replay_changes)
+        abstract_differences: list[str] = []
         if replay_differences:
-            risky = {
-                key
-                for key in active_candidates
-                if set(map(str, usage_by_key.get(key, ()))) != {"display_only"}
+            changed_commands = {
+                command_id
+                for command_ids in replay_changes.values()
+                for command_id in command_ids
+                if command_id != "project"
             }
-            # A display-only candidate changing semantics means the usage proof
-            # itself is incomplete. Preserve all active candidates rather than
-            # letting a mislabeled key pass the safety gate.
-            protect(risky or active_candidates, "semantic_replay_difference")
+            affected: set[str] = set()
+            for dependency in [*dependencies, *replay_report.get("dependencies", ())]:
+                if not isinstance(dependency, dict):
+                    continue
+                dependency_id = ":".join(map(str, (
+                    dependency.get("auto_file", ""),
+                    dependency.get("event_type", ""),
+                    dependency.get("event_id", ""),
+                    dependency.get("page", ""),
+                    dependency.get("command", ""),
+                )))
+                if dependency_id not in changed_commands:
+                    continue
+                dependency_keys: set[str] = set()
+                for field in ("condition_keys", "source_keys", "right_source_keys"):
+                    dependency_keys.update(map(str, dependency.get(field, ())))
+                kind = str(dependency.get("kind", ""))
+                scoped = _scope_keys(
+                    items,
+                    tuple(map(str, dependency.get("unresolved_scopes", ()))),
+                    scope_cache,
+                )
+                if kind == "call":
+                    affected.update(
+                        key
+                        for key in dependency_keys | scoped
+                        if key in active_candidates and not same_event_target(key)
+                    )
+                elif kind != "condition":
+                    active_keys = dependency_keys & active_candidates.keys()
+                    affected.update(active_keys or (scoped & active_candidates.keys()))
+            affected.intersection_update(active_candidates)
+            if not affected:
+                non_condition = set(replay_differences) - {"conditions"}
+                if non_condition:
+                    # A semantic delta without provenance is an analyzer defect,
+                    # not evidence that every unrelated translation is unsafe.
+                    raise RuntimeError(
+                        "WOLF 候选译文重放出现无法定位来源的语义差异："
+                        + ", ".join(sorted(non_condition))
+                    )
+                # Dynamic abstract domains can contain different strings while
+                # every candidate predicate remains equivalent. The explicit
+                # item-wise checks above are the safety property we care about.
+                abstract_differences.append("conditions")
+                replay_differences = []
+            else:
+                protect(affected, "semantic_replay_difference")
+        replay_history.append({
+            "iteration": iterations + 1,
+            "active_candidates": len(active_candidates),
+            "differences": sorted(replay_changes),
+            "abstract_differences": abstract_differences,
+            "changed_commands": {
+                field: sorted(command_ids)[:20]
+                for field, command_ids in sorted(replay_changes.items())
+            },
+        })
         iterations += 1
         if len(forced) == protected_before and not replay_differences:
             break
@@ -4814,6 +5170,15 @@ def analyze_translation_safety(
     protected = set(base_protected)
     protected.update(forced)
     safe.difference_update(protected)
+    safe_display = {
+        key for key in safe
+        if set(map(str, usage_by_key.get(key, ()))) == {"display_only"}
+    }
+    safe_equivalent = {
+        key for key in safe
+        if set(map(str, usage_by_key.get(key, ()))) & {"logic", "event_target"}
+    }
+    safe_contract = safe - safe_display - safe_equivalent
     unresolved = sorted(
         {
             str(scope)
@@ -4831,6 +5196,11 @@ def analyze_translation_safety(
     return {
         "schema": TRANSLATION_SAFETY_SCHEMA,
         "safe_to_translate": sorted(safe),
+        "approvals": {
+            "direct_display": sorted(safe_display),
+            "official_display_contract": sorted(safe_contract),
+            "semantic_equivalence": sorted(safe_equivalent),
+        },
         "keep_original": sorted(protected),
         "unresolved_scopes": unresolved,
         "replay": {
@@ -4847,12 +5217,13 @@ def analyze_translation_safety(
                 == replay_signature["data_effects"]
             ),
             "condition_results_equivalent": (
-                original_signature["conditions"] == replay_signature["conditions"]
+                "conditions" not in replay_differences
             ),
             "resource_targets_equivalent": (
                 original_signature["resources"] == replay_signature["resources"]
             ),
             "differences": replay_differences,
+            "history": replay_history,
         },
         "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
     }
@@ -4875,16 +5246,73 @@ def compare_auto_structure(
         for code, code_items in by_code.items()
         if any(item.key in approved_keys for item in code_items)
     }
+    copy_targets: dict[str, set[str]] = {}
     for code, code_items in by_code.items():
         for item in code_items:
-            if not item.flag.upper().startswith("COPY-FROM-"):
+            match = COPY_FROM_RE.search(item.flag)
+            if match is None:
                 continue
-            source_code = item.flag[len("COPY-FROM-"):].upper()
-            if source_code in approved_codes:
-                approved_codes.add(code)
+            copy_targets.setdefault(match.group(1).upper(), set()).add(code)
+    queue = deque(approved_codes)
+    while queue:
+        for target in copy_targets.get(queue.popleft(), ()):
+            if target not in approved_codes:
+                approved_codes.add(target)
+                queue.append(target)
+
+    segment_expected: dict[str, str] = {}
+    for code, code_items in by_code.items():
+        if len(code_items) != 1 or code.startswith("SEGMENT_"):
+            continue
+        current = code_items[0]
+        parts = [current]
+        seen_segments = {code}
+        while True:
+            match = re.search(
+                r"(?:^|\r?\n)NEXT=([^\r\n]+)",
+                current.flag,
+                re.IGNORECASE,
+            )
+            if match is None:
+                break
+            next_code = match.group(1).upper()
+            candidates = by_code.get(next_code, [])
+            if len(candidates) != 1 or next_code in seen_segments:
+                parts = []
+                break
+            seen_segments.add(next_code)
+            current = candidates[0]
+            parts.append(current)
+        if len(parts) <= 1:
+            continue
+        expected = "".join(
+            part.translation
+            if part.key in approved_keys and part.translation
+            else part.original
+            for part in parts
+        )
+        segment_expected[code] = (
+            expected.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", r"<\n>")
+        )
+        if any(part.key in approved_keys for part in parts):
+            approved_codes.add(code)
+    queue = deque(approved_codes)
+    while queue:
+        for target in copy_targets.get(queue.popleft(), ()):
+            if target not in approved_codes:
+                approved_codes.add(target)
+                queue.append(target)
 
     def event_index(root: Path) -> dict[tuple[str, int, int], _CommandBlock]:
         result: dict[tuple[str, int, int], _CommandBlock] = {}
+        sdb_path = root / "BasicData" / "SysDataBase.Auto.txt"
+        map_ids = (
+            _map_ids_from_databases({"SDB": _database_index(sdb_path, "SDB")[0]})
+            if sdb_path.is_file()
+            else {}
+        )
         paths = [root / "BasicData" / "CommonEvent.dat.Auto.txt"]
         paths.extend(sorted((root / "MapData").rglob("*.mps.Auto.txt")))
         for path in paths:
@@ -4892,6 +5320,11 @@ def compare_auto_structure(
                 continue
             event_type = "common" if path.name == "CommonEvent.dat.Auto.txt" else "map"
             for block in _event_blocks(path, event_type, source=path.relative_to(root).as_posix())[0]:
+                if event_type == "map":
+                    block = replace(
+                        block,
+                        map_id=map_ids.get(block.source.casefold(), block.map_id),
+                    )
                 result[(block.source, block.event_id, block.page)] = block
         return result
 
@@ -4906,14 +5339,59 @@ def compare_auto_structure(
 
     before_events = event_index(before_root)
     after_events = event_index(after_root)
+    before_files = {
+        path.relative_to(before_root).as_posix()
+        for path in (
+            [before_root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+            + sorted((before_root / "MapData").rglob("*.mps.Auto.txt"))
+        )
+        if path.is_file()
+    }
+    after_files = {
+        path.relative_to(after_root).as_posix()
+        for path in (
+            [after_root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+            + sorted((after_root / "MapData").rglob("*.mps.Auto.txt"))
+        )
+        if path.is_file()
+    }
+    if before_files != after_files:
+        add(
+            "auto_file_set",
+            "AutoProject",
+            {
+                "count": len(before_files),
+                "missing_from_after": sorted(before_files - after_files)[:50],
+            },
+            {
+                "count": len(after_files),
+                "added_in_after": sorted(after_files - before_files)[:50],
+            },
+        )
     if set(before_events) != set(after_events):
-        add("event_set", "AutoProject", sorted(map(str, before_events)), sorted(map(str, after_events)))
+        before_only = sorted(map(str, set(before_events) - set(after_events)))
+        after_only = sorted(map(str, set(after_events) - set(before_events)))
+        add(
+            "event_set",
+            "AutoProject",
+            {
+                "count": len(before_events),
+                "missing_from_after_count": len(before_only),
+                "missing_from_after": before_only[:50],
+            },
+            {
+                "count": len(after_events),
+                "added_in_after_count": len(after_only),
+                "added_in_after": after_only[:50],
+            },
+        )
     for key in sorted(set(before_events) & set(after_events)):
         before = before_events[key]
         after = after_events[key]
         location = f"{before.source} event={before.event_id} page={before.page}"
         if before.event_name != after.event_name:
-            add("event_name", location, before.event_name, after.event_name)
+            if _event_name_code(before).upper() not in approved_codes:
+                add("event_name", location, before.event_name, after.event_name)
         if len(before.commands) != len(after.commands):
             add("command_count", location, len(before.commands), len(after.commands))
             continue
@@ -4934,6 +5412,16 @@ def compare_auto_structure(
                 if left_text == right_text:
                     continue
                 code = _event_code(before, index, string_index).upper()
+                expected = segment_expected.get(code)
+                if expected is not None:
+                    if right_text != expected:
+                        add(
+                            "segmented_string",
+                            f"{command_location} string={string_index}",
+                            expected,
+                            right_text,
+                        )
+                    continue
                 if code not in approved_codes:
                     add("unapproved_string", f"{command_location} string={string_index}", left_text, right_text)
 
@@ -4955,14 +5443,60 @@ def compare_auto_structure(
             left_type = left_types[type_id]
             right_type = right_types[type_id]
             type_location = f"{database}[{type_id}]"
+            if left_type.field_types != right_type.field_types:
+                add(
+                    "database_field_types",
+                    type_location,
+                    left_type.field_types,
+                    right_type.field_types,
+                )
+            if len(left_type.rows) != len(right_type.rows):
+                add(
+                    "database_row_count",
+                    type_location,
+                    len(left_type.rows),
+                    len(right_type.rows),
+                )
             if (
                 left_type.name != right_type.name
-                or left_type.field_names != right_type.field_names
-                or left_type.field_types != right_type.field_types
-                or left_type.data_names != right_type.data_names
-                or len(left_type.rows) != len(right_type.rows)
+                and f"NAME-T-{database}-{type_id}".upper() not in approved_codes
             ):
-                add("database_metadata", type_location, left_type.name, right_type.name)
+                add("database_type_name", type_location, left_type.name, right_type.name)
+            for field_id in sorted(set(left_type.field_names) | set(right_type.field_names)):
+                left_name = left_type.field_names.get(field_id)
+                right_name = right_type.field_names.get(field_id)
+                if (
+                    left_name != right_name
+                    and f"NAME-I-{database}-{type_id}-{field_id}".upper()
+                    not in approved_codes
+                ):
+                    add(
+                        "database_field_name",
+                        f"{type_location}[field={field_id}]",
+                        left_name,
+                        right_name,
+                    )
+            if len(left_type.data_names) != len(right_type.data_names):
+                add(
+                    "database_data_name_count",
+                    type_location,
+                    len(left_type.data_names),
+                    len(right_type.data_names),
+                )
+            for data_id, (left_name, right_name) in enumerate(
+                zip(left_type.data_names, right_type.data_names)
+            ):
+                if (
+                    left_name != right_name
+                    and f"NAME-D-{database}-{type_id}-{data_id}".upper()
+                    not in approved_codes
+                ):
+                    add(
+                        "database_data_name",
+                        f"{type_location}[data={data_id}]",
+                        left_name,
+                        right_name,
+                    )
             for data_id, (left_row, right_row) in enumerate(zip(left_type.rows, right_type.rows)):
                 if len(left_row) != len(right_row):
                     add("database_width", f"{type_location}[{data_id}]", len(left_row), len(right_row))
@@ -5026,33 +5560,45 @@ def export_and_analyze(
             diagnostic_log(
                 f"editor.sandbox path={sandbox} maps={len(maps)} input_hash={hash_directory(sandbox / 'Data')}"
             )
-        result = run_process(
-            [
-                str(sandbox / "Editor.exe"),
-                "-txtoutput",
-                "-txt_folder",
-                "Auto",
-                "-target",
-                "ALL",
-                "-f",
-                "Data",
-            ],
-            cwd=sandbox,
-            timeout=1800,
+        with _editor_execution_lock(
+            editor,
             cancel_event=cancel_event,
-            log=log,
             diagnostic_log=diagnostic_log,
-            hide_window=True,
-            slow_warning_after=300,
-            slow_warning=(
-                (lambda elapsed: warning(f"WOLF RPG Editor 全事件导出已运行 {elapsed / 60:.1f} 分钟，请继续等待。"))
-                if warning
-                else None
-            ),
-        )
+            warning=warning,
+        ):
+            result = run_process(
+                [
+                    str(sandbox / "Editor.exe"),
+                    "-txtoutput",
+                    "-txt_folder",
+                    "Auto",
+                    "-target",
+                    "ALL",
+                    "-f",
+                    "Data",
+                ],
+                cwd=sandbox,
+                timeout=1800,
+                cancel_event=cancel_event,
+                log=log,
+                diagnostic_log=diagnostic_log,
+                hide_window=True,
+                slow_warning_after=300,
+                slow_warning=(
+                    (
+                        lambda elapsed: warning(
+                            "WOLF RPG Editor 全事件导出已运行 "
+                            f"{elapsed / 60:.1f} 分钟，请继续等待。"
+                        )
+                    )
+                    if warning
+                    else None
+                ),
+            )
         if result.return_code != 0:
             raise RuntimeError(f"WOLF RPG Editor 退出码为 {result.return_code}。")
         auto_source = sandbox / "Auto"
+        _restore_editor_map_paths(auto_source, maps)
         _validate_outputs(sandbox, auto_source, maps)
         auto_target = output / "editor-auto"
         shutil.copytree(auto_source, auto_target)

@@ -26,6 +26,27 @@ from wolf_command_catalog import (
 
 
 class EditorCalibrationTests(unittest.TestCase):
+    def test_real_corpus_shapes_have_official_evidence_and_transfer(self):
+        shapes = {
+            102: ((1, 4), (1, 6), (1, 10)),
+            121: ((7, 0),),
+            140: ((7, 0),),
+            151: ((5, 0),),
+            210: ((3, 2), (10, 0), (10, 5)),
+            260: ((3, 3),),
+            270: ((2, 0), (2, 1)),
+            300: ((6, 3), (8, 4)),
+        }
+        for opcode, values in shapes.items():
+            for shape in values:
+                semantics = command_semantics(opcode, *shape)
+                self.assertIsNotNone(semantics, (opcode, shape))
+                self.assertNotEqual("opaque", semantics["transfer"])
+                self.assertIn(
+                    semantics["evidence"],
+                    {"roundtrip", "differential", "runtime_verified"},
+                )
+
     def test_free_catalog_has_one_effect_and_never_accepts_unknown_shapes(self):
         effects = {
             "no_write",

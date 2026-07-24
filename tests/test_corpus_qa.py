@@ -7,10 +7,14 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.wolf_corpus_qa import (
+    _aggregate,
+    _official_out_of_scope,
     _out_of_scope_evidence,
     _sandbox_root,
+    build_parser,
     discover,
     pseudo_translation,
+    select_manifest,
     verify,
 )
 
@@ -28,6 +32,60 @@ def _coverage() -> dict[str, object]:
 
 
 class CorpusQaTests(unittest.TestCase):
+    def test_run_parser_accepts_targeted_candidate_ids(self):
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--manifest",
+                "corpus.json",
+                "--editor",
+                "Editor.exe",
+                "--run-dir",
+                "targeted",
+                "--candidate-id",
+                "one",
+                "--candidate-id",
+                "two",
+            ]
+        )
+        self.assertEqual(["one", "two"], args.candidate_id)
+        self.assertEqual(Path("targeted"), args.run_dir)
+
+    def test_defect_aggregate_keeps_analysis_evidence(self):
+        coverage = _coverage()
+        aggregate = _aggregate(
+            {"scan_complete": True, "access_errors": [], "candidates": [{}]},
+            [
+                {
+                    "candidate_id": "abc",
+                    "path": "game",
+                    "status": "DEFECT",
+                    "failure_stage": "acceptance",
+                    "failure_class": "coverage_gate",
+                    "coverage": coverage,
+                    "blocking_issue_count": 2,
+                    "error": "failed after analysis",
+                }
+            ],
+        )
+        result = aggregate["reports"][0]
+        self.assertEqual(coverage, result["coverage"])
+        self.assertEqual("acceptance", result["failure_stage"])
+        self.assertEqual("coverage_gate", result["failure_class"])
+        self.assertEqual(2, result["blocking_issue_count"])
+
+    def test_official_scope_dialogs_require_exact_positive_evidence(self):
+        legacy = _official_out_of_scope(
+            [
+                "Warning! | The process completed, but the Editor.exe version used "
+                "to create the game data seems to be old! Runtime Error!"
+            ]
+        )
+        self.assertEqual("legacy_editor_data", legacy[0]["kind"])
+        damaged = _official_out_of_scope(["Error | Map Size Error! [Size 0 Error]"])
+        self.assertEqual("damaged_map_data", damaged[0]["kind"])
+        self.assertEqual([], _official_out_of_scope(["Warning! | Unknown warning"]))
+
     def test_qa_sandbox_uses_short_public_path(self):
         with mock.patch.dict("os.environ", {"PUBLIC": r"C:\Users\Public"}):
             root = _sandbox_root("a" * 64)
@@ -52,6 +110,15 @@ class CorpusQaTests(unittest.TestCase):
             self.assertEqual(2, manifest["path_count"])
             self.assertEqual(1, manifest["unique_count"])
             self.assertEqual(1, len(manifest["candidates"][0]["duplicates"]))
+
+            scoped = select_manifest(output / "corpus-manifest.json", root / "packed", "packed")
+            self.assertTrue(scoped["scan_complete"])
+            self.assertEqual(1, scoped["unique_count"])
+            self.assertEqual("packed", scoped["scope"]["kind"])
+            self.assertEqual(0, len(scoped["access_errors"]))
+            self.assertEqual(
+                manifest["scan_complete"], scoped["scope"]["source_scan_complete"]
+            )
 
             original = "\\c[1]AB\nCD"
             translated = pseudo_translation(original, "stable-key")

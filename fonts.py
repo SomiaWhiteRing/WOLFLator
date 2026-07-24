@@ -3,11 +3,14 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import mmap
 import os
 import shutil
 import struct
 import sys
 import unicodedata
+from bisect import bisect_left, bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -23,6 +26,7 @@ BUNDLED_FONT_ID = "fusion-pixel-12px-proportional-zh_hans.ttf"
 BUNDLED_FONT_FAMILY = "Fusion Pixel 12px Prop zh_hans"
 BUNDLED_FONT_SHA256 = "5b27e9eb9d9dd93cff727d8919ddd2e7a482b19314b62991cb1e7806852e8734"
 FONT_EXTENSIONS = {".ttf", ".otf", ".ttc"}
+_COMMON_TEXT_SYMBOLS = frozenset("¥￥€£¢°℃℉©®™№×÷±−≠≈≤≥∞＋＝＜＞♂♀")
 
 
 class FontError(ValueError):
@@ -35,12 +39,47 @@ class FontCandidate:
     family: str
     aliases: tuple[str, ...]
     files: tuple[Path, ...]
+    preview_family: str = ""
+    style: str = ""
+    weight: int = 400
+    weight_range: tuple[int, int] | None = None
     missing: frozenset[str] = frozenset()
 
     @property
     def label(self) -> str:
         source = {"bundled": "随附", "game": "游戏", "system": "系统"}.get(self.source, self.source)
         return f"[{source}] {self.family}"
+
+
+@dataclass(frozen=True)
+class FontFaceInfo:
+    family: str
+    aliases: tuple[str, ...]
+    typographic_aliases: tuple[str, ...]
+    preview_family: str
+    style: str
+    weight: int
+    weight_range: tuple[int, int] | None
+    codepoint_ranges: tuple[tuple[int, int], ...]
+
+    @property
+    def codepoints(self) -> frozenset[int]:
+        return frozenset(
+            codepoint
+            for start, end in self.codepoint_ranges
+            for codepoint in range(start, end + 1)
+        )
+
+
+@dataclass(frozen=True)
+class _ScannedFontFace:
+    family: str
+    aliases: tuple[str, ...]
+    preview_family: str
+    style: str
+    weight: int
+    weight_range: tuple[int, int] | None
+    covered: frozenset[int]
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -231,6 +270,31 @@ def _validate_file_record(project_dir: Path, record: object, *, check_files: boo
     return {key: str(record[key]) for key in expected}
 
 
+def _canonical_scheme_family(
+    project_dir: Path,
+    family: str,
+    records: list[dict[str, str]],
+) -> str:
+    folded = family.casefold()
+    matches: set[str] = set()
+    for record in records:
+        path = (
+            bundled_font_path()
+            if record["kind"] == "bundled"
+            else _safe_project_file(project_dir, record["path"])
+        )
+        for face in font_file_faces(path):
+            names = {
+                face.family,
+                face.preview_family,
+                *face.aliases,
+                *face.typographic_aliases,
+            }
+            if any(name.casefold() == folded for name in names if name):
+                matches.add(face.family)
+    return next(iter(matches)) if len(matches) == 1 else family
+
+
 def validate_font_scheme(
     project_dir: str | Path,
     value: object,
@@ -267,14 +331,19 @@ def validate_font_scheme(
             raise FontError(f"字体槽位 {index + 1} 来源无效")
         if not isinstance(files, list) or not files:
             raise FontError(f"字体槽位 {index + 1} 没有字体文件")
+        validated_files = [
+            _validate_file_record(root, record, check_files=check_files) for record in files
+        ]
         validated_slots.append(
             {
                 "mode": "font",
-                "family": family.strip(),
+                "family": (
+                    _canonical_scheme_family(root, family.strip(), validated_files)
+                    if check_files
+                    else family.strip()
+                ),
                 "provenance": provenance,
-                "files": [
-                    _validate_file_record(root, record, check_files=check_files) for record in files
-                ],
+                "files": validated_files,
             }
         )
     acknowledgement = value.get("coverage_ack")
@@ -338,7 +407,16 @@ def required_characters(texts: Iterable[str]) -> set[str]:
     result: set[str] = set()
     for text in texts:
         for character in text:
-            if not character.isspace() and not unicodedata.category(character).startswith("C"):
+            category = unicodedata.category(character)
+            if character.isspace() or category.startswith("C"):
+                continue
+            # ponytail: this is a zh/ja text-coverage check, not icon-font validation;
+            # add a project symbol allowlist if games later need custom glyph coverage.
+            if (
+                character.isascii()
+                or category[0] in "LMNP"
+                or character in _COMMON_TEXT_SYMBOLS
+            ):
                 result.add(character)
     return result
 
@@ -461,7 +539,19 @@ def _table(data: bytes, tag: bytes, font_offset: int = 0) -> tuple[int, int]:
     raise FontError(f"字体缺少 {tag.decode('ascii')} 表")
 
 
-def _format_12_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
+def _merge_codepoint_ranges(
+    ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    result: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if result and start <= result[-1][1] + 1:
+            result[-1] = (result[-1][0], max(result[-1][1], end))
+        else:
+            result.append((start, end))
+    return tuple(result)
+
+
+def _format_12_ranges(data: bytes, offset: int, limit: int) -> list[tuple[int, int]]:
     if offset < 0 or offset + 16 > limit:
         raise FontError("字体 cmap format 12 范围无效")
     length = _u32(data, offset + 4)
@@ -470,7 +560,7 @@ def _format_12_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
     groups = _u32(data, offset + 12)
     if 16 + groups * 12 > length:
         raise FontError("字体 cmap format 12 分组范围无效")
-    result: set[int] = set()
+    result: list[tuple[int, int]] = []
     for index in range(groups):
         group = offset + 16 + index * 12
         start = _u32(data, group)
@@ -479,13 +569,13 @@ def _format_12_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
         if end < start or end > 0x10FFFF:
             raise FontError("字体 cmap format 12 分组无效")
         if glyph:
-            result.update(range(start, end + 1))
+            result.append((start, end))
         elif end > start:
-            result.update(range(start + 1, end + 1))
+            result.append((start + 1, end))
     return result
 
 
-def _format_4_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
+def _format_4_ranges(data: bytes, offset: int, limit: int) -> list[tuple[int, int]]:
     if offset < 0 or offset + 14 > limit:
         raise FontError("字体 cmap format 4 范围无效")
     length = _u16(data, offset + 2)
@@ -501,7 +591,7 @@ def _format_4_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
     range_offsets = deltas + segment_count * 2
     if range_offsets + segment_count * 2 > offset + length:
         raise FontError("字体 cmap format 4 分段范围无效")
-    result: set[int] = set()
+    result: list[tuple[int, int]] = []
     for index in range(segment_count):
         start = _u16(data, start_codes + index * 2)
         end = _u16(data, end_codes + index * 2)
@@ -509,6 +599,7 @@ def _format_4_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
             raise FontError("字体 cmap format 4 分段无效")
         delta = _i16(data, deltas + index * 2)
         range_offset = _u16(data, range_offsets + index * 2)
+        run_start = None
         for codepoint in range(start, min(end, 0xFFFE) + 1):
             if range_offset == 0:
                 glyph = (codepoint + delta) & 0xFFFF
@@ -520,11 +611,122 @@ def _format_4_codepoints(data: bytes, offset: int, limit: int) -> set[int]:
                 if glyph:
                     glyph = (glyph + delta) & 0xFFFF
             if glyph:
-                result.add(codepoint)
+                if run_start is None:
+                    run_start = codepoint
+            elif run_start is not None:
+                result.append((run_start, codepoint - 1))
+                run_start = None
+        if run_start is not None:
+            result.append((run_start, min(end, 0xFFFE)))
     return result
 
 
-def _font_codepoints(data: bytes, font_offset: int) -> set[int]:
+def _format_12_covered(
+    data: bytes,
+    offset: int,
+    limit: int,
+    required: tuple[int, ...],
+) -> set[int]:
+    if offset < 0 or offset + 16 > limit:
+        raise FontError("字体 cmap format 12 范围无效")
+    length = _u32(data, offset + 4)
+    groups = _u32(data, offset + 12)
+    if length < 16 or offset + length > limit or 16 + groups * 12 > length:
+        raise FontError("字体 cmap format 12 分组范围无效")
+    covered: set[int] = set()
+    for index in range(groups):
+        group = offset + 16 + index * 12
+        start = _u32(data, group)
+        end = _u32(data, group + 4)
+        glyph = _u32(data, group + 8)
+        if end < start or end > 0x10FFFF:
+            raise FontError("字体 cmap format 12 分组无效")
+        left = bisect_left(required, start)
+        right = bisect_right(required, end, lo=left)
+        for codepoint in required[left:right]:
+            if glyph or codepoint != start:
+                covered.add(codepoint)
+    return covered
+
+
+def _format_4_covered(
+    data: bytes,
+    offset: int,
+    limit: int,
+    required: tuple[int, ...],
+) -> set[int]:
+    if offset < 0 or offset + 14 > limit:
+        raise FontError("字体 cmap format 4 范围无效")
+    length = _u16(data, offset + 2)
+    segment_count_x2 = _u16(data, offset + 6)
+    if length < 16 or offset + length > limit or not segment_count_x2 or segment_count_x2 % 2:
+        raise FontError("字体 cmap format 4 范围无效")
+    segment_count = segment_count_x2 // 2
+    end_codes = offset + 14
+    start_codes = end_codes + segment_count * 2 + 2
+    deltas = start_codes + segment_count * 2
+    range_offsets = deltas + segment_count * 2
+    if range_offsets + segment_count * 2 > offset + length:
+        raise FontError("字体 cmap format 4 分段范围无效")
+    covered: set[int] = set()
+    for index in range(segment_count):
+        start = _u16(data, start_codes + index * 2)
+        raw_end = _u16(data, end_codes + index * 2)
+        if raw_end < start:
+            raise FontError("字体 cmap format 4 分段无效")
+        if start > 0xFFFE:
+            continue
+        end = min(raw_end, 0xFFFE)
+        delta = _i16(data, deltas + index * 2)
+        range_offset = _u16(data, range_offsets + index * 2)
+        left = bisect_left(required, start)
+        right = bisect_right(required, end, lo=left)
+        for codepoint in required[left:right]:
+            if range_offset == 0:
+                glyph = (codepoint + delta) & 0xFFFF
+            else:
+                glyph_offset = range_offsets + index * 2 + range_offset + (codepoint - start) * 2
+                if glyph_offset + 2 > offset + length:
+                    raise FontError("字体 cmap format 4 字形索引越界")
+                glyph = _u16(data, glyph_offset)
+                if glyph:
+                    glyph = (glyph + delta) & 0xFFFF
+            if glyph:
+                covered.add(codepoint)
+    return covered
+
+
+def _font_covered_required(
+    data: bytes,
+    font_offset: int,
+    required: tuple[int, ...],
+) -> frozenset[int]:
+    cmap_offset, cmap_length = _table(data, b"cmap", font_offset)
+    limit = cmap_offset + cmap_length
+    if cmap_length < 4:
+        raise FontError("字体 cmap 表被截断")
+    record_count = _u16(data, cmap_offset + 2)
+    if cmap_offset + 4 + record_count * 8 > limit:
+        raise FontError("字体 cmap 记录范围无效")
+    covered: set[int] = set()
+    seen: set[tuple[int, int]] = set()
+    for index in range(record_count):
+        record = cmap_offset + 4 + index * 8
+        subtable = cmap_offset + _u32(data, record + 4)
+        if subtable + 2 > limit:
+            raise FontError("字体 cmap 子表范围无效")
+        format_id = _u16(data, subtable)
+        if (format_id, subtable) in seen:
+            continue
+        seen.add((format_id, subtable))
+        if format_id == 12:
+            covered.update(_format_12_covered(data, subtable, limit, required))
+        elif format_id == 4:
+            covered.update(_format_4_covered(data, subtable, limit, required))
+    return frozenset(covered)
+
+
+def _font_codepoint_ranges(data: bytes, font_offset: int) -> tuple[tuple[int, int], ...]:
     cmap_offset, cmap_length = _table(data, b"cmap", font_offset)
     limit = cmap_offset + cmap_length
     if cmap_length < 4:
@@ -539,13 +741,13 @@ def _font_codepoints(data: bytes, font_offset: int) -> set[int]:
         if subtable + 2 > limit:
             raise FontError("字体 cmap 子表范围无效")
         subtables.append((_u16(data, subtable), subtable))
-    result: set[int] = set()
+    result: list[tuple[int, int]] = []
     for format_id, subtable in sorted(subtables, key=lambda item: item[0] != 12):
         if format_id == 12:
-            result.update(_format_12_codepoints(data, subtable, limit))
+            result.extend(_format_12_ranges(data, subtable, limit))
         elif format_id == 4:
-            result.update(_format_4_codepoints(data, subtable, limit))
-    return result
+            result.extend(_format_4_ranges(data, subtable, limit))
+    return _merge_codepoint_ranges(result)
 
 
 def _decode_name(platform_id: int, raw: bytes) -> str:
@@ -557,7 +759,9 @@ def _decode_name(platform_id: int, raw: bytes) -> str:
         return ""
 
 
-def _font_families(data: bytes, font_offset: int) -> set[str]:
+def _font_names(
+    data: bytes, font_offset: int
+) -> tuple[str, tuple[str, ...], tuple[str, ...], str, str]:
     table_offset, table_length = _table(data, b"name", font_offset)
     if table_length < 6:
         raise FontError("字体 name 表被截断")
@@ -569,10 +773,16 @@ def _font_families(data: bytes, font_offset: int) -> set[str]:
         or strings > table_offset + table_length
     ):
         raise FontError("字体 name 记录范围无效")
-    names: dict[int, set[str]] = {1: set(), 16: set()}
+    names: dict[int, list[tuple[int, int, str]]] = {
+        1: [],
+        2: [],
+        16: [],
+        17: [],
+    }
     for index in range(count):
         record = table_offset + 6 + index * 12
         platform_id = _u16(data, record)
+        language_id = _u16(data, record + 4)
         name_id = _u16(data, record + 6)
         if name_id not in names:
             continue
@@ -582,30 +792,151 @@ def _font_families(data: bytes, font_offset: int) -> set[str]:
             continue
         name = _decode_name(platform_id, data[offset : offset + length])
         if name:
-            names[name_id].add(name)
-    return names[16] | names[1]
+            names[name_id].append((platform_id, language_id, name))
+
+    def preferred(name_id: int) -> str:
+        values = names[name_id]
+        if not values:
+            return ""
+        platform, language, value = min(
+            values,
+            key=lambda item: (
+                0
+                if item[0] == 3 and item[1] == 0x0409
+                else 1
+                if item[0] == 1
+                else 2
+                if item[0] == 3
+                else 3,
+                item[2].casefold(),
+            ),
+        )
+        del platform, language
+        return value
+
+    family = preferred(1)
+    if not family:
+        raise FontError("字体没有 GDI 可用的字体族名称")
+    aliases = tuple(sorted({value for _platform, _language, value in names[1]}, key=str.casefold))
+    typographic_aliases = tuple(
+        sorted({value for _platform, _language, value in names[16]}, key=str.casefold)
+    )
+    return (
+        family,
+        aliases,
+        typographic_aliases,
+        preferred(16) or family,
+        preferred(17) or preferred(2),
+    )
+
+
+def _font_weight(data: bytes, font_offset: int) -> tuple[int, tuple[int, int] | None]:
+    variable_range = None
+    try:
+        table_offset, table_length = _table(data, b"fvar", font_offset)
+        if table_length >= 16:
+            axes_offset = table_offset + _u16(data, table_offset + 4)
+            axis_count = _u16(data, table_offset + 8)
+            axis_size = _u16(data, table_offset + 10)
+            if axis_size >= 20 and axes_offset + axis_count * axis_size <= table_offset + table_length:
+                for index in range(axis_count):
+                    record = axes_offset + index * axis_size
+                    if data[record : record + 4] != b"wght":
+                        continue
+                    minimum, default, maximum = (
+                        struct.unpack_from(">i", data, record + offset)[0] / 65536
+                        for offset in (4, 8, 12)
+                    )
+                    variable_range = (round(minimum), round(maximum))
+                    return min(1000, max(1, round(default))), variable_range
+    except FontError:
+        pass
+    try:
+        table_offset, table_length = _table(data, b"OS/2", font_offset)
+    except FontError:
+        return 400, variable_range
+    if table_length < 6:
+        return 400, variable_range
+    return min(1000, max(1, _u16(data, table_offset + 4))), variable_range
 
 
 @functools.lru_cache(maxsize=512)
-def _font_info_cached(path: str, size: int, modified_ns: int) -> tuple[tuple[str, ...], frozenset[int]]:
-    del size, modified_ns
-    data = Path(path).read_bytes()
-    families: set[str] = set()
-    codepoints: set[int] = set()
-    for offset in _font_offsets(data):
-        families.update(_font_families(data, offset))
-        codepoints.update(_font_codepoints(data, offset))
-    if not families or not codepoints:
+def _font_faces_cached(path: str, size: int, modified_ns: int) -> tuple[FontFaceInfo, ...]:
+    del modified_ns
+    if size == 0:
+        raise FontError("字体文件为空")
+    faces: list[FontFaceInfo] = []
+    with Path(path).open("rb") as handle, mmap.mmap(
+        handle.fileno(), 0, access=mmap.ACCESS_READ
+    ) as data:
+        for offset in _font_offsets(data):
+            family, aliases, typographic_aliases, preview_family, style = _font_names(data, offset)
+            codepoint_ranges = _font_codepoint_ranges(data, offset)
+            if not codepoint_ranges:
+                continue
+            weight, weight_range = _font_weight(data, offset)
+            faces.append(
+                FontFaceInfo(
+                    family=family,
+                    aliases=aliases,
+                    typographic_aliases=typographic_aliases,
+                    preview_family=preview_family,
+                    style=style,
+                    weight=weight,
+                    weight_range=weight_range,
+                    codepoint_ranges=codepoint_ranges,
+                )
+            )
+    if not faces:
         raise FontError("字体没有可用的字体族名称或 Unicode cmap")
-    return tuple(sorted(families, key=str.casefold)), frozenset(codepoints)
+    return tuple(faces)
 
 
-def font_file_info(path: str | Path) -> tuple[tuple[str, ...], frozenset[int]]:
+def font_file_faces(path: str | Path) -> tuple[FontFaceInfo, ...]:
     target = Path(path).resolve()
     if target.suffix.lower() not in FONT_EXTENSIONS:
         raise FontError(f"不支持的字体格式: {target.suffix or '(无扩展名)'}")
     stat = target.stat()
-    return _font_info_cached(str(target), stat.st_size, stat.st_mtime_ns)
+    return _font_faces_cached(str(target), stat.st_size, stat.st_mtime_ns)
+
+
+def _scan_font_faces(
+    path: Path,
+    required: tuple[int, ...],
+) -> tuple[_ScannedFontFace, ...]:
+    if path.stat().st_size == 0:
+        raise FontError("字体文件为空")
+    result: list[_ScannedFontFace] = []
+    with path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        for offset in _font_offsets(data):
+            family, aliases, _typographic, preview_family, style = _font_names(data, offset)
+            weight, weight_range = _font_weight(data, offset)
+            result.append(
+                _ScannedFontFace(
+                    family=family,
+                    aliases=aliases,
+                    preview_family=preview_family,
+                    style=style,
+                    weight=weight,
+                    weight_range=weight_range,
+                    covered=_font_covered_required(data, offset, required),
+                )
+            )
+    if not result:
+        raise FontError("字体没有可用的字体族名称或 Unicode cmap")
+    return tuple(result)
+
+
+def font_file_info(path: str | Path) -> tuple[tuple[str, ...], frozenset[int]]:
+    faces = font_file_faces(path)
+    families = {
+        name
+        for face in faces
+        for name in (*face.aliases, *face.typographic_aliases, face.preview_family)
+        if name
+    }
+    codepoints = frozenset(codepoint for face in faces for codepoint in face.codepoints)
+    return tuple(sorted(families, key=str.casefold)), codepoints
 
 
 def _font_paths(
@@ -616,13 +947,25 @@ def _font_paths(
 ) -> list[Path]:
     if root is None or not root.is_dir():
         return []
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    result = []
-    for path in iterator:
+    result: list[Path] = []
+    if not recursive:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if cancelled and cancelled():
+                    raise InterruptedError("字体扫描已取消")
+                if entry.is_file() and Path(entry.name).suffix.lower() in FONT_EXTENSIONS:
+                    result.append(Path(entry.path))
+        return result
+    for directory, _subdirectories, filenames in os.walk(
+        root, followlinks=False, onerror=lambda _error: None
+    ):
         if cancelled and cancelled():
             raise InterruptedError("字体扫描已取消")
-        if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS:
-            result.append(path)
+        result.extend(
+            Path(directory) / filename
+            for filename in filenames
+            if Path(filename).suffix.lower() in FONT_EXTENSIONS
+        )
     return result
 
 
@@ -651,12 +994,12 @@ def _system_font_paths(cancelled: Callable[[], bool] | None = None) -> list[Path
                         continue
                     direct = Path(value)
                     if direct.is_absolute() and direct.is_file():
-                        paths.add(direct.resolve())
+                        paths.add(direct)
                         continue
                     for directory in directories:
                         candidate = directory / value
                         if candidate.is_file():
-                            paths.add(candidate.resolve())
+                            paths.add(candidate)
                             break
         except InterruptedError:
             raise
@@ -665,13 +1008,172 @@ def _system_font_paths(cancelled: Callable[[], bool] | None = None) -> list[Path
     return sorted(paths, key=lambda path: str(path).casefold())
 
 
+def _missing_codepoints(
+    required: set[int],
+    coverages: Iterable[tuple[tuple[int, int], ...]],
+) -> set[int]:
+    ranges = _merge_codepoint_ranges(
+        item for coverage in coverages for item in coverage
+    )
+    missing: set[int] = set()
+    range_index = 0
+    for codepoint in sorted(required):
+        while range_index < len(ranges) and ranges[range_index][1] < codepoint:
+            range_index += 1
+        if range_index >= len(ranges) or codepoint < ranges[range_index][0]:
+            missing.add(codepoint)
+    return missing
+
+
+def _font_environment_signature(game: Path) -> list[object]:
+    signature: list[object] = [str(game.resolve()).casefold()]
+    for directory in (game, game / "Data"):
+        signature.append(directory.stat().st_mtime_ns if directory.is_dir() else 0)
+    if os.name == "nt":
+        import winreg
+
+        for hive, key_name in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+        ):
+            try:
+                with winreg.OpenKey(hive, key_name) as key:
+                    signature.append(winreg.QueryInfoKey(key)[2])
+            except OSError:
+                signature.append(0)
+        for directory in (
+            Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts",
+        ):
+            signature.append(directory.stat().st_mtime_ns if directory.is_dir() else 0)
+    return signature
+
+
+def _font_candidate_cache_path(game: Path, required: set[str]) -> Path:
+    payload = json.dumps(
+        {
+            "schema": 2,
+            "environment": _font_environment_signature(game),
+            "required": sorted(required, key=ord),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    key = hashlib.sha256(payload).hexdigest()
+    root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "WOLFLator" / "cache" / "font-candidates"
+    return root / f"{key}.json"
+
+
+def _load_font_candidate_cache(
+    path: Path,
+    required: set[str],
+) -> list[FontCandidate] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("schema") != 2:
+            return None
+        rows = value.get("candidates")
+        if not isinstance(rows, list):
+            return None
+        result = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "source",
+                "family",
+                "aliases",
+                "files",
+                "preview_family",
+                "style",
+                "weight",
+                "weight_range",
+                "missing",
+            }:
+                return None
+            source = row["source"]
+            files = tuple(Path(item) for item in row["files"])
+            if source not in {"bundled", "game", "system"} or any(
+                not item.is_absolute() or not item.is_file() for item in files
+            ):
+                return None
+            missing = row["missing"]
+            aliases = row["aliases"]
+            weight_range = row["weight_range"]
+            if (
+                not isinstance(row["family"], str)
+                or not isinstance(row["preview_family"], str)
+                or not isinstance(row["style"], str)
+                or type(row["weight"]) is not int
+                or not isinstance(aliases, list)
+                or not all(isinstance(item, str) for item in aliases)
+                or not isinstance(missing, list)
+                or not all(isinstance(item, str) and len(item) == 1 and item in required for item in missing)
+                or not (
+                    weight_range is None
+                    or isinstance(weight_range, list)
+                    and len(weight_range) == 2
+                    and all(type(item) is int for item in weight_range)
+                )
+            ):
+                return None
+            result.append(
+                FontCandidate(
+                    source=source,
+                    family=row["family"],
+                    aliases=tuple(aliases),
+                    files=files,
+                    preview_family=row["preview_family"],
+                    style=row["style"],
+                    weight=row["weight"],
+                    weight_range=tuple(weight_range) if weight_range else None,
+                    missing=frozenset(missing),
+                )
+            )
+        return result
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_font_candidate_cache(path: Path, candidates: list[FontCandidate]) -> None:
+    # ponytail: cache growth is content-addressed and unbounded; add LRU cleanup only if real projects grow it materially.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        path,
+        {
+            "schema": 2,
+            "candidates": [
+                {
+                    "source": candidate.source,
+                    "family": candidate.family,
+                    "aliases": list(candidate.aliases),
+                    "files": [str(item.absolute()) for item in candidate.files],
+                    "preview_family": candidate.preview_family,
+                    "style": candidate.style,
+                    "weight": candidate.weight,
+                    "weight_range": list(candidate.weight_range) if candidate.weight_range else None,
+                    "missing": sorted(candidate.missing, key=ord),
+                }
+                for candidate in candidates
+            ],
+        },
+    )
+
+
 def discover_font_candidates(
     game_root: str | Path,
     required: Iterable[str],
     *,
     cancelled: Callable[[], bool] | None = None,
+    refresh: bool = False,
 ) -> list[FontCandidate]:
     game = Path(game_root)
+    required_set = set(required)
+    cache_path = _font_candidate_cache_path(game, required_set)
+    if not refresh:
+        cached = _load_font_candidate_cache(cache_path, required_set)
+        if cached is not None:
+            return cached
     sources = (
         ("bundled", [bundled_font_path()]),
         (
@@ -682,41 +1184,84 @@ def discover_font_candidates(
         ("system", _system_font_paths(cancelled)),
     )
     grouped: dict[tuple[str, str], dict[str, object]] = {}
-    required_set = set(required)
-    for source, paths in sources:
-        for path in paths:
+    required_codepoints = tuple(sorted(ord(character) for character in required_set))
+    work = [(source, path) for source, paths in sources for path in paths]
+
+    def scan(entry: tuple[str, Path]) -> tuple[str, Path, tuple[_ScannedFontFace, ...]]:
+        source, path = entry
+        if cancelled and cancelled():
+            raise InterruptedError("字体扫描已取消")
+        try:
+            return source, path, _scan_font_faces(path, required_codepoints)
+        except (OSError, FontError):
+            return source, path, ()
+
+    # ponytail: two workers overlap font-file I/O without turning HDD scans into
+    # random-access thrashing; increase only if profiling on real machines proves it.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scanned = executor.map(scan, work)
+        for source, path, faces in scanned:
             if cancelled and cancelled():
                 raise InterruptedError("字体扫描已取消")
-            try:
-                families, codepoints = font_file_info(path)
-            except (OSError, FontError):
-                continue
-            for family in families:
-                key = (source, family.casefold())
+            for face in faces:
+                key = (source, face.family.casefold())
                 item = grouped.setdefault(
                     key,
-                    {"source": source, "family": family, "aliases": set(), "files": [], "coverage": set()},
+                    {
+                        "source": source,
+                        "family": face.family,
+                        "aliases": set(),
+                        "files": [],
+                        "preview_family": face.preview_family,
+                        "styles": set(),
+                        "weights": set(),
+                        "weight_ranges": set(),
+                        "covered": set(),
+                    },
                 )
-                item["aliases"].update(families)
+                item["aliases"].update(face.aliases)
+                if face.style:
+                    item["styles"].add(face.style)
+                item["weights"].add(face.weight)
+                if face.weight_range:
+                    item["weight_ranges"].add(face.weight_range)
                 if path not in item["files"]:
                     item["files"].append(path)
-                item["coverage"].update(codepoints)
+                item["covered"].update(face.covered)
     order = {"bundled": 0, "game": 1, "system": 2}
     result = []
     for item in grouped.values():
         if cancelled and cancelled():
             raise InterruptedError("字体扫描已取消")
-        missing = frozenset(character for character in required_set if ord(character) not in item["coverage"])
+        missing_codepoints = set(required_codepoints) - item["covered"]
+        missing = frozenset(map(chr, missing_codepoints))
+        styles = sorted(item["styles"], key=str.casefold)
+        weights = sorted(item["weights"])
+        weight_ranges = sorted(item["weight_ranges"])
         result.append(
             FontCandidate(
                 source=str(item["source"]),
                 family=str(item["family"]),
                 aliases=tuple(sorted(item["aliases"], key=str.casefold)),
                 files=tuple(sorted(item["files"], key=lambda path: str(path).casefold())),
+                preview_family=str(item["preview_family"]),
+                style=" / ".join(styles),
+                weight=weights[0] if len(weights) == 1 else 0,
+                weight_range=weight_ranges[0] if len(weight_ranges) == 1 else None,
                 missing=missing,
             )
         )
-    result.sort(key=lambda candidate: (order[candidate.source], len(candidate.missing), candidate.family.casefold()))
+    result.sort(
+        key=lambda candidate: (
+            order[candidate.source],
+            len(candidate.missing),
+            candidate.family.casefold(),
+            candidate.weight,
+            candidate.style.casefold(),
+        )
+    )
+    if not (cancelled and cancelled()):
+        _save_font_candidate_cache(cache_path, result)
     return result
 
 
@@ -730,8 +1275,8 @@ def candidate_for_family(candidates: Iterable[FontCandidate], family: str) -> Fo
 
 
 def with_missing(candidate: FontCandidate, required: Iterable[str]) -> FontCandidate:
-    coverage: set[int] = set()
+    coverages = []
     for path in candidate.files:
-        coverage.update(font_file_info(path)[1])
-    missing = frozenset(character for character in set(required) if ord(character) not in coverage)
-    return replace(candidate, missing=missing)
+        coverages.extend(face.codepoint_ranges for face in font_file_faces(path))
+    missing = _missing_codepoints({ord(character) for character in required}, coverages)
+    return replace(candidate, missing=frozenset(map(chr, missing)))

@@ -3,15 +3,34 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from app import EditorInstallThread, STAGE_RESULT_LABELS, InstallThread, MainWindow, SettingsDialog
+from app import (
+    EditorInstallThread,
+    STAGE_RESULT_LABELS,
+    InstallThread,
+    MainWindow,
+    SettingsDialog,
+    _completed_import_protection,
+    _font_required_characters,
+    _qt_preview_font,
+    _qt_preview_family,
+)
 from fonts import FontCandidate
-from models import AppSettings, RunMode, Stage, StageStatus
+from models import (
+    AppSettings,
+    ImportProtectionRules,
+    ImportScope,
+    RunMode,
+    Stage,
+    StageStatus,
+    TranslationItem,
+)
 from pipeline import PipelineStateEvent, create_project, load_manifest
 from settings import SettingsStore, protect_secret, unprotect_secret
 
@@ -32,6 +51,26 @@ class SettingsQtTests(unittest.TestCase):
         self.assertEqual("已完成（16 个警告）", label.text())
         self.assertEqual("warning", label.property("state"))
         self.assertEqual("details", label.toolTip())
+
+    def test_preview_uses_qt_registered_alias_instead_of_localized_fallback(self):
+        candidate = FontCandidate(
+            source="system",
+            family="GenSenRounded JP R",
+            aliases=("GenSenRounded JP R", "源泉圓體 R"),
+            files=(),
+            preview_family="GenSenRounded JP",
+            style="R",
+            weight=400,
+        )
+        with patch(
+            "app.QFontDatabase.families",
+            return_value=["GenSenRounded JP", "SimSun"],
+        ):
+            self.assertEqual(
+                "GenSenRounded JP",
+                _qt_preview_family(candidate, candidate.family),
+            )
+            self.assertEqual("R", _qt_preview_font(candidate, candidate.family).styleName())
 
     def test_dialog_loads_persisted_paths(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +289,59 @@ class SettingsQtTests(unittest.TestCase):
                 window.step_mode.click()
                 self.assertEqual(1, window.workflow_stack.currentIndex())
                 window.close()
+
+    def test_font_scan_is_lazy_until_font_tab_is_opened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.ini")
+            with patch("app.SettingsStore", return_value=store), patch.object(
+                MainWindow, "_open_settings"
+            ), patch.object(MainWindow, "_refresh_font_tab") as refresh:
+                window = MainWindow()
+                refresh.assert_not_called()
+                window.tabs.setCurrentIndex(window.font_tab_index)
+                self.app.processEvents()
+                refresh.assert_called_once_with()
+                window.close()
+
+    def test_completed_import_protection_is_reused_for_font_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            manifest = load_manifest(create_project(root / "projects", game))
+            items = root / "items.json"
+            report = root / "import-protection.json"
+            items.write_text("{}", encoding="utf-8")
+            report.write_text(
+                json.dumps({"schema": 2, "protected_keys": ["key"]}),
+                encoding="utf-8",
+            )
+            record = manifest.version.stage(Stage.IMPORT)
+            record.status = StageStatus.COMPLETED
+            record.artifacts["import_protection"] = str(report)
+            self.assertEqual(
+                ["key"],
+                _completed_import_protection(manifest, items)["protected_keys"],
+            )
+
+    def test_pending_import_font_coverage_contains_original_and_translation(self):
+        manifest = SimpleNamespace(
+            import_scope=ImportScope(),
+            import_protection=ImportProtectionRules(),
+        )
+        items = [
+            TranslationItem(
+                key="line",
+                code="COMMON-1-1-0",
+                original="原文甲",
+                translation="译文乙",
+            )
+        ]
+        required, exact = _font_required_characters(manifest, items, None)
+        self.assertFalse(exact)
+        self.assertTrue(set("原文甲译乙") <= required)
 
     def test_incompatible_project_manifest_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:

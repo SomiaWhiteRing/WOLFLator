@@ -734,6 +734,34 @@ def _validate_manual_cases(copied: str) -> list[dict[str, object]]:
         ("CAL-255-XY-A", "CAL-255-XY-B", "CAL-ARRAY-A", "CAL-ARRAY-B", "opcode 255 XY 数组操作"),
         ("CAL-257-XY-A", "CAL-257-XY-B", "CAL-ARRAY-A", "CAL-ARRAY-B", "opcode 257 XY 数组操作"),
         ("CAL-300-ARGS-A", "CAL-300-ARGS-B", '"A"', '"B"', "opcode 300 公共事件参数"),
+        (
+            "CAL-260-DOWNLOAD-A",
+            "CAL-260-DOWNLOAD-B",
+            "example.invalid/A",
+            "example.invalid/B",
+            "opcode 260 下载 URL",
+        ),
+        (
+            "CAL-270-PARTY-FILE-A",
+            "CAL-270-PARTY-FILE-B",
+            "CAL-A.png",
+            "CAL-B.png",
+            "opcode 270 队伍资源路径",
+        ),
+        (
+            "CAL-270-SINGLE-FILE-A",
+            "CAL-270-SINGLE-FILE-B",
+            "CAL-A.png",
+            "CAL-B.png",
+            "opcode 270 单参数资源路径",
+        ),
+        (
+            "CAL-300-MANY-ARGS-A",
+            "CAL-300-MANY-ARGS-B",
+            '"A"',
+            '"B"',
+            "opcode 300 多参数公共事件调用",
+        ),
     )
     for left_id, right_id, old, new, label in differential_pairs:
         left = official.get(left_id, "")

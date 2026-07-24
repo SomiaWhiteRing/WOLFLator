@@ -15,11 +15,19 @@ from models import (
     RunMode,
     Stage,
     StageStatus,
+    ToolResult,
     TranslationItem,
 )
 from pipeline import Pipeline, create_project, load_manifest
 from wolf_editor import EditorInfo, analyze_auto_export
-from wolf_tools import dump_items, full_export_scope, hash_directory, load_items
+from wolf_tools import (
+    IMPORT_PROTECTION_SCHEMA,
+    UberWolfRunner,
+    dump_items,
+    full_export_scope,
+    hash_directory,
+    load_items,
+)
 
 
 def make_game(root: Path) -> Path:
@@ -49,6 +57,71 @@ class FailingPipeline(FakePipeline):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_unpack_excludes_mtool_trsdata_with_hash_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = make_game(root / "game")
+            manifest_path = create_project(root / "projects", game)
+            pipeline = Pipeline(
+                manifest_path,
+                AppSettings(),
+                "",
+                root / "cache",
+                glossary_api_key="",
+            )
+            pipeline.work_dir.mkdir(parents=True)
+            (pipeline.work_dir / "Game.exe").write_bytes(b"game")
+            legacy = pipeline.work_dir / "TrsData.bin"
+            legacy.write_bytes(b"MTool legacy")
+            variant = pipeline.work_dir / "TrsData_ChatGPT_2023108 124849.bin"
+            variant.write_bytes(b"MTool translated legacy")
+            with mock.patch("pipeline.prepare_uberwolf", return_value=root / "UberWolfCli.exe"):
+                with mock.patch.object(UberWolfRunner, "unpack"):
+                    artifacts = pipeline._unpack()
+            self.assertFalse(legacy.exists())
+            self.assertFalse(variant.exists())
+            evidence = json.loads(Path(artifacts["excluded_legacy_files"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                {"TrsData.bin", "TrsData_ChatGPT_2023108 124849.bin"},
+                {item["relative_path"] for item in evidence["files"]},
+            )
+            self.assertEqual({12, 23}, {item["bytes"] for item in evidence["files"]})
+
+    def test_uberwolf_merges_incomplete_loose_data_over_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "Online").mkdir(parents=True)
+            (game / "Data" / "Online" / "decode.csv").write_text(
+                "loose", encoding="utf-8"
+            )
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data.wolf").write_bytes(b"archive")
+            executable = root / "UberWolfCli.exe"
+            executable.write_bytes(b"tool")
+
+            def unpack(command, **_kwargs):
+                sandbox = Path(command[1]).parent
+                basic = sandbox / "Data" / "BasicData"
+                basic.mkdir(parents=True)
+                (basic / "Game.dat").write_bytes(b"unpacked")
+                (sandbox / "Data" / "Online").mkdir()
+                (sandbox / "Data" / "Online" / "decode.csv").write_text(
+                    "archive", encoding="utf-8"
+                )
+                return ToolResult(command, 0)
+
+            with mock.patch("wolf_tools.run_process", side_effect=unpack):
+                UberWolfRunner(executable).unpack(game)
+
+            self.assertEqual(
+                b"unpacked", (game / "Data" / "BasicData" / "Game.dat").read_bytes()
+            )
+            self.assertEqual(
+                "loose",
+                (game / "Data" / "Online" / "decode.csv").read_text(encoding="utf-8"),
+            )
+
     def _attach_editor_analysis(self, pipeline: Pipeline) -> Path:
         path = pipeline.artifacts_dir / "editor-analysis.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +190,25 @@ class PipelineTests(unittest.TestCase):
         self._attach_editor_analysis(pipeline)
         (pipeline.project_dir / "glossary.json").write_text("{}", encoding="utf-8")
         return pipeline
+
+    def _attach_import_protection(
+        self, pipeline: Pipeline, protected_keys: tuple[str, ...] = ()
+    ) -> Path:
+        path = pipeline.artifacts_dir / "import-protection.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": IMPORT_PROTECTION_SCHEMA,
+                    "protected_keys": list(protected_keys),
+                    "structural_diff": {"status": "passed", "differences": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        pipeline.manifest.version.stage(Stage.IMPORT).artifacts[
+            "import_protection"
+        ] = str(path)
+        return path
 
     def test_translation_retries_only_failed_rows_in_one_fresh_session(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -255,7 +347,7 @@ class PipelineTests(unittest.TestCase):
                 TranslationItem(key=f"font-{index}", original=f"原字体{index}", code=f"BASICDATA-{index + 3}")
                 for index in range(4)
             ]
-            items.append(TranslationItem(key="text", original="原文", translation="中文∟", code="COMMON-1-2-0"))
+            items.append(TranslationItem(key="text", original="原文", translation="中文𠀀", code="COMMON-1-2-0"))
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts["items"] = str(items_path)
             workbook_path = pipeline.artifacts_dir / "source.xlsx"
@@ -289,6 +381,7 @@ class PipelineTests(unittest.TestCase):
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["workbook"] = str(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
             self._attach_editor_analysis(pipeline)
+            self._attach_import_protection(pipeline)
 
             verification = root / "verification.xlsx"
             verify_book = Workbook()
@@ -320,7 +413,11 @@ class PipelineTests(unittest.TestCase):
             runner.extract.return_value = verification
             runner.console_outputs = []
             temporary = pipeline.version_dir / ".release-ready"
-            with mock.patch.object(pipeline, "_official_runner", return_value=runner):
+            with mock.patch.object(
+                pipeline,
+                "_translation_safety",
+                side_effect=AssertionError("release must reuse import protection"),
+            ), mock.patch.object(pipeline, "_official_runner", return_value=runner):
                 artifacts = pipeline._build_font_release(
                     translated, temporary, load_font_scheme(manifest_path.parent)
                 )
@@ -328,7 +425,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("4", artifacts["font_warning_count"])
             self.assertTrue(
                 any(
-                    line.startswith("[WARNING] 字体缺字：主字体") and '样例 "∟"' in line
+                    line.startswith("[WARNING] 字体缺字：主字体") and '样例 "𠀀"' in line
                     for line in logs
                 )
             )
@@ -373,6 +470,7 @@ class PipelineTests(unittest.TestCase):
                 "items": str(items_path),
             }
             self._attach_editor_analysis(pipeline)
+            self._attach_import_protection(pipeline)
             translated = make_game(root / "translated")
             generated = root / "generated"
             runner = mock.Mock()
@@ -412,6 +510,10 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pipeline = self._translation_pipeline(root)
+            map_path = pipeline.work_dir / "Data" / "MapData" / "Map0EX.mps"
+            map_path.parent.mkdir(parents=True)
+            map_path.write_bytes(b"map")
+            (pipeline.work_dir / "Data.wolf").write_bytes(b"packed")
             items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1-0-0")]
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
@@ -431,9 +533,16 @@ class PipelineTests(unittest.TestCase):
             stale_diagnostics.write_text("stale", encoding="utf-8")
 
             post_editor = mock.Mock(auto_dir=root / "post-auto", analysis_path=root / "post-analysis.json")
+
+            def verify_merged(_editor, game_root, *_args, **_kwargs):
+                merged = Path(game_root)
+                self.assertTrue((merged / "Data" / "MapData" / "Map0EX.mps").is_file())
+                self.assertFalse((merged / "Data.wolf").exists())
+                return post_editor
+
             with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
                 "pipeline.write_scoped_workbook", return_value=scoped
-            ), mock.patch("pipeline.export_and_analyze", return_value=post_editor), mock.patch(
+            ), mock.patch("pipeline.export_and_analyze", side_effect=verify_merged), mock.patch(
                 "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
             ):
                 artifacts = pipeline._import()
@@ -609,7 +718,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.COPY).status)
             self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.TRANSLATE).status)
 
-    def test_rerun_stage_invalidates_only_downstream(self):
+    def test_rerun_stage_keeps_downstream_completed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
@@ -619,6 +728,11 @@ class PipelineTests(unittest.TestCase):
                     manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
                 ).run(),
             )
+            before = load_manifest(manifest_path)
+            downstream_artifacts = {
+                stage: dict(before.version.stage(stage).artifacts)
+                for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT) + 1 :]
+            }
             executed = []
             pipeline = FakePipeline(
                 manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
@@ -629,7 +743,9 @@ class PipelineTests(unittest.TestCase):
             current = load_manifest(manifest_path)
             self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.UNPACK).status)
             self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.EXTRACT).status)
-            self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.GLOSSARY).status)
+            for stage, artifacts in downstream_artifacts.items():
+                self.assertEqual(StageStatus.COMPLETED, current.version.stage(stage).status)
+                self.assertEqual(artifacts, current.version.stage(stage).artifacts)
 
     def test_removed_skip_marker_is_normalized_before_run(self):
         with tempfile.TemporaryDirectory() as directory:

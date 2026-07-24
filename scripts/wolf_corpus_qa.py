@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -31,19 +32,59 @@ from wolf_editor import analyze_auto_export, inspect_wolf_editor  # noqa: E402
 from wolf_tools import (  # noqa: E402
     CancelledError,
     OfficialToolDialogError,
+    ToolProcessError,
     dump_items,
     load_items,
     protect_control_tokens,
     restore_control_tokens,
+    selected_translation_requirements,
     sha256_file,
 )
 
 
 CORPUS_SCHEMA = 1
-RUN_SCHEMA = 1
+RUN_SCHEMA = 2
 _REPARSE_POINT = 0x400
 _PSEUDO_ALPHABET = "伪译测试甲乙丙丁戊己庚辛壬癸"
-_TERMINAL = {"PASS", "OUT_OF_SCOPE"}
+_COMPLETED = {"PASS", "OUT_OF_SCOPE", "DEFECT"}
+_DISCARD_SANDBOX = {"PASS", "OUT_OF_SCOPE"}
+
+
+def _official_out_of_scope(dialogs: Sequence[str]) -> list[dict[str, object]]:
+    evidence = []
+    for dialog in dialogs:
+        normalized = " ".join(dialog.casefold().split())
+        if "editor.exe version used to create the game data seems to be old" in normalized:
+            kind = "legacy_editor_data"
+        elif "map size error" in normalized:
+            kind = "damaged_map_data"
+        else:
+            return []
+        evidence.append({"kind": kind, "dialog": dialog})
+    return evidence
+
+
+def _compact_failure_artifacts(project_parent: Path) -> dict[str, object]:
+    protections = sorted(
+        project_parent.rglob("import-protection-*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    if not protections:
+        return {}
+    path = protections[-1]
+    try:
+        protection = _load_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"import_protection": str(path)}
+    structural = protection.get("structural_diff", {})
+    return {
+        "import_protection": str(path),
+        "structural_diff": {
+            "status": structural.get("status"),
+            "difference_count": structural.get("difference_count", 0),
+            "differences": list(structural.get("differences", []))[:5],
+        },
+    }
 
 
 def _now() -> str:
@@ -184,6 +225,41 @@ def discover(roots: Iterable[Path], output: Path) -> dict[str, object]:
     return manifest
 
 
+def select_manifest(source: Path, output: Path, kind: str) -> dict[str, object]:
+    manifest = _load_json(source)
+    if manifest.get("schema") != CORPUS_SCHEMA:
+        raise ValueError("不支持的发现清单 schema。")
+    candidates = manifest.get("candidates", [])
+    if not isinstance(candidates, list):
+        raise ValueError("发现清单 candidates 不是数组。")
+    selected = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("kind") == kind
+    ]
+    scoped = {
+        "schema": CORPUS_SCHEMA,
+        "created_at": _now(),
+        "roots": list(manifest.get("roots", [])),
+        "scan_complete": True,
+        "access_errors": [],
+        "path_count": sum(1 + len(item.get("duplicates", [])) for item in selected),
+        "unique_count": len(selected),
+        "candidates": selected,
+        "scope": {
+            "kind": kind,
+            "source_manifest": str(source.resolve()),
+            "source_manifest_sha256": sha256_file(source),
+            "source_scan_complete": bool(manifest.get("scan_complete")),
+            "source_access_error_count": len(manifest.get("access_errors", [])),
+            "source_unique_count": len(candidates),
+        },
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output / "corpus-manifest.json", scoped)
+    return scoped
+
+
 def pseudo_translation(original: str, key: str) -> str:
     protected, tokens = protect_control_tokens(original)
     digest = hashlib.sha256(key.encode("utf-8", errors="surrogatepass")).digest()
@@ -228,16 +304,16 @@ def _coverage_passes(coverage: dict[str, object]) -> bool:
         coverage.get("opaque_effects") == 0
         and coverage.get("unexplained_data_side_effects", 0) == 0
         and all(
-        isinstance(coverage.get(name), dict)
-        and coverage[name].get("ratio") == 1.0
-        and coverage[name].get("missing") == 0
-        for name in (
-            "shape_coverage",
-            "semantic_coverage",
-            "cfg_coverage",
-            "call_target_coverage",
-            "data_effect_coverage",
-        )
+            isinstance(coverage.get(name), dict)
+            and coverage[name].get("ratio") == 1.0
+            and coverage[name].get("missing") == 0
+            for name in (
+                "shape_coverage",
+                "semantic_coverage",
+                "cfg_coverage",
+                "call_target_coverage",
+                "data_effect_coverage",
+            )
         )
     )
 
@@ -335,16 +411,29 @@ def _pipeline(settings, manifest_path: Path) -> Pipeline:
 
 def _sandbox_root(candidate_id: str) -> Path:
     public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public"))
-    # ponytail: sequential QA only; add a run-id component before parallelizing games.
+    # ponytail: frozen candidates use SHA-256 ids; widen the prefix for untrusted ids.
     return public_root / "WOLFLator" / "corpus-qa" / candidate_id[:16]
 
 
 def _inject_pseudo_translation(pipeline: Pipeline) -> tuple[int, int]:
     extract = pipeline.manifest.version.stage(Stage.EXTRACT).artifacts
     items = load_items(extract["items"])
+    all_scope = ImportScope(True, True, True, True, True)
+    requirements = selected_translation_requirements(
+        items,
+        all_scope,
+        allow_copy_condition_groups=True,
+    )
+    filename_keys = {
+        key
+        for key, categories in requirements.items()
+        if ImportCategory.FILENAME in categories
+    }
     translated = 0
     for item in items:
-        if (
+        if item.key in filename_keys:
+            item.translation = item.original
+        elif (
             item.original
             and item.category is not ImportCategory.COPY
             and item.code.upper() not in {"BASICDATA-3", "BASICDATA-4", "BASICDATA-5", "BASICDATA-6"}
@@ -390,8 +479,10 @@ def _run_candidate(
         "status": "INCOMPLETE",
     }
     project_parent = _sandbox_root(candidate_id)
+    current_stage = "setup"
     try:
         before = game_fingerprint(source, str(candidate["kind"]))
+        report["source_fingerprint_before"] = before
         if before != candidate["fingerprint"]:
             raise RuntimeError("发现清单冻结后源游戏逻辑文件发生变化。")
         if project_parent.exists():
@@ -405,8 +496,10 @@ def _run_candidate(
         pipeline.set_translation_scope(all_scope)
         pipeline.set_import_scope(all_scope)
         for stage in (Stage.COPY, Stage.UNPACK, Stage.EXTRACT):
+            current_stage = stage.value
             pipeline.run_stage(stage)
 
+        current_stage = "analysis"
         extract = load_manifest(manifest_path).version.stage(Stage.EXTRACT).artifacts
         analysis_path = Path(extract["editor_analysis"])
         first_analysis = _load_json(analysis_path)
@@ -419,6 +512,22 @@ def _run_candidate(
         )
         first_hash = _json_hash(first_analysis)
         second_hash = _json_hash(second_analysis)
+        coverage = _coverage(first_analysis)
+        blocking = list(first_analysis.get("blocking_issues", []))
+        report.update(
+            {
+                "analysis_hash": first_hash,
+                "repeat_analysis_hash": second_hash,
+                "coverage": coverage,
+                "blocking_issue_count": len(blocking),
+                "blocking_issues": blocking[:5],
+                "analysis_artifacts": {
+                    "editor_analysis": str(analysis_path),
+                    "editor_auto_dir": str(extract["editor_auto_dir"]),
+                    "items": str(extract["items"]),
+                },
+            }
+        )
         if first_hash != second_hash:
             raise RuntimeError(
                 f"原文静态分析结果不确定: {first_hash} != {second_hash}"
@@ -434,16 +543,16 @@ def _run_candidate(
                     "source_fingerprint_after": game_fingerprint(
                         source, str(candidate["kind"])
                     ),
-                    "analysis_hash": first_hash,
-                    "repeat_analysis_hash": second_hash,
-                    "coverage": _coverage(first_analysis),
                     "evidence": out_of_scope,
                 }
             )
             return report
 
+        current_stage = "pseudo_translation"
         total_items, pseudo_items = _inject_pseudo_translation(pipeline)
+        current_stage = Stage.VALIDATE.value
         pipeline.run_stage(Stage.VALIDATE)
+        current_stage = Stage.IMPORT.value
         pipeline.run_stage(Stage.IMPORT)
         manifest = load_manifest(manifest_path)
         import_artifacts = manifest.version.stage(Stage.IMPORT).artifacts
@@ -451,7 +560,6 @@ def _run_candidate(
         replay = protection.get("translated_replay", {})
         structural = protection.get("structural_diff", {})
         after = game_fingerprint(source, str(candidate["kind"]))
-        coverage = _coverage(first_analysis)
         pass_reasons = []
         if not _coverage_passes(coverage):
             pass_reasons.append("核心覆盖未达到 100% 或仍有不透明副作用")
@@ -471,17 +579,9 @@ def _run_candidate(
             pass_reasons.append("官方回读结构比较未通过")
         if before != after:
             pass_reasons.append("源游戏逻辑文件哈希变化")
-        if pass_reasons:
-            raise RuntimeError("；".join(pass_reasons))
-
         report.update(
             {
-                "status": "PASS",
-                "source_fingerprint_before": before,
                 "source_fingerprint_after": after,
-                "analysis_hash": first_hash,
-                "repeat_analysis_hash": second_hash,
-                "coverage": coverage,
                 "items": total_items,
                 "pseudo_translations": pseudo_items,
                 "safe_to_translate": len(protection.get("safe_to_translate", [])),
@@ -490,36 +590,74 @@ def _run_candidate(
                 "structural_diff": structural,
             }
         )
+        if pass_reasons:
+            report.update(
+                {
+                    "status": "DEFECT",
+                    "failure_stage": "acceptance",
+                    "failure_class": "acceptance_gate",
+                    "error": "；".join(pass_reasons),
+                    "evidence": pass_reasons[:5],
+                }
+            )
+            return report
+        report["status"] = "PASS"
     except OfficialToolDialogError as error:
-        if any(re.search(r"(?:Map Size|Data).*Error", dialog, re.IGNORECASE) for dialog in error.dialogs):
+        evidence = _official_out_of_scope(error.dialogs)
+        if evidence:
             report.update(
                 {
                     "status": "OUT_OF_SCOPE",
-                    "source_fingerprint_before": before,
                     "source_fingerprint_after": game_fingerprint(
                         source, str(candidate["kind"])
                     ),
-                    "evidence": [
-                        {
-                            "kind": "official_tool_data_error",
-                            "dialogs": list(error.dialogs),
-                        }
-                    ],
+                    "failure_stage": current_stage,
+                    "failure_class": str(evidence[0]["kind"]),
+                    "error": str(error),
+                    "evidence": evidence,
                 }
             )
         else:
             report.update(
                 {
                     "status": "DEFECT",
+                    "failure_stage": current_stage,
+                    "failure_class": "official_tool_dialog",
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "evidence": list(error.dialogs)[:5],
                     "traceback": traceback.format_exc(),
                 }
             )
+    except ToolProcessError as error:
+        report.update(
+            {
+                "status": "DEFECT",
+                "failure_stage": current_stage,
+                "failure_class": "external_process_exit",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "exit_code": error.return_code,
+                "command_type": Path(error.command[0]).name if error.command else "",
+                "command": list(error.command),
+                "evidence": [
+                    value[-1000:]
+                    for value in (
+                        error.console_output,
+                        error.stderr,
+                        error.stdout,
+                    )
+                    if value
+                ][:5],
+                "traceback": traceback.format_exc(),
+            }
+        )
     except (CancelledError, KeyboardInterrupt, TimeoutError, PermissionError) as error:
         report.update(
             {
                 "status": "INCOMPLETE",
+                "failure_stage": current_stage,
+                "failure_class": "interrupted",
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "traceback": traceback.format_exc(),
@@ -531,20 +669,40 @@ def _run_candidate(
         report.update(
             {
                 "status": "DEFECT",
+                "failure_stage": current_stage,
+                "failure_class": "analysis_or_pipeline_exception",
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "traceback": traceback.format_exc(),
             }
         )
     finally:
+        if report["status"] in {"DEFECT", "INCOMPLETE"}:
+            report.update(_compact_failure_artifacts(project_parent))
         report["finished_at"] = _now()
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         atomic_write_json(checkpoint, report)
-        if report["status"] in _TERMINAL and project_parent.exists():
+        if report["status"] in _DISCARD_SANDBOX and project_parent.exists():
             # ponytail: successful multi-GB sandboxes add no evidence beyond their hashes;
             # retain failed sandboxes for diagnosis and rebuild passing ones on demand.
             shutil.rmtree(project_parent)
     return report
+
+
+def _run_candidate_worker(
+    candidate: dict[str, object],
+    run_dir: str,
+    settings_path: str | None,
+    editor_path: str,
+) -> dict[str, object]:
+    QCoreApplication.setApplicationName("WOLFLator")
+    QCoreApplication.setOrganizationName("WOLFLator")
+    application = QCoreApplication.instance() or QCoreApplication([])
+    settings_store = SettingsStore(settings_path)
+    settings = settings_store.load()
+    editor = inspect_wolf_editor(editor_path)
+    settings.wolf_editor_path = str(editor.path)
+    return _run_candidate(candidate, Path(run_dir), settings, editor)
 
 
 def _aggregate(manifest: dict[str, object], reports: list[dict[str, object]]) -> dict[str, object]:
@@ -569,6 +727,11 @@ def _aggregate(manifest: dict[str, object], reports: list[dict[str, object]]) ->
                 "path": report.get("path"),
                 "status": report.get("status"),
                 "elapsed_seconds": report.get("elapsed_seconds"),
+                "failure_stage": report.get("failure_stage", ""),
+                "failure_class": report.get("failure_class", ""),
+                "exit_code": report.get("exit_code"),
+                "coverage": report.get("coverage", {}),
+                "blocking_issue_count": report.get("blocking_issue_count", 0),
                 "error": report.get("error", ""),
             }
             for report in reports
@@ -576,10 +739,33 @@ def _aggregate(manifest: dict[str, object], reports: list[dict[str, object]]) ->
     }
 
 
-def run_manifest(manifest_path: Path, editor_path: Path, resume: bool, settings_path: str | None) -> dict[str, object]:
+def run_manifest(
+    manifest_path: Path,
+    editor_path: Path,
+    resume: bool,
+    settings_path: str | None,
+    jobs: int = 4,
+    *,
+    run_dir: Path | None = None,
+    candidate_ids: Sequence[str] | None = None,
+) -> dict[str, object]:
+    if not 1 <= jobs <= 16:
+        raise ValueError("jobs 必须在 1..16 之间。")
     manifest = _load_json(manifest_path)
     if manifest.get("schema") != CORPUS_SCHEMA:
         raise ValueError("不支持的全盘发现清单 schema。")
+    if candidate_ids:
+        requested = set(candidate_ids)
+        available = {
+            str(candidate["id"]): candidate
+            for candidate in manifest.get("candidates", [])
+            if isinstance(candidate, dict) and "id" in candidate
+        }
+        missing = sorted(requested - available.keys())
+        if missing:
+            raise ValueError(f"冻结清单中不存在候选: {', '.join(missing)}")
+        manifest = dict(manifest)
+        manifest["candidates"] = [available[candidate_id] for candidate_id in candidate_ids]
     editor = inspect_wolf_editor(editor_path)
     if editor.version != VERIFIED_EDITOR_VERSION or editor.sha256 != VERIFIED_EDITOR_SHA256:
         raise ValueError(
@@ -587,13 +773,14 @@ def run_manifest(manifest_path: Path, editor_path: Path, resume: bool, settings_
             f"{VERIFIED_EDITOR_VERSION} / {VERIFIED_EDITOR_SHA256}；"
             f"实际为 {editor.version} / {editor.sha256}。"
         )
-    settings = SettingsStore(settings_path).load()
+    settings_store = SettingsStore(settings_path)
+    settings = settings_store.load()
     settings.wolf_editor_path = str(editor.path)
     wolf_tool = Path(settings.wolf_tool_path)
     if not wolf_tool.is_file() or not (wolf_tool.parent / "LibXL.dll").is_file():
         raise ValueError("当前设置中的官方翻译工具无效或缺少 LibXL.dll。")
 
-    run_dir = manifest_path.parent / "run"
+    run_dir = run_dir.resolve() if run_dir is not None else manifest_path.parent / "run"
     if run_dir.exists() and not resume:
         raise FileExistsError(f"QA 运行目录已存在；请使用 --resume 或移走该目录: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +790,7 @@ def run_manifest(manifest_path: Path, editor_path: Path, resume: bool, settings_
         "manifest": str(manifest_path.resolve()),
         "manifest_sha256": sha256_file(manifest_path),
         "python": sys.version,
+        "jobs": jobs,
         "git": _git_state(),
         "editor": {
             "path": str(editor.path),
@@ -613,27 +801,78 @@ def run_manifest(manifest_path: Path, editor_path: Path, resume: bool, settings_
     }
     atomic_write_json(run_dir / "environment.json", metadata)
 
-    reports = []
+    reports_by_id: dict[str, dict[str, object]] = {}
     candidates = manifest.get("candidates", [])
     if not isinstance(candidates, list):
         raise ValueError("发现清单 candidates 不是数组。")
+    pending = []
     for index, candidate in enumerate(candidates, start=1):
         if not isinstance(candidate, dict):
             raise ValueError("发现清单候选项不是对象。")
         checkpoint = run_dir / "games" / str(candidate["id"]) / "report.json"
         if resume and checkpoint.is_file():
             previous = _load_json(checkpoint)
-            if previous.get("status") in _TERMINAL:
-                reports.append(previous)
+            if (
+                previous.get("schema") == RUN_SCHEMA
+                and previous.get("status") in _COMPLETED
+            ):
+                reports_by_id[str(candidate["id"])] = previous
                 print(f"[{index}/{len(candidates)}] {candidate['path']} -> {previous['status']} (resume)", flush=True)
                 continue
-        print(f"[{index}/{len(candidates)}] {candidate['path']} 开始", flush=True)
-        report = _run_candidate(candidate, run_dir, settings, editor)
-        reports.append(report)
-        print(f"[{index}/{len(candidates)}] {candidate['path']} -> {report['status']}", flush=True)
-        aggregate = _aggregate(manifest, reports)
-        atomic_write_json(run_dir / "run.json", aggregate)
+        pending.append((index, candidate))
 
+    completed = len(reports_by_id)
+    if pending:
+        print(
+            f"并发运行：jobs={jobs}，待处理={len(pending)}，已恢复={completed}",
+            flush=True,
+        )
+    with ProcessPoolExecutor(max_workers=jobs) as executor:
+        futures = {
+            executor.submit(
+                _run_candidate_worker,
+                candidate,
+                str(run_dir),
+                str(settings_store.path),
+                str(editor.path),
+            ): (index, candidate)
+            for index, candidate in pending
+        }
+        for future in as_completed(futures):
+            index, candidate = futures[future]
+            candidate_id = str(candidate["id"])
+            try:
+                report = future.result()
+            except Exception as error:
+                report = {
+                    "schema": RUN_SCHEMA,
+                    "candidate_id": candidate_id,
+                    "path": str(candidate["path"]),
+                    "started_at": _now(),
+                    "finished_at": _now(),
+                    "status": "INCOMPLETE",
+                    "error_type": type(error).__name__,
+                    "error": f"QA worker 失败: {error}",
+                    "traceback": traceback.format_exc(),
+                }
+                checkpoint = run_dir / "games" / candidate_id / "report.json"
+                checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(checkpoint, report)
+            reports_by_id[candidate_id] = report
+            completed += 1
+            print(
+                f"[{completed}/{len(candidates)}] #{index} {candidate['path']} -> {report['status']}",
+                flush=True,
+            )
+            reports = [
+                reports_by_id[str(item["id"])]
+                for item in candidates
+                if str(item["id"]) in reports_by_id
+            ]
+            aggregate = _aggregate(manifest, reports)
+            atomic_write_json(run_dir / "run.json", aggregate)
+
+    reports = [reports_by_id[str(item["id"])] for item in candidates]
     aggregate = _aggregate(manifest, reports)
     atomic_write_json(run_dir / "run.json", aggregate)
     return aggregate
@@ -725,11 +964,30 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--all-fixed-drives", action="store_true", required=True)
     discover_parser.add_argument("--output", type=Path, required=True)
 
+    select_parser = subparsers.add_parser("select", help="从冻结清单派生类型子范围")
+    select_parser.add_argument("--manifest", type=Path, required=True)
+    select_parser.add_argument("--kind", choices=("packed", "loose"), required=True)
+    select_parser.add_argument("--output", type=Path, required=True)
+
     run_parser = subparsers.add_parser("run", help="对冻结清单执行真实流水线安全验收")
     run_parser.add_argument("--manifest", type=Path, required=True)
     run_parser.add_argument("--editor", type=Path, required=True)
     run_parser.add_argument("--resume", action="store_true")
     run_parser.add_argument("--settings", help="覆盖 settings.ini 路径")
+    run_parser.add_argument("--run-dir", type=Path, help="覆盖 QA 输出目录")
+    run_parser.add_argument(
+        "--candidate-id",
+        action="append",
+        help="只运行指定冻结候选；可重复传入，仅供定向回归",
+    )
+    run_parser.add_argument(
+        "--jobs",
+        type=int,
+        choices=range(1, 17),
+        default=min(4, max(1, (os.cpu_count() or 2) // 2)),
+        metavar="1..16",
+        help="并行处理的游戏数（默认最多 4）",
+    )
 
     verify_parser = subparsers.add_parser("verify", help="验证运行结果并生成中文报告")
     verify_parser.add_argument("--run", type=Path, required=True)
@@ -744,9 +1002,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = discover(_fixed_drives(), args.output.resolve())
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["scan_complete"] else 2
+    if args.command == "select":
+        result = select_manifest(
+            args.manifest.resolve(), args.output.resolve(), args.kind
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "run":
         result = run_manifest(
-            args.manifest.resolve(), args.editor.resolve(), args.resume, args.settings
+            args.manifest.resolve(),
+            args.editor.resolve(),
+            args.resume,
+            args.settings,
+            args.jobs,
+            run_dir=args.run_dir,
+            candidate_ids=args.candidate_id,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["defect_total"] == result["incomplete_total"] == 0 else 1

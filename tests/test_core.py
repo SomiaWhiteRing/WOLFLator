@@ -26,7 +26,9 @@ from fonts import (
     FontError,
     bundled_font_path,
     default_font_scheme,
+    discover_font_candidates,
     font_file_info,
+    font_file_faces,
     load_font_scheme,
     load_original_fonts,
     record_original_fonts,
@@ -50,6 +52,7 @@ from wolf_tools import (
     _console_delta,
     _dismiss_process_dialogs,
     _official_config_text,
+    _normalize_xlsx_shared_strings,
     _pe_import_name_offset,
     _process_startupinfo,
     _silent_official_executable,
@@ -79,13 +82,19 @@ from wolf_tools import (
     write_scoped_workbook,
 )
 from wolf_editor import (
+    _AnalysisAudit,
+    _BlockAnalyzer,
+    _CommandBlock,
     EditorRelease,
     EditorInfo,
     _NumberValue,
     _StringValue,
     _copy_editor_sandbox,
+    _database_index,
+    _editor_execution_lock,
     _merge_numbers,
     _merge_strings,
+    _restore_editor_map_paths,
     analyze_auto_export,
     analyze_translation_safety,
     compare_auto_structure,
@@ -127,6 +136,25 @@ def make_workbook(path: Path) -> Path:
 
 
 class WorkbookTests(unittest.TestCase):
+    def test_xlsx_shared_strings_preserve_excel_control_escape_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "before_x0008_after"
+            workbook.save(path)
+            _normalize_xlsx_shared_strings(path)
+
+            with zipfile.ZipFile(path) as archive:
+                self.assertIn("xl/sharedStrings.xml", archive.namelist())
+                shared = archive.read("xl/sharedStrings.xml")
+                sheet = archive.read("xl/worksheets/sheet1.xml")
+            self.assertIn(b"_x0008_", shared)
+            self.assertIn(b't="s"', sheet)
+            self.assertNotIn(b"inlineStr", sheet)
+            loaded = load_workbook(path)
+            self.assertEqual("before_x0008_after", loaded.active["A1"].value)
+            loaded.close()
+
     def test_calibrated_database_and_array_commands_have_conservative_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -385,6 +413,25 @@ class WorkbookTests(unittest.TestCase):
             self.assertIsNone(sheet.cell(6, 7).value)
             self.assertEqual([f"原字体{index}" for index in range(4)], read_font_slots(read_translation_items(output)))
 
+    def test_font_workbook_accepts_missing_optional_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            for index, code in enumerate(("BASICDATA-3", "BASICDATA-4")):
+                sheet.append([code, "", "Basic Game Settings", f"Font {index}", "", f"原字体{index}", "旧译"])
+            workbook.save(source)
+            output = write_font_workbook(
+                source,
+                root / "font.xlsx",
+                ["新主字体", "新副字体", "", ""],
+            )
+            items = read_translation_items(output)
+            self.assertEqual(["原字体0", "原字体1", "", ""], read_font_slots(items))
+            self.assertEqual(["新主字体", "新副字体"], [item.translation for item in items])
+
     def test_final_display_texts_follow_import_scope_and_strip_controls(self):
         with tempfile.TemporaryDirectory() as directory:
             items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
@@ -500,8 +547,11 @@ class WorkbookAndFontTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(FontError, "越界"):
             validate_font_scheme(directory, scheme, check_files=False)
 
-    def test_required_characters_keep_all_visible_codepoints(self):
-        self.assertEqual({"A", "中", "あ", "ア", "！"}, required_characters(["A中あア！\n\u200b"]))
+    def test_required_characters_exclude_non_language_symbols(self):
+        self.assertEqual(
+            {"A", "_", "中", "あ", "ア", "！", "é", "\u0301", "￥", "℃", "×"},
+            required_characters(["A_中あア！é\u0301￥℃×∟↖│◆★\n\u200b"]),
+        )
 
     def test_font_parser_rejects_truncated_and_unsupported_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -515,12 +565,63 @@ class WorkbookAndFontTests(unittest.TestCase):
             with self.assertRaisesRegex(FontError, "不支持"):
                 font_file_info(unsupported)
 
+    def test_font_candidate_cache_survives_a_new_scan(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"LOCALAPPDATA": directory}
+        ), mock.patch("fonts._system_font_paths", return_value=[]):
+            game = Path(directory) / "game"
+            (game / "Data").mkdir(parents=True)
+            required = {"中", "A", "\U0010ffff"}
+            first = discover_font_candidates(game, required, refresh=True)
+            self.assertEqual(frozenset({"\U0010ffff"}), first[0].missing)
+            with mock.patch("fonts._scan_font_faces", side_effect=AssertionError("cache miss")):
+                second = discover_font_candidates(game, required)
+            self.assertEqual(first, second)
+
     @unittest.skipUnless(Path(r"C:\Windows\Fonts\msyh.ttc").is_file(), "Windows YaHei TTC unavailable")
     def test_ttc_parser_reads_multiple_family_aliases(self):
         families, codepoints = font_file_info(Path(r"C:\Windows\Fonts\msyh.ttc"))
         self.assertIn("Microsoft YaHei", families)
         self.assertIn("微软雅黑", families)
         self.assertIn(ord("中"), codepoints)
+
+    @unittest.skipUnless(Path(r"C:\Windows\Fonts\msyhl.ttc").is_file(), "Windows YaHei Light unavailable")
+    def test_font_faces_preserve_gdi_family_style_and_weight(self):
+        faces = font_file_faces(Path(r"C:\Windows\Fonts\msyhl.ttc"))
+        face = next(item for item in faces if item.family == "Microsoft YaHei Light")
+        self.assertEqual("Microsoft YaHei", face.preview_family)
+        self.assertEqual("Light", face.style)
+        self.assertEqual(290, face.weight)
+
+    @unittest.skipUnless(Path(r"C:\Windows\Fonts\msyhl.ttc").is_file(), "Windows YaHei Light unavailable")
+    def test_saved_scheme_uses_gdi_family_instead_of_typographic_family(self):
+        source = Path(r"C:\Windows\Fonts\msyhl.ttc")
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "fonts" / digest / source.name
+            target.parent.mkdir(parents=True)
+            target.write_bytes(data)
+            scheme = default_font_scheme()
+            scheme["slots"][0] = {
+                "mode": "font",
+                "family": "Microsoft YaHei",
+                "provenance": "system",
+                "files": [
+                    {
+                        "kind": "project",
+                        "path": target.relative_to(root).as_posix(),
+                        "filename": source.name,
+                        "sha256": digest,
+                    }
+                ],
+            }
+            save_font_scheme(root, scheme)
+            self.assertEqual(
+                "Microsoft YaHei Light",
+                load_font_scheme(root)["slots"][0]["family"],
+            )
 
     def test_copy_corpus_keeps_mixed_scope_group_atomic(self):
         source = TranslationItem(
@@ -671,6 +772,54 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual("系统设置", names_sheet["G3"].value)
             self.assertEqual("系统设置", names_sheet["G4"].value)
 
+    def test_workbook_writes_equals_prefix_as_literal_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(
+                ["NAME-T-UDB-1", "", "UDB", "Type", "", "==literal==", ""]
+            )
+            sheet.append(
+                [
+                    "UDB-1-0-0",
+                    "COPY-FROM-NAME-T-UDB-1",
+                    "UDB",
+                    "Name",
+                    "",
+                    "==literal==",
+                    "",
+                ]
+            )
+            workbook.save(source_path)
+
+            items = read_translation_items(source_path)
+            items[0].translation = "=translated"
+            full = write_full_workbook(source_path, root / "full.xlsx", items)
+            full_sheet = load_workbook(full, data_only=False).active
+            self.assertEqual("=translated", full_sheet["G2"].value)
+            self.assertEqual("s", full_sheet["G2"].data_type)
+
+            default_scoped = write_scoped_workbook(
+                full, root / "default.xlsx", ImportScope(), root / "game", items
+            )
+            default_sheet = load_workbook(default_scoped, data_only=False).active
+            self.assertEqual("==literal==", default_sheet["G3"].value)
+            self.assertEqual("s", default_sheet["G3"].data_type)
+
+            names_scoped = write_scoped_workbook(
+                full,
+                root / "names.xlsx",
+                ImportScope(optional_name=True),
+                root / "game",
+                items,
+            )
+            names_sheet = load_workbook(names_scoped, data_only=False).active
+            self.assertEqual("=translated", names_sheet["G3"].value)
+            self.assertEqual("s", names_sheet["G3"].data_type)
+
     def test_import_protection_keeps_conditions_and_external_references_original(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -763,7 +912,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 5"):
+            with self.assertRaisesRegex(ValueError, "schema 6"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -790,7 +939,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 5,
+                "schema": 6,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -838,6 +987,31 @@ class WorkbookAndFontTests(unittest.TestCase):
                 if entry["reason"] == "resource_reference"
             )
             self.assertEqual("resource_path", resource_entry["resource_role"])
+            call_dependency = {
+                **dependency,
+                "kind": "call",
+                "operator": "event_call",
+                "literal": "X[共]アイテム増減",
+                "condition_keys": [],
+                "source_keys": [by_code["COMMON-63-167-2"].key],
+                "unresolved_scopes": ["common:63"],
+            }
+            call_report = analyze_import_protection(
+                items,
+                ImportScope(),
+                game,
+                ImportProtectionRules(),
+                {**analysis, "dependencies": [call_dependency]},
+            )
+            self.assertIn(
+                by_code["COMMON-63-167-2"].key, call_report["protected_keys"]
+            )
+            self.assertTrue(
+                any(
+                    entry["reason"] == "event_call_target"
+                    for entry in call_report["entries"]
+                )
+            )
             variable_side = {
                 **dependency,
                 "status": "untracked",
@@ -982,6 +1156,47 @@ class WorkbookAndFontTests(unittest.TestCase):
             ),
         )
         self.assertEqual(1, report["summary"]["atomic_groups"])
+
+    def test_scoped_workbook_rewrites_stale_formula_in_selected_copy_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            full = root / "full.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append(
+                ["UDB-20-15-0", "", "Effect", "Name", "", "==▼仮連撃▼==", "==▼仮連撃▼=="]
+            )
+            sheet.append(
+                [
+                    "NAME-D-UDB-21-10",
+                    "COPY-FROM-UDB-20-15-0",
+                    "UDB info",
+                    "Data name",
+                    "",
+                    "==▼仮連撃▼==",
+                    "",
+                ]
+            )
+            workbook.save(full)
+            items = read_translation_items(full)
+            items[0].translation = items[0].original
+            scoped = write_scoped_workbook(
+                full,
+                root / "scoped.xlsx",
+                ImportScope(),
+                root / "game",
+                items,
+                allow_copy_condition_groups=True,
+            )
+
+            loaded = load_workbook(scoped, data_only=False)
+            self.assertIsNone(loaded.active["G2"].value)
+            loaded.close()
+            with zipfile.ZipFile(scoped) as archive:
+                sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+            self.assertIn(b'r="G2"', sheet_xml)
+            self.assertNotIn(b"<f>", sheet_xml)
 
     def test_editor_auto_analysis_contract_and_runtime_match(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1146,7 +1361,7 @@ class WorkbookAndFontTests(unittest.TestCase):
             editor_path.write_bytes(b"editor")
             editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
             report = analyze_auto_export(auto, items, editor, input_hash="input")
-            self.assertEqual(5, report["schema"])
+            self.assertEqual(6, report["schema"])
             self.assertIn("event_summaries", report)
             self.assertIn("call_graph", report)
             self.assertNotIn("translated_replay", report)
@@ -1240,7 +1455,7 @@ class WorkbookAndFontTests(unittest.TestCase):
 
             report = analyze_auto_export(root / "Auto", [], editor, input_hash="input")
 
-            self.assertEqual(5, report["schema"])
+            self.assertEqual(6, report["schema"])
             self.assertFalse(
                 any("固定点超过" in issue["reason"] for issue in report["blocking_issues"])
             )
@@ -1257,12 +1472,13 @@ class WorkbookAndFontTests(unittest.TestCase):
                         "COMMON_EVENT_NUM=2",
                         "COMMON_ID=1",
                         "COMMON_NAME=Caller",
-                        "COMMAND_NUM=7",
+                        "COMMAND_NUM=8",
                         "WoditorEvCOMMAND_START",
                         '[102][1,2]<0>(0)("甲","乙")',
                         "[401][1,0]<0>(0)()",
                         "[250][5,0]<1>(0,0,0,0,1600000)()",
                         "[210][2,0]<1>(500002,0)()",
+                        "[104][0,0]<1>()()",
                         "[401][1,0]<0>(1)()",
                         '[101][0,1]<1>()("分支乙")',
                         "[499][0,0]<0>()()",
@@ -1327,16 +1543,37 @@ class WorkbookAndFontTests(unittest.TestCase):
                 if edge[0].endswith(":1")
             ]
             self.assertGreaterEqual(len(choice_edges), 2)
-            self.assertTrue(
+            self.assertIn(
+                "END",
+                {
+                    edge[1]
+                    for edge in report["runtime_semantics"]["cfg_edges"]
+                    if edge[0].endswith(":5")
+                },
+            )
+            self.assertFalse(
                 any(
                     dependency["kind"] == "call"
-                    and dependency["status"] == "dynamic"
-                    and "common:2" in dependency["unresolved_scopes"]
+                    and "无返回公共事件副作用" in dependency["reason"]
                     for dependency in report["dependencies"]
                 )
             )
 
-    def test_translation_safety_requires_positive_display_proof(self):
+    def test_call_ledger_merges_repeated_contexts_order_independently(self):
+        block = _CommandBlock("Auto", "common", 1, "caller", 1, ())
+        left = _BlockAnalyzer(block, {}, {}, {}, audit=_AnalysisAudit.empty())
+        right = _BlockAnalyzer(block, {}, {}, {}, audit=_AnalysisAudit.empty())
+        left._record_call("call", "exact", ("common:1",))
+        left._record_call("call", "exact", ("common:2",))
+        right._record_call("call", "exact", ("common:2",))
+        right._record_call("call", "exact", ("common:1",))
+        self.assertEqual(
+            ("exact", ("common:1", "common:2")), left.audit.calls["call"]
+        )
+        self.assertEqual(left.audit.calls, right.audit.calls)
+        self.assertEqual(left.audit.data_effects, right.audit.data_effects)
+
+    def test_translation_safety_uses_official_display_contract_and_auto_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             basic = root / "Auto" / "BasicData"
@@ -1387,6 +1624,12 @@ class WorkbookAndFontTests(unittest.TestCase):
                     original="系统参数",
                     translation="系统参数译文",
                     code="UDB-9-9-9",
+                ),
+                TranslationItem(
+                    key="unchanged",
+                    original="无需改动",
+                    translation="无需改动",
+                    code="UDB-9-9-10",
                 ),
                 TranslationItem(
                     key="picture_text",
@@ -1460,7 +1703,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analysis=analysis,
             )
             self.assertEqual(
-                ["display", "dynamic_safe", "picture_text"],
+                ["display", "dynamic_safe", "picture_text", "unmapped"],
                 safety["safe_to_translate"],
             )
             self.assertEqual(
@@ -1470,9 +1713,11 @@ class WorkbookAndFontTests(unittest.TestCase):
                     "logic_literal",
                     "logic_source",
                     "picture_file",
-                    "unmapped",
                 },
                 set(safety["keep_original"]),
+            )
+            self.assertIn(
+                "unmapped", safety["approvals"]["official_display_contract"]
             )
             self.assertEqual(2, safety["replay"]["iterations"])
             self.assertTrue(safety["replay"]["control_flow_equivalent"])
@@ -1484,11 +1729,159 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analysis,
                 logic_safety=safety,
             )
-            self.assertEqual(5, protection["schema"])
+            self.assertEqual(6, protection["schema"])
             self.assertEqual(
-                ["display", "dynamic_safe", "picture_text"],
+                ["display", "dynamic_safe", "picture_text", "unmapped"],
                 protection["safe_to_translate"],
             )
+            self.assertNotIn("unchanged", protection["keep_original"])
+
+    def test_editor_database_keeps_zero_field_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DataBase.Auto.txt"
+            path.write_text(
+                "\n".join(
+                    (
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=0",
+                        "ITEM_NUM=0",
+                        "DATA_NUM=1",
+                        "TYPENAME=Empty",
+                        "<<--CSV_START-->>",
+                        "",
+                        "",
+                        "",
+                        "<<--CSV_END-->>",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            databases, summary = _database_index(path, "UDB")
+            self.assertEqual(1, summary["csv_rows"])
+            self.assertEqual(((),), databases[0].rows)
+            self.assertEqual(("",), databases[0].data_names)
+
+    def test_dynamic_database_selector_and_reserved_event_are_conservative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=2",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Caller",
+                        "COMMAND_NUM=6",
+                        "WoditorEvCOMMAND_START",
+                        '[122][2,1]<0>(1600000,0)("Aya")',
+                        '[112][2,4]<0>(1,1075341824)("ya","","","")',
+                        '[123][2,0]<0>(1600001,0)()',
+                        "[211][2,0]<0>(1600001,0)()",
+                        "[121][4,0]<0>(1600002,-1,0,0)()",
+                        '[250][5,4]<0>(1600002,0,0,512,1600003)("","","","")',
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=2",
+                        "COMMON_NAME=Callee",
+                        "COMMAND_NUM=1",
+                        "WoditorEvCOMMAND_START",
+                        '[101][0,1]<0>()("display")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (basic / "DataBase.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=0",
+                        "ITEM_NUM=1",
+                        "DATATYPE_0=2000",
+                        "DATA_NUM=1",
+                        "TYPENAME=Names",
+                        "ITEMNAME_NUM=1",
+                        "ITEMNAME0=Name",
+                        "<<--CSV_START-->>",
+                        '"Name",',
+                        '"Alice",',
+                        "<<--CSV_END-->>",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            report = analyze_auto_export(
+                root / "Auto",
+                [],
+                EditorInfo(
+                    root / "Editor.exe",
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "a" * 64,
+                ),
+                input_hash="input",
+            )
+            self.assertEqual(0, report["command_catalog"]["opaque_effects"])
+            self.assertEqual(1.0, report["command_catalog"]["data_effect_coverage"]["ratio"])
+            self.assertTrue(
+                any(item["operator"] == "ends_with" for item in report["dependencies"])
+            )
+            reserved = next(
+                item
+                for item in report["dependencies"]
+                if item["reason"] == "预约公共事件目标为运行时动态值"
+            )
+            self.assertEqual("dynamic", reserved["status"])
+            self.assertEqual(["common:*"], reserved["unresolved_scopes"])
+            self.assertEqual([], report["blocking_issues"])
+
+    def test_editor_execution_waits_for_cross_process_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            lock_path = root / "WOLFLator" / "locks" / f"editor-{'a' * 64}.lock"
+            code = (
+                "import time\n"
+                "from safe_io import ResourceLock\n"
+                f"with ResourceLock({str(lock_path)!r}, 'test'):\n"
+                " print('ready', flush=True)\n"
+                " time.sleep(0.5)\n"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", code],
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual("ready", child.stdout.readline().strip())
+                logs: list[str] = []
+                started = time.monotonic()
+                with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(root)}):
+                    with _editor_execution_lock(
+                        EditorInfo(
+                            editor_path,
+                            "3.713.2026.718",
+                            (3, 713, 2026, 718),
+                            "a" * 64,
+                        ),
+                        cancel_event=None,
+                        diagnostic_log=logs.append,
+                        warning=None,
+                    ):
+                        pass
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+                self.assertTrue(any("editor.queue.wait" in item for item in logs))
+                self.assertTrue(any("editor.queue.acquired" in item for item in logs))
+                self.assertTrue(any("editor.queue.released" in item for item in logs))
+            finally:
+                child.wait(timeout=5)
+                if child.stdout is not None:
+                    child.stdout.close()
 
     def test_editor_roundtrip_masks_only_approved_text_slots(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1522,6 +1915,152 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual("failed", failed["status"])
             self.assertEqual("command_structure", failed["differences"][0]["kind"])
 
+            def segmented_auto(name: str, first: str, copied: str) -> str:
+                return "\n".join((
+                    "[COMMON_EVENT_TEXT_OUTPUT]",
+                    "COMMON_EVENT_NUM=1",
+                    "COMMON_ID=1",
+                    f"COMMON_NAME={name}",
+                    "COMMAND_NUM=2",
+                    "WoditorEvCOMMAND_START",
+                    f'[101][0,1]<0>()("{first}")',
+                    f'[101][0,1]<0>()("{copied}")',
+                    "WoditorEvCOMMAND_END",
+                ))
+
+            path_before.write_text(
+                segmented_auto("原名", r"前<\n>后", r"前<\n>后"),
+                encoding="utf-8",
+            )
+            path_after.write_text(
+                segmented_auto("译名", r"前<\n>译", r"前<\n>译"),
+                encoding="utf-8",
+            )
+            base = TranslationItem(
+                key="base",
+                original="前\n",
+                translation="不应采用",
+                code="COMMON-1-0-0",
+                flag="NEXT=SEGMENT_1-COMMON-1-0-0",
+            )
+            segment = TranslationItem(
+                key="segment",
+                original="后",
+                translation="译",
+                code="SEGMENT_1-COMMON-1-0-0",
+            )
+            copied = TranslationItem(
+                key="copied",
+                original="前\n后",
+                code="COMMON-1-1-0",
+                flag="<Half-Width Characters Only>\nCOPY-FROM-COMMON-1-0-0",
+            )
+            name_source = TranslationItem(
+                key="name-source",
+                original="原名",
+                translation="译名",
+                code="UDB-1-0-0",
+            )
+            name_copy = TranslationItem(
+                key="name-copy",
+                original="原名",
+                code="COMMON-1-Name",
+                flag="COPY-FROM-UDB-1-0-0",
+            )
+            segmented = compare_auto_structure(
+                root / "before",
+                root / "after",
+                [base, segment, copied, name_source, name_copy],
+                {segment.key, name_source.key},
+            )
+            self.assertEqual("passed", segmented["status"])
+            path_after.write_text(
+                segmented_auto("译名", "错误", r"前<\n>译"),
+                encoding="utf-8",
+            )
+            segmented_failed = compare_auto_structure(
+                root / "before",
+                root / "after",
+                [base, segment, copied, name_source, name_copy],
+                {segment.key, name_source.key},
+            )
+            self.assertEqual("segmented_string", segmented_failed["differences"][0]["kind"])
+
+    def test_editor_roundtrip_maps_named_map_files_through_sdb_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def common() -> str:
+                return "\n".join((
+                    "[COMMON_EVENT_TEXT_OUTPUT]",
+                    "COMMON_EVENT_NUM=0",
+                ))
+
+            def map_auto(name: str, text: str) -> str:
+                return "\n".join((
+                    "[MAPDATA_TEXT_OUTPUT]",
+                    "EVENT_NUM=1",
+                    "EVENT_ID=7",
+                    f"EVENT_NAME={name}",
+                    "COMMAND_NUM=1",
+                    "WoditorEvCOMMAND_START",
+                    f'[101][0,1]<0>()("{text}")',
+                    "WoditorEvCOMMAND_END",
+                ))
+
+            sdb = "\n".join((
+                "[DATABASE_TEXT_OUTPUT]",
+                "TYPE_NUM=1",
+                "TYPE_ID=0",
+                "ITEM_NUM=1",
+                "DATATYPE_0=2000",
+                "DATA_NUM=6",
+                "TYPENAME=Maps",
+                "ITEMNAME_NUM=1",
+                "ITEMNAME0=Path",
+                "<<--CSV_START-->>",
+                '"Path",',
+                '"",',
+                '"",',
+                '"",',
+                '"",',
+                '"",',
+                '"MapData/Fancy.mps",',
+                "<<--CSV_END-->>",
+            ))
+            for side, name, text in (
+                ("before", "原事件", "原文"),
+                ("after", "译事件", "译文"),
+            ):
+                basic = root / side / "BasicData"
+                maps = root / side / "MapData"
+                basic.mkdir(parents=True)
+                maps.mkdir(parents=True)
+                (basic / "CommonEvent.dat.Auto.txt").write_text(common(), encoding="utf-8")
+                (basic / "SysDataBase.Auto.txt").write_text(sdb, encoding="utf-8")
+                (maps / "Fancy.mps.Auto.txt").write_text(
+                    map_auto(name, text), encoding="utf-8"
+                )
+            text_item = TranslationItem(
+                key="map-text",
+                original="原文",
+                translation="译文",
+                code="MAP-5-Ev007-Page1-0-0",
+            )
+            name_item = TranslationItem(
+                key="map-name",
+                original="原事件",
+                translation="译事件",
+                code="MAP-5-Ev007-Name",
+            )
+            result = compare_auto_structure(
+                root / "before",
+                root / "after",
+                [text_item, name_item],
+                {text_item.key, name_item.key},
+            )
+            self.assertEqual("passed", result["status"])
+
     def test_editor_version_and_sandbox_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1554,6 +2093,24 @@ class WorkbookAndFontTests(unittest.TestCase):
             maps_found = _copy_editor_sandbox(editor, game, sandbox)
             self.assertEqual([Path("MapData/Map001.mps")], maps_found)
             self.assertTrue((sandbox / "Data" / "BasicData" / "Game.dat").is_file())
+            sandbox_map = (
+                sandbox / "Data" / "MapData" / "WOLFLatorMap00000000.mps"
+            )
+            self.assertEqual(b"map", sandbox_map.read_bytes())
+            self.assertFalse((sandbox / "Data" / maps_found[0]).exists())
+            generated = (
+                sandbox
+                / "Auto"
+                / "MapData"
+                / "WOLFLatorMap00000000.mps.Auto.txt"
+            )
+            generated.parent.mkdir(parents=True)
+            generated.write_bytes(b"auto")
+            _restore_editor_map_paths(sandbox / "Auto", maps_found)
+            self.assertEqual(
+                b"auto",
+                (sandbox / "Auto" / "MapData" / "Map001.mps.Auto.txt").read_bytes(),
+            )
             self.assertFalse((sandbox / "Data" / "BasicData" / "icon.png").exists())
             self.assertFalse((sandbox / "Data" / "story.txt").exists())
 
@@ -1658,6 +2215,28 @@ class WorkbookAndFontTests(unittest.TestCase):
                 write_scoped_workbook(full, root / "bad.xlsx", scope, game, items)
             (game / "Data" / "Picture" / "face.png").write_bytes(b"png")
             write_scoped_workbook(full, root / "good.xlsx", scope, game, items)
+
+            for item in items:
+                if item.category is ImportCategory.FILENAME:
+                    item.translation = item.original
+            no_op_full = write_full_workbook(source, root / "no-op-full.xlsx", items)
+            no_op = write_scoped_workbook(
+                no_op_full,
+                root / "no-op.xlsx",
+                scope,
+                root / "empty-game",
+                items,
+            )
+            no_op_sheet = load_workbook(no_op).active
+            filename_rows = [
+                row
+                for row in range(2, no_op_sheet.max_row + 1)
+                if "<FILENAME>" in str(no_op_sheet.cell(row, 2).value or "")
+            ]
+            self.assertTrue(filename_rows)
+            self.assertTrue(
+                all(no_op_sheet.cell(row, 7).value is None for row in filename_rows)
+            )
 
     def test_workbook_locator_requires_official_filename(self):
         with tempfile.TemporaryDirectory() as directory:

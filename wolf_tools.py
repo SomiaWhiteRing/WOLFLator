@@ -13,6 +13,8 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,6 +51,7 @@ SUPPORT_DIR = "WOLF_Translation_Support_Tool_Data"
 WORKBOOK_NAME = "WOLF_Translation_Text.xlsx"
 GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
 ITEMS_SCHEMA = 1
+IMPORT_PROTECTION_SCHEMA = 6
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
@@ -332,6 +335,27 @@ class OfficialToolDialogError(RuntimeError):
     def __init__(self, dialogs: list[str]):
         self.dialogs = tuple(dialogs)
         super().__init__("官方工具弹出错误对话框：" + "；".join(dialogs))
+
+
+class ToolProcessError(RuntimeError):
+    def __init__(
+        self,
+        command: list[str],
+        return_code: int,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        console_output: str = "",
+    ):
+        self.command = tuple(command)
+        self.return_code = return_code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.console_output = console_output
+        detail = "\n".join(
+            part for part in (console_output, stderr, stdout) if part
+        ).strip()[-2000:]
+        super().__init__(f"外部工具退出码 {return_code}: {detail}")
 
 
 def _dismiss_process_dialogs(process_id: int) -> list[str]:
@@ -760,8 +784,13 @@ def run_process(
         f"console_lines={len(console_text.splitlines())}",
     )
     if result.return_code != 0:
-        error_detail = "\n".join(part for part in (console_text, stderr, stdout) if part).strip()[-2000:]
-        raise RuntimeError(f"外部工具退出码 {result.return_code}: {error_detail}")
+        raise ToolProcessError(
+            command,
+            result.return_code,
+            stdout=stdout,
+            stderr=stderr,
+            console_output=console_text,
+        )
     if seen_dialogs:
         raise OfficialToolDialogError(sorted(seen_dialogs))
     _emit_log(log, f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
@@ -797,23 +826,67 @@ class UberWolfRunner:
         diagnostic_log: Callable[[str], None] | None = None,
     ) -> ToolResult | None:
         root = Path(game_root)
-        if (root / "Data" / "BasicData" / "Game.dat").is_file() and not next(root.rglob("*.wolf"), None):
+        data = root / "Data"
+        if (data / "BasicData" / "Game.dat").is_file():
             if log:
                 log("检测到完整松散 Data，跳过 UberWolf。")
             return None
         game_exe = root / "Game.exe"
         if not game_exe.is_file():
             raise FileNotFoundError("工作副本中没有 Game.exe。")
-        result = run_process(
-            [str(self.executable), str(game_exe)],
-            cwd=self.executable.parent,
-            cancel_event=cancel_event,
-            log=log,
-            diagnostic_log=diagnostic_log,
+        archives = sorted(
+            (path for path in root.iterdir() if path.is_file() and path.suffix.casefold() == ".wolf"),
+            key=lambda path: path.name.casefold(),
         )
-        if not (root / "Data" / "BasicData" / "Game.dat").is_file():
-            raise RuntimeError("UberWolf 返回成功，但没有生成 Data/BasicData/Game.dat。")
-        return result
+        if not archives:
+            raise RuntimeError("松散 Data 不完整，且没有可供 UberWolf 解包的 .wolf 文件。")
+        had_loose_data = data.is_dir()
+
+        # ponytail: UberWolf treats any Data directory as already unpacked, so use a
+        # clean sibling view and overlay the game's loose files after extraction.
+        sandbox = Path(tempfile.mkdtemp(prefix=".wolflator-uberwolf-", dir=root.parent))
+        merged = root / f".wolflator-data-merged-{os.getpid()}-{time.time_ns()}"
+        previous = root / f".wolflator-data-previous-{os.getpid()}-{time.time_ns()}"
+        result: ToolResult | None = None
+        try:
+            shutil.copy2(game_exe, sandbox / game_exe.name)
+            for archive in archives:
+                shutil.copy2(archive, sandbox / archive.name)
+            result = run_process(
+                [str(self.executable), str(sandbox / game_exe.name)],
+                cwd=self.executable.parent,
+                cancel_event=cancel_event,
+                log=log,
+                diagnostic_log=diagnostic_log,
+            )
+            extracted = sandbox / "Data"
+            if not (extracted / "BasicData" / "Game.dat").is_file():
+                raise RuntimeError("UberWolf 返回成功，但没有生成 Data/BasicData/Game.dat。")
+            shutil.copytree(extracted, merged)
+            if had_loose_data:
+                shutil.copytree(data, merged, dirs_exist_ok=True, copy_function=shutil.copy2)
+            if data.exists():
+                replace_with_retry(data, previous)
+            try:
+                replace_with_retry(merged, data)
+            except Exception:
+                if not data.exists() and previous.exists():
+                    replace_with_retry(previous, data)
+                raise
+            if previous.exists():
+                shutil.rmtree(previous)
+            if diagnostic_log:
+                diagnostic_log(
+                    f"uberwolf.merge archives={len(archives)} loose_overlay={had_loose_data} "
+                    f"data={data}"
+                )
+            return result
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
+            if merged.exists():
+                shutil.rmtree(merged, ignore_errors=True)
+            if previous.exists() and data.exists():
+                shutil.rmtree(previous, ignore_errors=True)
 
 
 def _official_config_text(scope: ImportScope) -> str:
@@ -1442,7 +1515,131 @@ def _save_workbook_atomic(workbook, output_path: str | Path) -> Path:
     output = Path(output_path)
     with atomic_output_path(output) as temporary:
         workbook.save(temporary)
+        _normalize_xlsx_shared_strings(temporary)
     return output
+
+
+def _normalize_xlsx_shared_strings(path: Path) -> None:
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    content_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    q = lambda namespace, name: f"{{{namespace}}}{name}"
+    converted = path.with_name(f"{path.name}.{os.getpid()}.shared")
+    try:
+        with zipfile.ZipFile(path, "r") as source:
+            entries = {info.filename: info for info in source.infolist()}
+            payloads: dict[str, bytes] = {}
+            shared_name = "xl/sharedStrings.xml"
+            if shared_name in entries:
+                shared = ET.fromstring(source.read(shared_name))
+            else:
+                shared = ET.Element(q(main_ns, "sst"))
+            unique: dict[bytes, int] = {
+                ET.tostring(item, encoding="utf-8"): index
+                for index, item in enumerate(shared.findall(q(main_ns, "si")))
+            }
+            total = int(shared.get("count", "0"))
+            for name, info in entries.items():
+                if not name.startswith("xl/worksheets/") or not name.endswith(".xml"):
+                    continue
+                root = ET.fromstring(source.read(info))
+                changed = False
+                for cell in root.iter(q(main_ns, "c")):
+                    if cell.get("t") != "inlineStr":
+                        continue
+                    inline = cell.find(q(main_ns, "is"))
+                    if inline is None:
+                        continue
+                    item = ET.Element(q(main_ns, "si"))
+                    for child in list(inline):
+                        item.append(child)
+                    key = ET.tostring(item, encoding="utf-8")
+                    index = unique.get(key)
+                    if index is None:
+                        index = len(unique)
+                        unique[key] = index
+                        shared.append(item)
+                    cell.remove(inline)
+                    cell.set("t", "s")
+                    ET.SubElement(cell, q(main_ns, "v")).text = str(index)
+                    total += 1
+                    changed = True
+                if changed:
+                    payloads[name] = ET.tostring(
+                        root, encoding="utf-8", xml_declaration=True
+                    )
+            if not total:
+                return
+
+            shared.set("count", str(total))
+            shared.set("uniqueCount", str(len(unique)))
+            payloads[shared_name] = ET.tostring(
+                shared, encoding="utf-8", xml_declaration=True
+            )
+
+            rels_name = "xl/_rels/workbook.xml.rels"
+            rels = ET.fromstring(source.read(rels_name))
+            if not any(
+                relation.get("Type", "").endswith("/sharedStrings")
+                for relation in rels
+            ):
+                used = {
+                    int(match.group(1))
+                    for relation in rels
+                    if (match := re.fullmatch(r"rId(\d+)", relation.get("Id", "")))
+                }
+                next_id = max(used, default=0) + 1
+                ET.SubElement(
+                    rels,
+                    q(rel_ns, "Relationship"),
+                    {
+                        "Id": f"rId{next_id}",
+                        "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+                        "Target": "sharedStrings.xml",
+                    },
+                )
+                payloads[rels_name] = ET.tostring(
+                    rels, encoding="utf-8", xml_declaration=True
+                )
+
+            types_name = "[Content_Types].xml"
+            content_types = ET.fromstring(source.read(types_name))
+            if not any(
+                item.get("PartName") == "/xl/sharedStrings.xml"
+                for item in content_types
+            ):
+                ET.SubElement(
+                    content_types,
+                    q(content_ns, "Override"),
+                    {
+                        "PartName": "/xl/sharedStrings.xml",
+                        "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+                    },
+                )
+                payloads[types_name] = ET.tostring(
+                    content_types, encoding="utf-8", xml_declaration=True
+                )
+
+            with zipfile.ZipFile(converted, "w") as target:
+                for name, info in entries.items():
+                    if name == shared_name and name not in payloads:
+                        continue
+                    target.writestr(info, payloads.get(name, source.read(info)))
+                if shared_name not in entries:
+                    target.writestr(
+                        shared_name,
+                        payloads[shared_name],
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+        replace_with_retry(converted, path)
+    finally:
+        converted.unlink(missing_ok=True)
+
+
+def _set_literal_cell(cell, value: str) -> None:
+    cell.value = value
+    if value.startswith("="):
+        cell.data_type = "s"
 
 
 def write_full_workbook(
@@ -1457,10 +1654,11 @@ def write_full_workbook(
     for row_index, values, ordinal in _iter_data_rows(worksheet):
         key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         category = _category(values["code"], values["flag"], values["type"])
-        worksheet.cell(row_index, headers["__target__"]).value = (
+        _set_literal_cell(
+            worksheet.cell(row_index, headers["__target__"]),
             ""
             if category is ImportCategory.COPY or values["code"].upper() in FONT_CODES
-            else translations.get(key, "")
+            else translations.get(key, ""),
         )
     return _save_workbook_atomic(workbook, output_path)
 
@@ -1471,11 +1669,15 @@ def read_font_slots(items: list[TranslationItem], *, translated: bool = False) -
         code = item.code.upper()
         if code in by_code:
             by_code[code].append(item)
-    invalid = [code for code, matches in by_code.items() if len(matches) != 1]
+    invalid = [code for code, matches in by_code.items() if len(matches) > 1]
     if invalid:
-        raise ValueError("字体字段数量不正确: " + ", ".join(invalid))
+        raise ValueError("字体字段重复: " + ", ".join(invalid))
     return [
-        (by_code[code][0].translation if translated else by_code[code][0].original)
+        (
+            by_code[code][0].translation if translated else by_code[code][0].original
+        )
+        if by_code[code]
+        else ""
         for code in FONT_CODES
     ]
 
@@ -1495,14 +1697,14 @@ def write_font_workbook(
     for row_index, values, _ordinal in _iter_data_rows(worksheet):
         code = values["code"].upper()
         cell = worksheet.cell(row_index, headers["__target__"])
-        cell.value = ""
+        _set_literal_cell(cell, "")
         if code in slot_by_code:
             found[code] += 1
-            cell.value = slot_by_code[code]
-    invalid = [code for code in FONT_CODES if found[code] != 1]
+            _set_literal_cell(cell, slot_by_code[code])
+    invalid = [code for code in FONT_CODES if found[code] > 1]
     if invalid:
         workbook.close()
-        raise ValueError("字体工作簿字段数量不正确: " + ", ".join(invalid))
+        raise ValueError("字体工作簿字段重复: " + ", ".join(invalid))
     return _save_workbook_atomic(workbook, output_path)
 
 
@@ -1593,7 +1795,7 @@ def analyze_import_protection(
     unresolved_scope_entries: list[dict[str, object]] = []
     proven_safe: set[str] = set()
     if logic_safety is not None:
-        if logic_safety.get("schema") != 2:
+        if logic_safety.get("schema") != 3:
             raise ValueError("WOLF 候选译文安全报告格式错误。")
         safe_values = logic_safety.get("safe_to_translate")
         if not isinstance(safe_values, list):
@@ -1718,9 +1920,53 @@ def analyze_import_protection(
             if _looks_like_path_or_command(item):
                 add(item, "keep_original", "path_or_command")
 
-    if rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 5:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 5 Editor 分析报告，请重新执行导出文本。")
+    if rules.protect_logic_references and logic_safety is not None:
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 6:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 6 Editor 分析报告，请重新执行导出文本。")
+        keep_values = logic_safety.get("keep_original")
+        safety_reasons = logic_safety.get("reasons")
+        if not isinstance(keep_values, list) or not isinstance(safety_reasons, dict):
+            raise ValueError("WOLF 候选译文安全报告缺少保护键或原因。")
+        by_key = {item.key: item for item in items}
+        for raw_key in keep_values:
+            key = str(raw_key)
+            item = by_key.get(key)
+            if item is None:
+                continue
+            raw_reasons = safety_reasons.get(key, ["logic_safety"])
+            reasons_for_key = (
+                [str(value) for value in raw_reasons]
+                if isinstance(raw_reasons, list)
+                else [str(raw_reasons)]
+            )
+            add(
+                item,
+                "keep_original",
+                "logic_safety",
+                "；".join(reasons_for_key),
+                {"safety_reasons": reasons_for_key},
+            )
+        unresolved_scope_entries = [
+            {"scopes": [str(scope)], "reason": "candidate_safety", "evidence": ""}
+            for scope in logic_safety.get("unresolved_scopes", ())
+        ]
+        relevant_logic_blocking = [
+            issue
+            for issue in logic_blocking
+            if isinstance(issue, dict)
+        ]
+        should_block = (
+            rules.logic_unknown_policy == "block"
+            if block_on_logic_issue is None
+            else block_on_logic_issue
+        )
+        if should_block and keep_values:
+            raise RuntimeError(
+                "WOLF 静态安全分析需要保留风险原文，严格模式已阻止导入。"
+            )
+    elif rules.protect_logic_references:
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 6:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 6 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
@@ -1802,6 +2048,25 @@ def analyze_import_protection(
                     relevant_blocking.append(dependency)
                     unresolved_scope_entries.append(
                         {"scopes": scopes or ["project"], "reason": dependency.get("reason", ""), "evidence": evidence}
+                    )
+                continue
+            if dependency_kind in {"call", "control_flow"}:
+                call_items = [
+                    by_key[str(key)] for key in [*source_keys, *right_source_keys]
+                    if str(key) in by_key
+                ]
+                if dependency.get("status") != "resolved":
+                    call_items.extend(items_for_scopes(scopes or ["common:*"]))
+                for item in call_items:
+                    add(item, "keep_original", "event_call_target", evidence, details)
+                if dependency.get("status") == "blocking" and call_items:
+                    relevant_blocking.append(dependency)
+                    unresolved_scope_entries.append(
+                        {
+                            "scopes": scopes or ["common:*"],
+                            "reason": dependency.get("reason", ""),
+                            "evidence": evidence,
+                        }
                     )
                 continue
             for key in condition_keys:
@@ -1916,6 +2181,7 @@ def analyze_import_protection(
         if (
             item.key in requirements
             and item.translation
+            and item.translation != item.original
             and item.key not in proven_safe
             and item.key not in protected
         ):
@@ -1935,10 +2201,15 @@ def analyze_import_protection(
     action_order = {"keep_original": 0, "warn": 1, "atomic_translate": 2}
     entries.sort(key=lambda entry: (action_order[entry["action"]], entry["code"], entry["original"]))
     return {
-        "schema": 5,
+        "schema": IMPORT_PROTECTION_SCHEMA,
         "protected_keys": sorted(protected),
         "safe_to_translate": sorted((set(requirements) & proven_safe) - protected),
         "keep_original": sorted(protected),
+        "approvals": (
+            dict(logic_safety.get("approvals", {}))
+            if isinstance(logic_safety, dict)
+            else {}
+        ),
         "unresolved_scopes": unresolved_scope_entries,
         "translated_replay": (
             dict(logic_safety.get("replay", {}))
@@ -1963,7 +2234,9 @@ def analyze_import_protection(
             "logic_protected": len({
                 entry["key"]
                 for entry in entries
-                if entry["reason"] in {"logic_condition", "logic_value_change"}
+                if entry["reason"] in {
+                    "logic_condition", "logic_value_change", "logic_safety"
+                }
             }),
             "logic_blocking": len(
                 logic_blocking
@@ -1979,12 +2252,30 @@ def analyze_import_protection(
             "logic_auto_preserved": (
                 len({
                     entry["key"] for entry in entries
-                    if entry["reason"] == "logic_unresolved_scope"
+                    if entry["reason"] in {"logic_unresolved_scope", "logic_safety"}
                 })
                 if rules.protect_logic_references and rules.logic_unknown_policy == "warn"
                 else 0
             ),
             "logic_proven_safe": len((set(requirements) & proven_safe) - protected),
+            "logic_direct_display": len(
+                logic_safety.get("approvals", {}).get("direct_display", ())
+                if isinstance(logic_safety, dict)
+                and isinstance(logic_safety.get("approvals"), dict)
+                else ()
+            ),
+            "logic_display_contract": len(
+                logic_safety.get("approvals", {}).get("official_display_contract", ())
+                if isinstance(logic_safety, dict)
+                and isinstance(logic_safety.get("approvals"), dict)
+                else ()
+            ),
+            "logic_semantic_equivalence": len(
+                logic_safety.get("approvals", {}).get("semantic_equivalence", ())
+                if isinstance(logic_safety, dict)
+                and isinstance(logic_safety.get("approvals"), dict)
+                else ()
+            ),
             "logic_not_proven": sum(
                 entry["reason"] == "not_proven_safe" for entry in entries
             ),
@@ -2081,22 +2372,34 @@ def write_scoped_workbook(
         key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         category = _category(values["code"], values["flag"], values["type"])
         cell = worksheet.cell(row_index, headers["__target__"])
+        item = items_by_key.get(key)
         required_categories = requirements.get(key, set())
         keep = bool(required_categories)
         if category is ImportCategory.COPY:
-            item = items_by_key.get(key)
             if item is None:
                 raise ValueError(f"范围工作簿找不到 COPY-FROM 条目: {values['code']}")
             source = _copy_source(item, by_code)
             copy_enabled = source.key in requirements
-            cell.value = source.translation if copy_enabled and source.translation else item.original
+            _set_literal_cell(
+                cell,
+                source.translation if copy_enabled and source.translation else item.original,
+            )
             continue
         if not keep:
-            cell.value = ""
+            _set_literal_cell(cell, "")
             continue
-        if ImportCategory.FILENAME in required_categories and cell.value:
-            if not _filename_target_exists(Path(game_root), str(cell.value)):
-                missing_filenames.append(str(cell.value))
+        if item is None:
+            raise ValueError(f"范围工作簿找不到翻译条目: {values['code']}")
+        target = item.translation if item.translation != item.original else ""
+        # ponytail: rewrite every selected cell from the item model so a stale
+        # workbook formula cannot leak into the official tool input.
+        _set_literal_cell(cell, target)
+        if (
+            ImportCategory.FILENAME in required_categories
+            and target
+            and not _filename_target_exists(Path(game_root), target)
+        ):
+            missing_filenames.append(target)
     if missing_filenames:
         sample = ", ".join(missing_filenames[:5])
         raise ValueError(f"文件名译文没有对应真实文件，共 {len(missing_filenames)} 项，例如: {sample}")
