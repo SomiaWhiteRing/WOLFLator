@@ -1077,6 +1077,61 @@ class WorkbookAndFontTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "COMMAND_NUM"):
                 analyze_auto_export(auto, items, editor, input_hash="input")
 
+    def test_editor_cfg_handles_cross_structure_gotos_without_recursion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    [
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=2",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Nested back edge",
+                        "COMMAND_NUM=10",
+                        "WoditorEvCOMMAND_START",
+                        '[212][0,1]<0>()("start")',
+                        '[112][2,1]<0>(1,1600000)("outer")',
+                        '[401][1,0]<0>(0)()',
+                        '[170][0,0]<1>()()',
+                        '[112][2,1]<2>(1,1600001)("inner")',
+                        '[401][1,0]<2>(0)()',
+                        '[213][0,1]<3>()("start")',
+                        '[499][0,0]<2>()()',
+                        '[498][0,0]<1>()()',
+                        '[499][0,0]<0>()()',
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=2",
+                        "COMMON_NAME=Jump into loop",
+                        "COMMAND_NUM=5",
+                        "WoditorEvCOMMAND_START",
+                        '[213][0,1]<0>()("inside")',
+                        '[179][1,0]<0>(2)()',
+                        '[212][0,1]<1>()("inside")',
+                        '[171][0,0]<1>()()',
+                        '[498][0,0]<0>()()',
+                        "WoditorEvCOMMAND_END",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            editor = EditorInfo(
+                editor_path,
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+
+            report = analyze_auto_export(root / "Auto", [], editor, input_hash="input")
+
+            self.assertEqual(4, report["schema"])
+            self.assertFalse(
+                any("固定点超过" in issue["reason"] for issue in report["blocking_issues"])
+            )
+
     def test_translation_safety_requires_positive_display_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

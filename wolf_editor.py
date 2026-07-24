@@ -13,7 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -38,6 +38,7 @@ AUTO_ANALYSIS_SCHEMA = 4
 _VALUE_LIMIT = 256
 _LOOP_LIMIT = 64
 _CALL_DEPTH_LIMIT = 64
+_CFG_STATE_VISIT_LIMIT = 64
 _CFG_IMPLEMENTED_OPCODES = frozenset(
     {
         0, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
@@ -1036,20 +1037,58 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
 def _state_cache_key(state: _AnalysisState) -> tuple[object, ...]:
     local_numbers = tuple(
         sorted(
-            (key, value)
+            (key, value.values, value.tracked)
             for key, value in state.numbers.items()
             if 1_600_000 <= key < 1_600_100
         )
     )
     local_strings = tuple(
         sorted(
-            (key, value)
+            (key, _string_semantic_key(value))
             for key, value in state.strings.items()
             if 1_600_000 <= key < 1_600_100
         )
     )
-    database = tuple(sorted(state.database_strings.items()))
+    database = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.database_strings.items()
+        )
+    )
     return (local_numbers, local_strings, database)
+
+
+def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
+    return (
+        value.source_keys,
+        value.cells,
+        _string_value_status(value)[0],
+        value.symbolic_all,
+        value.scopes,
+        value.literals,
+    )
+
+
+def _state_semantic_key(state: _AnalysisState) -> tuple[object, ...]:
+    numbers = tuple(
+        sorted(
+            (key, value.values, value.tracked)
+            for key, value in state.numbers.items()
+        )
+    )
+    strings = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.strings.items()
+        )
+    )
+    database = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.database_strings.items()
+        )
+    )
+    return numbers, strings, database, state.unknown_scopes
 
 
 def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
@@ -1093,6 +1132,52 @@ class _BlockAnalyzer:
             if command.opcode == 212 and len(command.strings) == 1:
                 labels.setdefault(command.strings[0], []).append(position)
         self.labels = {name: tuple(positions) for name, positions in labels.items()}
+        self._condition_regions: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {}
+        self._branch_exits: dict[int, int] = {}
+        self._loop_ends: dict[int, int] = {}
+        self._loop_starts: dict[int, int] = {}
+        self._enclosing_loops: dict[int, tuple[int, int]] = {}
+        self._index_control_flow()
+
+    def _index_control_flow(self) -> None:
+        commands = self.block.commands
+        for index, command in enumerate(commands):
+            if command.opcode in {111, 112}:
+                closing = self._matching(index, len(commands), 499)
+                if closing is None:
+                    continue
+                markers = tuple(
+                    position
+                    for position in range(index + 1, closing)
+                    if commands[position].indent == command.indent
+                    and commands[position].opcode in {401, 420, 421}
+                )
+                branches: list[tuple[int, int]] = []
+                for offset, marker in enumerate(markers):
+                    branch_end = markers[offset + 1] if offset + 1 < len(markers) else closing
+                    branches.append((marker, branch_end))
+                    if marker + 1 < branch_end:
+                        last = branch_end - 1
+                        self._branch_exits[last] = max(
+                            self._branch_exits.get(last, 0), closing + 1
+                        )
+                self._condition_regions[index] = (closing, tuple(branches))
+            elif command.opcode in {170, 179}:
+                closing = self._matching(index, len(commands), 498)
+                if closing is not None:
+                    self._loop_ends[index] = closing
+                    self._loop_starts[closing] = index
+
+        loops = sorted(
+            self._loop_ends.items(), key=lambda item: (item[1] - item[0], -item[0])
+        )
+        for index in range(len(commands)):
+            enclosing = next(
+                ((start, closing) for start, closing in loops if start < index < closing),
+                None,
+            )
+            if enclosing is not None:
+                self._enclosing_loops[index] = enclosing
 
     def _dynamic_entry_dispatcher(self) -> int | None:
         if self.block.event_type != "common":
@@ -2600,14 +2685,14 @@ class _BlockAnalyzer:
             scopes,
         )
 
-    def _execute(
+    def _transfer_command(
         self,
-        start: int,
-        end: int,
+        index: int,
         state: _AnalysisState,
         exits: list[_AnalysisState] | None = None,
     ) -> bool:
-        index = start
+        start = index
+        end = index + 1
         jump_counts: Counter[int] = Counter()
         while index < end:
             command = self.block.commands[index]
@@ -2848,6 +2933,288 @@ class _BlockAnalyzer:
             index += 1
         return True
 
+    def _cfg_failure(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        reason: str,
+    ) -> None:
+        scopes = self._current_scope()
+        state.unknown_scopes = state.unknown_scopes | scopes
+        state.unknown_reasons = state.unknown_reasons | frozenset(
+            {f"{self._location(index)}: {reason}"}
+        )
+        self.summary_failed = reason
+        self._blocking_scope_dependency(
+            command, index, "control_flow", reason, scopes
+        )
+
+    @staticmethod
+    def _bounded_successor(target: int, limit: int) -> tuple[int | None, int]:
+        return (target, limit) if target < limit else (None, limit)
+
+    def _widen_back_edge(
+        self,
+        previous: _AnalysisState,
+        current: _AnalysisState,
+    ) -> _AnalysisState:
+        merged = _merge_states([previous, current])
+        for variable in set(previous.numbers) | set(current.numbers):
+            left = previous.numbers.get(variable)
+            right = current.numbers.get(variable)
+            if left != right:
+                value = merged.numbers.get(variable)
+                merged.numbers[variable] = _NumberValue(
+                    None,
+                    "控制流回边扩大为运行时数值",
+                    bool(value and value.tracked),
+                )
+        scope = self._current_scope()
+        for variable in set(previous.strings) | set(current.strings):
+            left = previous.strings.get(variable)
+            right = current.strings.get(variable)
+            if left is not None and right is not None:
+                unchanged = _string_semantic_key(left) == _string_semantic_key(right)
+            else:
+                unchanged = left is right
+            if unchanged:
+                continue
+            value = merged.strings.get(variable) or _StringValue()
+            database_scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for database, type_id, _data_id, field_id in value.cells
+            )
+            merged.strings[variable] = _StringValue(
+                trace=value.trace,
+                unknown="控制流回边扩大为运行时字符串",
+                symbolic_all=True,
+                scopes=value.scopes | database_scopes | scope,
+                literals=None,
+            )
+        previous_coordinates = set(previous.database_strings)
+        current_coordinates = set(current.database_strings)
+        growing_databases = {
+            coordinate[0]
+            for coordinate in previous_coordinates ^ current_coordinates
+        }
+        if growing_databases:
+            merged.database_strings = {
+                coordinate: value
+                for coordinate, value in merged.database_strings.items()
+                if coordinate[0] not in growing_databases
+            }
+            merged.unknown_scopes = merged.unknown_scopes | scope | frozenset(
+                f"database:{database}:*:*:*" for database in growing_databases
+            )
+        for coordinate in set(previous.database_strings) | set(current.database_strings):
+            if coordinate[0] in growing_databases:
+                continue
+            left = previous.database_strings.get(coordinate)
+            right = current.database_strings.get(coordinate)
+            if left is not None and right is not None:
+                unchanged = _string_semantic_key(left) == _string_semantic_key(right)
+            else:
+                unchanged = left is right
+            if unchanged:
+                continue
+            value = merged.database_strings.get(coordinate) or _StringValue()
+            database, type_id, data_id, field_id = coordinate
+            merged.database_strings[coordinate] = _StringValue(
+                trace=value.trace,
+                unknown="控制流回边扩大为运行时数据库字符串",
+                symbolic_all=True,
+                scopes=value.scopes
+                | frozenset(
+                    {f"database:{database}:{type_id}:{data_id}:{field_id}"}
+                ),
+                literals=None,
+            )
+        return merged
+
+    def _cfg_successors(
+        self,
+        index: int,
+        limit: int,
+        state: _AnalysisState,
+        exits: list[_AnalysisState] | None,
+    ) -> tuple[tuple[int | None, int], ...]:
+        command = self.block.commands[index]
+        if command.opcode in {111, 112}:
+            region = self._condition_regions.get(index)
+            if region is None:
+                return (self._bounded_successor(index + 1, limit),)
+            closing, branches = region
+            if not branches:
+                return (self._bounded_successor(closing + 1, limit),)
+            truth = (
+                self._numeric_condition_truth(command, state)
+                if command.opcode == 111
+                else None
+            )
+            if truth is True:
+                selected = branches[:1]
+            elif truth is False:
+                selected = tuple(
+                    branch
+                    for branch in branches
+                    if self.block.commands[branch[0]].opcode in {420, 421}
+                )
+            else:
+                selected = branches
+            targets = [
+                branch_start + 1 if branch_start + 1 < branch_end else closing + 1
+                for branch_start, branch_end in selected
+            ]
+            has_else = any(
+                self.block.commands[branch_start].opcode in {420, 421}
+                for branch_start, _branch_end in branches
+            )
+            if (truth is False and not selected) or (truth is None and not has_else):
+                targets.append(closing + 1)
+            return tuple(
+                dict.fromkeys(self._bounded_successor(target, limit) for target in targets)
+            )
+
+        if command.opcode in {170, 179}:
+            closing = self._loop_ends.get(index)
+            if closing is None:
+                self._cfg_failure(command, index, state, "循环缺少配对的循环结束")
+                return ()
+            body = self._bounded_successor(index + 1, limit)
+            if command.opcode == 170:
+                return (body,)
+            count = (
+                _number_argument(command.ints[0], state)
+                if command.ints
+                else _NumberValue(None, "循环次数缺失")
+            )
+            after = self._bounded_successor(closing + 1, limit)
+            if count.values is not None and all(value <= 0 for value in count.values):
+                return (after,)
+            return tuple(dict.fromkeys((body, after)))
+
+        if command.opcode == 498:
+            start = self._loop_starts.get(index)
+            if start is None:
+                self._cfg_failure(command, index, state, "循环结束缺少配对的循环入口")
+                return ()
+            return (self._bounded_successor(start, limit),)
+
+        if command.opcode in {171, 176}:
+            loop = self._enclosing_loops.get(index)
+            if loop is None:
+                self._cfg_failure(command, index, state, "循环控制命令不在循环结构内")
+                return ()
+            start, closing = loop
+            target = closing + 1 if command.opcode == 171 else start
+            return (self._bounded_successor(target, limit),)
+
+        if command.opcode == 172:
+            if exits is not None:
+                exits.append(state.copy())
+            return ()
+        if command.opcode in {173, 174, 175}:
+            return ()
+
+        if command.opcode == 213:
+            if command.strings == ("END",):
+                if exits is not None:
+                    exits.append(state.copy())
+                return ()
+            target_names = (
+                _expand_string_references(frozenset({command.strings[0]}), state)
+                if len(command.strings) == 1
+                else None
+            )
+            targets = tuple(sorted({
+                position
+                for name in (target_names or ())
+                for position in self.labels.get(name, ())
+            }))
+            if len(targets) == 1:
+                target = targets[0] + 1
+                return ((target, len(self.block.commands)),) if target < len(self.block.commands) else ((None, len(self.block.commands)),)
+            target_name = command.strings[0] if len(command.strings) == 1 else ""
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "control_flow",
+                f"标签目标为运行时动态值，已保守保护当前事件范围 {target_name!r}",
+                self._current_scope(),
+                status="dynamic",
+            )
+            return ()
+
+        target = self._branch_exits.get(index, index + 1)
+        return (self._bounded_successor(target, limit),)
+
+    def _execute(
+        self,
+        start: int,
+        end: int,
+        state: _AnalysisState,
+        exits: list[_AnalysisState] | None = None,
+    ) -> bool:
+        if start >= len(self.block.commands):
+            return True
+        initial_limit = min(max(end, start + 1), len(self.block.commands))
+        states: dict[tuple[int, int], _AnalysisState] = {
+            (start, initial_limit): state.copy()
+        }
+        pending: deque[tuple[int, int]] = deque(((start, initial_limit),))
+        visits: Counter[tuple[int, int]] = Counter()
+        fallthrough: list[_AnalysisState] = []
+        structural = {170, 171, 172, 173, 174, 175, 176, 179, 213}
+
+        while pending:
+            key = pending.popleft()
+            index, limit = key
+            current = states[key].copy()
+            visits[key] += 1
+            if visits[key] > _CFG_STATE_VISIT_LIMIT:
+                self._cfg_failure(
+                    self.block.commands[index],
+                    index,
+                    current,
+                    f"控制流固定点超过 {_CFG_STATE_VISIT_LIMIT} 次仍未收敛",
+                )
+                continue
+
+            command = self.block.commands[index]
+            if command.opcode not in structural:
+                self._transfer_command(index, current, exits)
+            successors = self._cfg_successors(index, limit, current, exits)
+            for successor, successor_limit in successors:
+                if successor is None:
+                    fallthrough.append(current.copy())
+                    continue
+                successor_key = (successor, successor_limit)
+                previous = states.get(successor_key)
+                merged = (
+                    current.copy()
+                    if previous is None
+                    else self._widen_back_edge(previous, current)
+                    if successor <= index
+                    else _merge_states([previous, current])
+                )
+                if previous is not None:
+                    if _state_semantic_key(merged) == _state_semantic_key(previous):
+                        states[successor_key] = merged
+                        continue
+                states[successor_key] = merged
+                pending.append(successor_key)
+
+        if not fallthrough:
+            return False
+        result = _merge_states(fallthrough)
+        state.numbers = result.numbers
+        state.strings = result.strings
+        state.database_strings = result.database_strings
+        state.unknown_scopes = result.unknown_scopes
+        state.unknown_reasons = result.unknown_reasons
+        return True
+
     def run(self) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
         entry_labels = [
             (index, int(command.strings[0].removeprefix("cmd:")))
@@ -2923,7 +3290,6 @@ def _analyze_blocks(
     common_by_name = {name: tuple(group) for name, group in common_names.items()}
     event_scopes = _conservative_event_scopes(blocks, common_by_id, common_by_name)
     dependencies: list[dict[str, object]] = []
-    blocking: list[dict[str, object]] = []
     unknown = Counter()
     locations: dict[tuple[int, str], list[str]] = {}
     call_cache: _CallCache = {}
@@ -2938,9 +3304,8 @@ def _analyze_blocks(
             event_scopes,
             call_cache=call_cache,
         )
-        block_dependencies, block_blocking, block_unknown = analyzer.run()
+        block_dependencies, _block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
-        blocking.extend(block_blocking)
         for warning in block_unknown:
             key = (int(warning["opcode"]), str(warning["shape"]))
             unknown[key] += int(warning["count"])
@@ -2957,51 +3322,82 @@ def _analyze_blocks(
         )
         current = merged_dependencies.get(identity)
         if current is None:
-            merged_dependencies[identity] = dependency
-            continue
-        current["condition_keys"] = sorted(set(current["condition_keys"]) | set(dependency["condition_keys"]))
-        current["source_keys"] = sorted(set(current["source_keys"]) | set(dependency["source_keys"]))
-        current["right_source_keys"] = sorted(
-            set(current.get("right_source_keys", [])) | set(dependency.get("right_source_keys", []))
-        )
-        cells = {
-            (cell["database"], cell["type"], cell["data"], cell["field"])
-            for cell in [*current["database_cells"], *dependency["database_cells"]]
-        }
-        current["database_cells"] = [
-            {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
-            for cell in sorted(cells)
-        ]
-        right_cells = {
-            (cell["database"], cell["type"], cell["data"], cell["field"])
-            for cell in [*current.get("right_database_cells", []), *dependency.get("right_database_cells", [])]
-        }
-        current["right_database_cells"] = [
-            {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
-            for cell in sorted(right_cells)
-        ]
-        current["trace"] = list(dict.fromkeys([*current["trace"], *dependency["trace"]]))[:_VALUE_LIMIT]
-        for field in ("left_values", "right_values"):
-            current[field] = sorted(
-                set(current.get(field, [])) | set(dependency.get(field, []))
-            )[:_VALUE_LIMIT]
-        for field in ("source_scopes", "right_source_scopes"):
-            current[field] = sorted(
-                set(current.get(field, [])) | set(dependency.get(field, []))
+            current = dict(dependency)
+            current["_condition_keys"] = set(dependency["condition_keys"])
+            current["_source_keys"] = set(dependency["source_keys"])
+            current["_right_source_keys"] = set(
+                dependency.get("right_source_keys", [])
             )
-        current["unresolved_scopes"] = sorted(
-            set(current.get("unresolved_scopes", []))
-            | set(dependency.get("unresolved_scopes", []))
+            current["_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency["database_cells"]
+            }
+            current["_right_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency.get("right_database_cells", [])
+            }
+            current["_trace"] = dict.fromkeys(dependency["trace"])
+            current["_left_values"] = set(dependency.get("left_values", []))
+            current["_right_values"] = set(dependency.get("right_values", []))
+            current["_source_scopes"] = set(dependency.get("source_scopes", []))
+            current["_right_source_scopes"] = set(
+                dependency.get("right_source_scopes", [])
+            )
+            current["_unresolved_scopes"] = set(
+                dependency.get("unresolved_scopes", [])
+            )
+            current["_unresolved_reasons"] = dict.fromkeys(
+                dependency.get("unresolved_reasons", [])
+            )
+            merged_dependencies[identity] = current
+            continue
+        current["_condition_keys"].update(dependency["condition_keys"])
+        current["_source_keys"].update(dependency["source_keys"])
+        current["_right_source_keys"].update(dependency.get("right_source_keys", []))
+        current["_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency["database_cells"]
         )
-        current["unresolved_reasons"] = list(dict.fromkeys([
-            *current.get("unresolved_reasons", []),
-            *dependency.get("unresolved_reasons", []),
-        ]))[:_VALUE_LIMIT]
+        current["_right_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency.get("right_database_cells", [])
+        )
+        current["_trace"].update(dict.fromkeys(dependency["trace"]))
+        current["_left_values"].update(dependency.get("left_values", []))
+        current["_right_values"].update(dependency.get("right_values", []))
+        current["_source_scopes"].update(dependency.get("source_scopes", []))
+        current["_right_source_scopes"].update(
+            dependency.get("right_source_scopes", [])
+        )
+        current["_unresolved_scopes"].update(
+            dependency.get("unresolved_scopes", [])
+        )
+        current["_unresolved_reasons"].update(
+            dict.fromkeys(dependency.get("unresolved_reasons", []))
+        )
         rank = {"resolved": 0, "untracked": 1, "dynamic": 2, "blocking": 3}
         if rank.get(str(dependency["status"]), 3) > rank.get(str(current["status"]), 3):
             current["status"] = dependency["status"]
             current["reason"] = dependency["reason"]
-    dependencies = list(merged_dependencies.values())
+    dependencies = []
+    for current in merged_dependencies.values():
+        current["condition_keys"] = sorted(current.pop("_condition_keys"))
+        current["source_keys"] = sorted(current.pop("_source_keys"))
+        current["right_source_keys"] = sorted(current.pop("_right_source_keys"))
+        for field in ("database_cells", "right_database_cells"):
+            current[field] = [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(current.pop(f"_{field}"))
+            ]
+        current["trace"] = list(current.pop("_trace"))[:_VALUE_LIMIT]
+        for field in ("left_values", "right_values"):
+            current[field] = sorted(current.pop(f"_{field}"))[:_VALUE_LIMIT]
+        for field in ("source_scopes", "right_source_scopes", "unresolved_scopes"):
+            current[field] = sorted(current.pop(f"_{field}"))
+        current["unresolved_reasons"] = list(
+            current.pop("_unresolved_reasons")
+        )[:_VALUE_LIMIT]
+        dependencies.append(current)
     blocking = [item for item in dependencies if item["status"] == "blocking"]
     return dependencies, blocking, warnings
 

@@ -837,10 +837,15 @@ class Pipeline:
                 editor_result.analysis_path.read_text(encoding="utf-8")
             )
             call_graph = editor_analysis.get("call_graph", {})
-            coverage = editor_analysis.get("command_catalog", {}).get("coverage", {})
+            catalog = editor_analysis.get("command_catalog", {})
+            shape_coverage = catalog.get("shape_coverage", {})
+            semantic_coverage = catalog.get("semantic_coverage", {})
+            cfg_coverage = catalog.get("cfg_coverage", {})
             self.log(
                 "Editor 安全分析："
-                f"命令形状覆盖 {coverage.get('calibrated', 0)}/{coverage.get('commands', 0)}，"
+                f"命令形状覆盖 {shape_coverage.get('covered', 0)}/{shape_coverage.get('commands', 0)}，"
+                f"语义覆盖 {semantic_coverage.get('covered', 0)}/{semantic_coverage.get('commands', 0)}，"
+                f"控制流覆盖 {cfg_coverage.get('covered', 0)}/{cfg_coverage.get('control_commands', 0)}，"
                 f"事件摘要 {len(editor_analysis.get('event_summaries', []))} 个，"
                 f"调用边 {len(call_graph.get('edges', []))} 条，"
                 f"递归 SCC {len(call_graph.get('recursive_sccs', []))} 个。"
