@@ -79,7 +79,11 @@ from wolf_tools import (
 from wolf_editor import (
     EditorRelease,
     EditorInfo,
+    _NumberValue,
+    _StringValue,
     _copy_editor_sandbox,
+    _merge_numbers,
+    _merge_strings,
     analyze_auto_export,
     analyze_translation_safety,
     compare_auto_structure,
@@ -306,6 +310,27 @@ class WorkbookTests(unittest.TestCase):
 
 
 class WorkbookAndFontTests(unittest.TestCase):
+    def test_analysis_self_merge_keeps_required_widening(self):
+        stable = _StringValue(
+            source_keys=frozenset({"key"}),
+            trace=("source",),
+            literals=frozenset({"text"}),
+        )
+        self.assertEqual(stable, _merge_strings(stable, stable))
+
+        oversized_string = _StringValue(
+            source_keys=frozenset(f"key-{index}" for index in range(257)),
+            literals=frozenset({"text"}),
+        )
+        merged_string = _merge_strings(oversized_string, oversized_string)
+        self.assertTrue(merged_string.symbolic_all)
+        self.assertEqual(frozenset({"project"}), merged_string.scopes)
+
+        oversized_number = _NumberValue(frozenset(range(257)), tracked=True)
+        merged_number = _merge_numbers(oversized_number, oversized_number)
+        self.assertIsNone(merged_number.values)
+        self.assertTrue(merged_number.tracked)
+
     def test_external_filter_view_excludes_only_files_over_the_kb_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

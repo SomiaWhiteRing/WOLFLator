@@ -838,6 +838,12 @@ def _calculate_numbers(left: _NumberValue, right: _NumberValue, operator: int) -
 def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _NumberValue | None:
     if left is None and right is None:
         return None
+    if (
+        left == right
+        and left is not None
+        and (left.values is None or len(left.values) <= _VALUE_LIMIT)
+    ):
+        return left
     if left is None or right is None:
         value = left or right
         assert value is not None
@@ -851,6 +857,16 @@ def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _Nu
 def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _StringValue | None:
     if left is None and right is None:
         return None
+    if (
+        left == right
+        and left is not None
+        and (left.symbolic_all or len(left.source_keys) + len(left.cells) <= _VALUE_LIMIT)
+        and (left.literals is None or len(left.literals) <= _VALUE_LIMIT)
+        and (left.tracked or not left.unknown)
+        and len(left.trace) <= _VALUE_LIMIT
+        and len(left.trace) == len(set(left.trace))
+    ):
+        return left
     if left is None or right is None:
         value = left or right
         assert value is not None
@@ -1069,26 +1085,27 @@ def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
     )
 
 
-def _state_semantic_key(state: _AnalysisState) -> tuple[object, ...]:
-    numbers = tuple(
-        sorted(
-            (key, value.values, value.tracked)
-            for key, value in state.numbers.items()
-        )
+def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> bool:
+    if left.unknown_scopes != right.unknown_scopes:
+        return False
+    if left.numbers.keys() != right.numbers.keys():
+        return False
+    if any(
+        value.values != right.numbers[key].values
+        or value.tracked != right.numbers[key].tracked
+        for key, value in left.numbers.items()
+    ):
+        return False
+    if left.strings.keys() != right.strings.keys() or any(
+        _string_semantic_key(value) != _string_semantic_key(right.strings[key])
+        for key, value in left.strings.items()
+    ):
+        return False
+    return left.database_strings.keys() == right.database_strings.keys() and not any(
+        _string_semantic_key(value)
+        != _string_semantic_key(right.database_strings[key])
+        for key, value in left.database_strings.items()
     )
-    strings = tuple(
-        sorted(
-            (key, _string_semantic_key(value))
-            for key, value in state.strings.items()
-        )
-    )
-    database = tuple(
-        sorted(
-            (key, _string_semantic_key(value))
-            for key, value in state.database_strings.items()
-        )
-    )
-    return numbers, strings, database, state.unknown_scopes
 
 
 def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
@@ -1179,11 +1196,14 @@ class _BlockAnalyzer:
             if enclosing is not None:
                 self._enclosing_loops[index] = enclosing
 
-    def _dynamic_entry_dispatcher(self) -> int | None:
-        if self.block.event_type != "common":
+    def _dynamic_entry_dispatcher(
+        self, block: _CommandBlock | None = None
+    ) -> int | None:
+        target = block or self.block
+        if target.event_type != "common":
             return None
-        for index, command in enumerate(self.block.commands[:-1]):
-            following = self.block.commands[index + 1]
+        for index, command in enumerate(target.commands[:-1]):
+            following = target.commands[index + 1]
             if (
                 command.indent == 0
                 and following.indent == 0
@@ -2467,18 +2487,7 @@ class _BlockAnalyzer:
                 )
             return
 
-        child = _BlockAnalyzer(
-            target,
-            self.databases,
-            self.database_keys,
-            self.event_items,
-            self.common_by_id,
-            self.common_by_name,
-            self.event_scopes,
-            self.call_stack + (call_key,),
-            self.call_cache,
-        )
-        dispatcher = child._dynamic_entry_dispatcher()
+        dispatcher = self._dynamic_entry_dispatcher(target)
         if dispatcher is not None:
             start, end = dispatcher, len(target.commands)
         else:
@@ -2514,6 +2523,17 @@ class _BlockAnalyzer:
         cache_key = (target.event_id, choice, start, end, _state_cache_key(callee_state))
         cached = self.call_cache.get(cache_key)
         if cached is None:
+            child = _BlockAnalyzer(
+                target,
+                self.databases,
+                self.database_keys,
+                self.event_items,
+                self.common_by_id,
+                self.common_by_name,
+                self.event_scopes,
+                self.call_stack + (call_key,),
+                self.call_cache,
+            )
             exits: list[_AnalysisState] = []
             fell_through = child._execute(start, end, callee_state, exits)
             if fell_through:
@@ -2531,24 +2551,21 @@ class _BlockAnalyzer:
                 ),
             )
             self.call_cache[cache_key] = cached
-        fell_through = cached.fell_through
-        exits = [item.copy() for item in cached.exits]
-        child.summary_failed = cached.summary_failed
         self.dependencies.extend(cached.dependencies)
         self.blocking.extend(cached.blocking)
         self.unknown.update(cached.unknown)
         for key, values in cached.unknown_locations:
             self.unknown_locations.setdefault(key, []).extend(values)
-        if child.summary_failed:
+        if cached.summary_failed:
             self._unknown_call(
                 command,
                 index,
                 state,
-                child.summary_failed or "公共事件摘要没有在 END 返回",
+                cached.summary_failed or "公共事件摘要没有在 END 返回",
                 target_scopes,
             )
             return
-        if not exits:
+        if not cached.exits:
             self._blocking_scope_dependency(
                 command,
                 index,
@@ -2560,7 +2577,7 @@ class _BlockAnalyzer:
             self._set_dynamic_call_return(command, state, target, target_scopes)
             return
 
-        result = _merge_states(exits)
+        result = _merge_states(list(cached.exits))
         state.database_strings = dict(result.database_strings)
         state.unknown_scopes = state.unknown_scopes | result.unknown_scopes
         state.unknown_reasons = state.unknown_reasons | result.unknown_reasons
@@ -3199,7 +3216,7 @@ class _BlockAnalyzer:
                     else _merge_states([previous, current])
                 )
                 if previous is not None:
-                    if _state_semantic_key(merged) == _state_semantic_key(previous):
+                    if _states_semantically_equal(merged, previous):
                         states[successor_key] = merged
                         continue
                 states[successor_key] = merged
