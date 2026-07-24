@@ -48,10 +48,9 @@ class EditorCalibrationTests(unittest.TestCase):
                 self.assertIsNotNone(semantics)
                 self.assertTrue(semantics["semantic_complete"])
                 self.assertNotIn("encoded_parameter", semantics["integer_roles"])
-                self.assertIn(semantics["transfer"], {
-                    "preserve", "numeric_write", "string_read", "string_write",
-                    "condition", "control_flow", "database", "event_call", "opaque",
-                })
+                self.assertIsInstance(semantics["transfer"], str)
+                self.assertNotEqual("opaque", semantics["transfer"])
+                self.assertIn("data_effects", semantics)
             self.assertIsNone(command_effect(opcode, 999, 999))
             self.assertIsNone(command_semantics(opcode, 999, 999))
 

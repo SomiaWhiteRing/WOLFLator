@@ -34,17 +34,19 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 4
+AUTO_ANALYSIS_SCHEMA = 5
+TRANSLATION_SAFETY_SCHEMA = 2
 _VALUE_LIMIT = 256
 _LOOP_LIMIT = 64
 _CALL_DEPTH_LIMIT = 64
 _CFG_STATE_VISIT_LIMIT = 64
 _CFG_IMPLEMENTED_OPCODES = frozenset(
     {
-        0, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
+        0, 102, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
         212, 213, 401, 402, 420, 421, 498, 499,
     }
 )
+_CFG_CONTROL_OPCODES = _CFG_IMPLEMENTED_OPCODES
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
@@ -193,6 +195,19 @@ class _AnalysisState:
             self.unknown_scopes,
             self.unknown_reasons,
         )
+
+
+@dataclass
+class _AnalysisAudit:
+    transfers: dict[str, str]
+    cfg: dict[str, str]
+    cfg_edges: set[tuple[str, str]]
+    calls: dict[str, tuple[str, tuple[str, ...]]]
+    data_effects: dict[str, tuple[str, tuple[str, ...]]]
+
+    @classmethod
+    def empty(cls) -> "_AnalysisAudit":
+        return cls({}, {}, set(), {}, {})
 
 
 @dataclass(frozen=True)
@@ -1128,6 +1143,8 @@ class _BlockAnalyzer:
         event_scopes: dict[int, frozenset[str]] | None = None,
         call_stack: tuple[tuple[int, int | None], ...] = (),
         call_cache: _CallCache | None = None,
+        candidate_values: dict[str, str] | None = None,
+        audit: _AnalysisAudit | None = None,
     ) -> None:
         self.block = block
         self.databases = databases
@@ -1138,6 +1155,8 @@ class _BlockAnalyzer:
         self.event_scopes = event_scopes or {}
         self.call_stack = call_stack
         self.call_cache = call_cache if call_cache is not None else {}
+        self.candidate_values = candidate_values or {}
+        self.audit = audit if audit is not None else _AnalysisAudit.empty()
         self.dependencies: list[dict[str, object]] = []
         self.blocking: list[dict[str, object]] = []
         self.unknown = Counter()
@@ -1147,7 +1166,8 @@ class _BlockAnalyzer:
         labels: dict[str, list[int]] = {}
         for position, command in enumerate(block.commands):
             if command.opcode == 212 and len(command.strings) == 1:
-                labels.setdefault(command.strings[0], []).append(position)
+                for label in self._candidate_literal_values(command, position, 0):
+                    labels.setdefault(label, []).append(position)
         self.labels = {name: tuple(positions) for name, positions in labels.items()}
         self._condition_regions: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {}
         self._branch_exits: dict[int, int] = {}
@@ -1156,10 +1176,26 @@ class _BlockAnalyzer:
         self._enclosing_loops: dict[int, tuple[int, int]] = {}
         self._index_control_flow()
 
+    def _command_id(self, index: int) -> str:
+        return f"{self.block.source}:{self.block.event_type}:{self.block.event_id}:{self.block.page}:{index + 1}"
+
+    def _candidate_literal_values(
+        self, command: _Command, index: int, string_index: int
+    ) -> frozenset[str]:
+        literal = command.strings[string_index] if string_index < len(command.strings) else ""
+        values = {
+            self.candidate_values.get(item.key, literal)
+            for item in self.event_items.get(
+                _event_code(self.block, index + 1, string_index).upper(), ()
+            )
+            if item.original == literal
+        }
+        return frozenset(values or {literal})
+
     def _index_control_flow(self) -> None:
         commands = self.block.commands
         for index, command in enumerate(commands):
-            if command.opcode in {111, 112}:
+            if command.opcode in {102, 111, 112}:
                 closing = self._matching(index, len(commands), 499)
                 if closing is None:
                     continue
@@ -1167,7 +1203,7 @@ class _BlockAnalyzer:
                     position
                     for position in range(index + 1, closing)
                     if commands[position].indent == command.indent
-                    and commands[position].opcode in {401, 420, 421}
+                    and commands[position].opcode in {401, 402, 420, 421}
                 )
                 branches: list[tuple[int, int]] = []
                 for offset, marker in enumerate(markers):
@@ -1286,6 +1322,7 @@ class _BlockAnalyzer:
             if not value.tracked:
                 continue
             status, reason = _string_value_status(value)
+            resource_values = sorted(value.literals or ())
             self.dependencies.append({
                 "kind": "display",
                 "auto_file": self.block.source,
@@ -1300,7 +1337,12 @@ class _BlockAnalyzer:
                 ).upper(),
                 "condition_keys": [],
                 "operator": "display",
-                "literal": command.strings[string_index],
+                    "literal": (
+                        resource_values[0]
+                        if len(resource_values) == 1
+                        else command.strings[string_index]
+                    ),
+                    "resource_values": resource_values,
                 "right_is_variable": False,
                 "source_keys": sorted(value.source_keys),
                 "right_source_keys": [],
@@ -1474,13 +1516,27 @@ class _BlockAnalyzer:
         if database is None:
             self._record_unknown(command, index, f"250-flags-{flags:08x}")
             return
-        if byte1 & 0xF0 != 0x10:
-            if len(command.ints) == 4 and command.strings:
+        if len(command.ints) == 4:
+            if command.strings:
                 self._write_database_string(command, index, state, database, byte2)
+            else:
+                type_ids = self._type_ids(database, command, byte2, state)
+                scopes = frozenset(
+                    f"database:{database}:{type_id}:*:*"
+                    for type_id in (type_ids or self.databases.get(database, {}))
+                ) or frozenset({f"database:{database}:*:*:*"})
+                # Numeric DB writes cannot carry translated strings, but their
+                # affected range is still part of the side-effect ledger.
+                if not type_ids:
+                    self.audit.data_effects[self._command_id(index)] = (
+                        "conservative",
+                        tuple(sorted(scopes)),
+                    )
             return
-        if len(command.ints) != 5:
-            self._record_unknown(command, index, "invalid-250-read")
-            return
+        # All five-integer 3.713 forms read a DB value into the destination.
+        # The high nibble selects the value mode; it does not turn the command
+        # into a write. Treating only 0x10 as a read silently dropped numeric
+        # lookups in real games.
         destination = command.ints[4] & 0x00FFFFFF
         selected_type_ids = self._type_ids(database, command, byte2, state)
         if selected_type_ids == set():
@@ -1554,6 +1610,13 @@ class _BlockAnalyzer:
                     if coordinate_keys:
                         keys.update(coordinate_keys)
                         cells.add(coordinate)
+                        names.discard(db_type.data_names[data_id])
+                        names.update(
+                            self.candidate_values.get(
+                                key, db_type.data_names[data_id]
+                            )
+                            for key in coordinate_keys
+                        )
             scopes = frozenset(
                 f"database:{database}:{type_id}:*:0" for type_id in type_ids
             )
@@ -1637,7 +1700,11 @@ class _BlockAnalyzer:
                         elif coordinate_keys:
                             cells.add(coordinate)
                             keys.update(coordinate_keys)
-                            string_values.add(db_type.rows[data_id][field_id])
+                            original_value = db_type.rows[data_id][field_id]
+                            string_values.update(
+                                self.candidate_values.get(key, original_value)
+                                for key in coordinate_keys
+                            )
                     else:
                         try:
                             numeric_values.add(int(db_type.rows[data_id][field_id]))
@@ -1758,19 +1825,19 @@ class _BlockAnalyzer:
         index: int,
         state: _AnalysisState,
         *,
-        string_result: bool,
+        string_result: bool | None,
     ) -> None:
         if not command.ints:
             self._record_unknown(command, index, "missing-destination")
             return
         destination = command.ints[0] & 0x00FFFFFF
-        if string_result:
+        if string_result is not False:
             state.strings[destination] = _StringValue(
                 trace=(self._location(index),),
                 unknown=f"字符串由运行时命令 opcode={command.opcode} 取得",
                 literals=None,
             )
-        else:
+        if string_result is not True:
             state.numbers[destination] = _NumberValue(
                 None, f"数值由运行时命令 opcode={command.opcode} 取得"
             )
@@ -1830,16 +1897,29 @@ class _BlockAnalyzer:
             match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", self.block.source, re.IGNORECASE)
             map_id = int(match.group(1)) if match else 0
             source_scope = f"map:{map_id}:{self.block.event_id}:{self.block.page}"
+        candidate_literals = self._candidate_literal_values(
+            command, index, string_index
+        )
         value = _StringValue(
             keys,
             trace=(f"{self._location(index)} opcode={command.opcode} literal",),
             scopes=frozenset({source_scope}) if keys else frozenset(),
-            literals=frozenset({literal}),
+            literals=candidate_literals,
         )
         referenced = _string_reference_value(literal, state)
         if referenced is not None:
             value = _merge_strings(value, referenced) or value
-        concrete = _expand_string_references(frozenset({literal}), state)
+        concrete_values: set[str] = set()
+        concrete_known = True
+        for candidate_literal in candidate_literals:
+            expanded = _expand_string_references(
+                frozenset({candidate_literal}), state
+            )
+            if expanded is None:
+                concrete_known = False
+                break
+            concrete_values.update(expanded)
+        concrete = frozenset(concrete_values) if concrete_known else None
         value = _with_literals(value, concrete)
         return value
 
@@ -2016,13 +2096,21 @@ class _BlockAnalyzer:
         for condition_index in range(count):
             variable, operator, right_is_variable = _condition_operator(command.ints[condition_index + 1])
             condition_code = _event_code(self.block, index + 1, condition_index).upper()
+            condition_literal = self._literal_string(
+                command, index, condition_index, state
+            )
+            literal_values = condition_literal.literals
             condition_keys = sorted(
                 item.key
                 for item in self.event_items.get(condition_code, ())
                 if item.original == command.strings[condition_index]
             )
             value = state.strings.get(variable)
-            literal = command.strings[condition_index]
+            literal = (
+                next(iter(literal_values))
+                if literal_values is not None and len(literal_values) == 1
+                else command.strings[condition_index]
+            )
             right_value: _StringValue | None = None
             if right_is_variable:
                 right_index = count + 1 + condition_index
@@ -2090,7 +2178,7 @@ class _BlockAnalyzer:
                 "right_values": (
                     sorted(right_value.literals)
                     if right_value and right_value.literals is not None
-                    else []
+                    else sorted(literal_values or ())
                 ),
                 "source_scopes": sorted(value.scopes if value else ()),
                 "right_source_scopes": sorted(
@@ -2222,6 +2310,39 @@ class _BlockAnalyzer:
                 None, f"数值经过未支持命令 opcode={command.opcode}", current.tracked
             )
 
+    def _apply_conservative_scopes(
+        self,
+        state: _AnalysisState,
+        scopes: frozenset[str],
+        reason: str,
+    ) -> None:
+        if not scopes:
+            scopes = frozenset({"project"})
+        state.unknown_scopes = state.unknown_scopes | scopes
+        state.unknown_reasons = state.unknown_reasons | frozenset({reason})
+        affects_globals = "project" in scopes or any(
+            scope.startswith("common:") for scope in scopes
+        )
+        if affects_globals:
+            for variable, current in tuple(state.strings.items()):
+                if 1_600_000 <= variable < 1_600_100:
+                    continue
+                state.strings[variable] = _StringValue(
+                    current.source_keys,
+                    current.cells,
+                    current.trace,
+                    reason,
+                    True,
+                    current.scopes | scopes,
+                    None,
+                )
+            for variable, current in tuple(state.numbers.items()):
+                if 1_600_000 <= variable < 1_600_100:
+                    continue
+                state.numbers[variable] = _NumberValue(
+                    None, reason, current.tracked
+                )
+
     def _unknown_call(
         self,
         command: _Command,
@@ -2249,10 +2370,11 @@ class _BlockAnalyzer:
             command, index, "call", reason, scopes, input_values, status=status
         )
         if taint_state:
-            state.unknown_scopes = state.unknown_scopes | scopes
-            state.unknown_reasons = state.unknown_reasons | frozenset({
-                f"{self._location(index)} opcode={command.opcode}: {reason}"
-            })
+            self._apply_conservative_scopes(
+                state,
+                scopes,
+                f"{self._location(index)} opcode={command.opcode}: {reason}",
+            )
         if len(command.ints) < 2 or not command.ints[1] & 0x01000000:
             return
         destination = command.ints[-1] & 0x00FFFFFF
@@ -2287,16 +2409,14 @@ class _BlockAnalyzer:
         )
 
     def _call_target(
-        self, command: _Command, state: _AnalysisState
+        self, command: _Command, index: int, state: _AnalysisState
     ) -> tuple[_CommandBlock, int | None] | None:
         if len(command.ints) < 2:
             return None
         if command.opcode == 300:
             if not command.strings:
                 return None
-            target_names = _expand_string_references(
-                frozenset({command.strings[0]}), state
-            )
+            target_names = self._literal_string(command, index, 0, state).literals
             matches = {
                 max(group, key=lambda block: block.event_id).event_id:
                 max(group, key=lambda block: block.event_id)
@@ -2328,18 +2448,18 @@ class _BlockAnalyzer:
         return target, choice
 
     def _call_event(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        command_id = self._command_id(index)
         has_return = len(command.ints) >= 2 and bool(command.ints[1] & 0x01000000)
-        resolved = self._call_target(command, state)
+        resolved = self._call_target(command, index, state)
         if resolved is None:
             if command.opcode == 300 and command.strings:
-                names = _expand_string_references(
-                    frozenset({command.strings[0]}), state
-                )
+                names = self._literal_string(command, index, 0, state).literals
                 if names is not None and not any(
                     self.common_by_name.get(name) for name in names
                 ):
                     # The official manual specifies that an invalid name does
                     # nothing. Old projects commonly retain optional calls.
+                    self.audit.calls[command_id] = ("exact", ("noop",))
                     return
                 value = self._literal_string(command, index, 0, state)
                 self._blocking_scope_dependency(
@@ -2347,11 +2467,12 @@ class _BlockAnalyzer:
                     index,
                     "call",
                     "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
-                    frozenset(),
+                    frozenset({"common:*"}),
                     (value,),
                     status="dynamic",
                 )
             elif command.opcode == 210 and command.ints and command.ints[0] < 0:
+                self.audit.calls[command_id] = ("exact", ("noop",))
                 return
             else:
                 self._blocking_scope_dependency(
@@ -2362,6 +2483,7 @@ class _BlockAnalyzer:
                     frozenset({"common:*"}),
                     status="dynamic",
                 )
+            self.audit.calls[command_id] = ("conservative", ("common:*",))
             self._set_unknown_target_return(command, state)
             return
         target, choice = resolved
@@ -2369,6 +2491,9 @@ class _BlockAnalyzer:
         # only need the callee's own text and actual argument provenance; DB and
         # global writes are covered by their value-boundary dependencies.
         target_scopes = frozenset({f"common:{target.event_id}"})
+        self.audit.calls[command_id] = (
+            "exact", (f"common:{target.event_id}",)
+        )
         target_has_dispatcher = any(
             command.indent == 0
             and following.indent == 0
@@ -2387,6 +2512,9 @@ class _BlockAnalyzer:
             for item in target.commands
         )
         if choice is None and (target_has_dispatcher or target_has_entry_labels):
+            self.audit.calls[command_id] = (
+                "conservative", tuple(sorted(target_scopes))
+            )
             self._blocking_scope_dependency(
                 command,
                 index,
@@ -2410,6 +2538,10 @@ class _BlockAnalyzer:
                 status="dynamic",
                 taint_state=False,
             )
+            self.audit.calls[command_id] = (
+                "conservative",
+                tuple(sorted(self.event_scopes.get(target.event_id, target_scopes))),
+            )
             return
         if call_key in self.call_stack:
             self._unknown_call(
@@ -2420,6 +2552,10 @@ class _BlockAnalyzer:
                 self.event_scopes.get(target.event_id, target_scopes),
                 status="dynamic",
                 taint_state=False,
+            )
+            self.audit.calls[command_id] = (
+                "conservative",
+                tuple(sorted(self.event_scopes.get(target.event_id, target_scopes))),
             )
             return
         if has_return and target.return_target < 0:
@@ -2474,15 +2610,17 @@ class _BlockAnalyzer:
                 )
 
         if not has_return:
+            scopes = self.event_scopes.get(target.event_id, frozenset())
             inputs = tuple(callee_state.strings.values())
-            if any(value.tracked for value in inputs):
+            tracked_inputs = tuple(value for value in inputs if value.tracked)
+            if scopes or tracked_inputs:
                 self._blocking_scope_dependency(
                     command,
                     index,
                     "call",
                     "无返回公共事件副作用已按事件摘要保守定位",
-                    frozenset(),
-                    inputs,
+                    scopes or target_scopes,
+                    tracked_inputs,
                     status="dynamic",
                 )
             return
@@ -2533,6 +2671,8 @@ class _BlockAnalyzer:
                 self.event_scopes,
                 self.call_stack + (call_key,),
                 self.call_cache,
+                self.candidate_values,
+                self.audit,
             )
             exits: list[_AnalysisState] = []
             fell_through = child._execute(start, end, callee_state, exits)
@@ -2654,7 +2794,9 @@ class _BlockAnalyzer:
     def _reserve_event(
         self, command: _Command, index: int, state: _AnalysisState
     ) -> None:
+        command_id = self._command_id(index)
         if not command.ints:
+            self.audit.calls[command_id] = ("conservative", ("common:*",))
             self._unknown_call(
                 command, index, state, "预约公共事件目标缺失", frozenset({"common:*"})
             )
@@ -2663,11 +2805,15 @@ class _BlockAnalyzer:
         target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
         target = self.common_by_id.get(target_id)
         if target is None:
+            self.audit.calls[command_id] = ("conservative", ("common:*",))
             self._unknown_call(
                 command, index, state, "预约公共事件目标无法解析", frozenset({"common:*"})
             )
             return
-        scopes = frozenset({f"common:{target.event_id}"})
+        scopes = self.event_scopes.get(target.event_id, frozenset())
+        self.audit.calls[command_id] = (
+            "exact", (f"common:{target.event_id}",)
+        )
         if scopes:
             self._blocking_scope_dependency(
                 command,
@@ -2700,6 +2846,78 @@ class _BlockAnalyzer:
             "database",
             "CSV 数据库操作可能在运行时改写数据库字符串",
             scopes,
+            status="dynamic",
+        )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative", tuple(sorted(scopes))
+        )
+
+    def _transform_database(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        flags = command.ints[3] if len(command.ints) > 3 else 0
+        selector_flags = (flags >> 16) & 0xFF
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get((flags >> 8) & 0x0F)
+        if database is None:
+            scopes = frozenset(
+                {
+                    "database:CDB:*:*:*",
+                    "database:SDB:*:*:*",
+                    "database:UDB:*:*:*",
+                }
+            )
+        else:
+            type_ids = self._type_ids(database, command, selector_flags, state)
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:*"
+                for type_id in (type_ids or self.databases.get(database, {}))
+            ) or frozenset({f"database:{database}:*:*:*"})
+        values = tuple(
+            self._literal_string(command, index, string_index, state)
+            for string_index, text in enumerate(command.strings)
+            if text
+        )
+        self._blocking_scope_dependency(
+            command,
+            index,
+            "database",
+            "数据库数据操作会重排或改写可定位的数据库范围",
+            scopes,
+            values,
+            status="dynamic",
+        )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            tuple(sorted(scopes)),
+        )
+
+    def _xy_array(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        selector = (
+            self._literal_string(command, index, 1, state)
+            if len(command.strings) > 1 and command.strings[1]
+            else _StringValue(literals=frozenset())
+        )
+        scopes = frozenset({"array:*"})
+        if selector.tracked:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "XY 数值数组名称来自可翻译字符串",
+                scopes,
+                (selector,),
+                status="dynamic",
+            )
+        if len(command.ints) > 4:
+            destination = command.ints[4] & 0x00FFFFFF
+            state.numbers[destination] = _NumberValue(
+                None, "XY 数值数组操作结果为运行时动态值", selector.tracked
+            )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            tuple(sorted(scopes)),
         )
 
     def _transfer_command(
@@ -2713,14 +2931,23 @@ class _BlockAnalyzer:
         jump_counts: Counter[int] = Counter()
         while index < end:
             command = self.block.commands[index]
+            command_id = self._command_id(index)
             semantics = command_semantics(
                 command.opcode, len(command.ints), len(command.strings)
             )
             if semantics is None:
+                self.audit.transfers[command_id] = "opaque"
+                self.audit.data_effects[command_id] = ("opaque", ("project",))
                 self._record_unknown(command, index)
                 self._taint_unknown(command, index, state)
                 index += 1
                 continue
+            shape_key = (
+                command.opcode,
+                f"ints={len(command.ints)},strings={len(command.strings)}",
+            )
+            unknown_before = self.unknown[shape_key]
+            self.audit.transfers[command_id] = str(semantics["transfer"])
             self._display_reference(command, index, state, semantics)
             self._resource_reference(command, index, state, semantics)
             if command.opcode == 121:
@@ -2730,23 +2957,24 @@ class _BlockAnalyzer:
             elif command.opcode == 123:
                 self._set_runtime_value(command, index, state, string_result=False)
             elif command.opcode == 124:
-                # Editor 3.713 exposes both numeric and string-valued system queries.
-                # A query overwrites prior provenance; runtime strings are not
-                # WOLFLator-editable sources and therefore remain untracked.
-                category = command.ints[1] if len(command.ints) > 1 else -1
-                field = command.ints[3] if len(command.ints) > 3 else -1
-                string_result = category == 4096 and field == 9
-                self._set_runtime_value(command, index, state, string_result=string_result)
+                # Editor 3.713 exposes both numeric and string-valued queries.
+                # Keeping both abstract destinations is conservative and avoids
+                # guessing an uncalibrated runtime category's result type.
+                self._set_runtime_value(command, index, state, string_result=None)
             elif command.opcode == 250:
                 self._database(command, index, state)
             elif command.opcode == 251:
                 self._import_database(command, index, state)
+            elif command.opcode == 252:
+                self._transform_database(command, index, state)
+            elif command.opcode in {255, 257}:
+                self._xy_array(command, index, state)
             elif command.opcode == 221:
                 self._set_runtime_value(
                     command,
                     index,
                     state,
-                    string_result=bool(command.ints and command.ints[-1] == 1),
+                    string_result=None,
                 )
             elif command.opcode == 112:
                 self._condition(command, index, state)
@@ -2947,6 +3175,18 @@ class _BlockAnalyzer:
                     ):
                         self._record_unknown(command, index)
                     self._taint_unknown(command, index, state)
+            if self.unknown[shape_key] > unknown_before:
+                self.audit.transfers[command_id] = "opaque"
+                self.audit.data_effects[command_id] = ("opaque", ("project",))
+            elif semantics.get("data_effects") and command_id not in self.audit.data_effects:
+                call = self.audit.calls.get(command_id)
+                if call is not None:
+                    self.audit.data_effects[command_id] = call
+                else:
+                    self.audit.data_effects[command_id] = (
+                        "exact",
+                        tuple(map(str, semantics["data_effects"])),
+                    )
             index += 1
         return True
 
@@ -3057,7 +3297,7 @@ class _BlockAnalyzer:
         exits: list[_AnalysisState] | None,
     ) -> tuple[tuple[int | None, int], ...]:
         command = self.block.commands[index]
-        if command.opcode in {111, 112}:
+        if command.opcode in {102, 111, 112}:
             region = self._condition_regions.get(index)
             if region is None:
                 return (self._bounded_successor(index + 1, limit),)
@@ -3069,7 +3309,9 @@ class _BlockAnalyzer:
                 if command.opcode == 111
                 else None
             )
-            if truth is True:
+            if command.opcode == 102:
+                selected = branches
+            elif truth is True:
                 selected = branches[:1]
             elif truth is False:
                 selected = tuple(
@@ -3087,7 +3329,15 @@ class _BlockAnalyzer:
                 self.block.commands[branch_start].opcode in {420, 421}
                 for branch_start, _branch_end in branches
             )
-            if (truth is False and not selected) or (truth is None and not has_else):
+            has_cancel = any(
+                self.block.commands[branch_start].opcode == 421
+                for branch_start, _branch_end in branches
+            )
+            if (
+                command.opcode == 102 and not has_cancel
+                or command.opcode != 102
+                and ((truth is False and not selected) or (truth is None and not has_else))
+            ):
                 targets.append(closing + 1)
             return tuple(
                 dict.fromkeys(self._bounded_successor(target, limit) for target in targets)
@@ -3135,15 +3385,17 @@ class _BlockAnalyzer:
             return ()
 
         if command.opcode == 213:
-            if command.strings == ("END",):
+            target_value = (
+                self._literal_string(command, index, 0, state)
+                if len(command.strings) == 1
+                else _StringValue(literals=None)
+            )
+            target_literals = target_value.literals
+            if target_literals == frozenset({"END"}):
                 if exits is not None:
                     exits.append(state.copy())
                 return ()
-            target_names = (
-                _expand_string_references(frozenset({command.strings[0]}), state)
-                if len(command.strings) == 1
-                else None
-            )
+            target_names = target_literals
             targets = tuple(sorted({
                 position
                 for name in (target_names or ())
@@ -3201,7 +3453,33 @@ class _BlockAnalyzer:
             command = self.block.commands[index]
             if command.opcode not in structural:
                 self._transfer_command(index, current, exits)
+            else:
+                semantics = command_semantics(
+                    command.opcode, len(command.ints), len(command.strings)
+                )
+                command_id = self._command_id(index)
+                if semantics is None:
+                    self.audit.transfers[command_id] = "opaque"
+                    self.audit.data_effects[command_id] = ("opaque", ("project",))
+                else:
+                    self.audit.transfers[command_id] = str(semantics["transfer"])
             successors = self._cfg_successors(index, limit, current, exits)
+            if command.opcode in _CFG_CONTROL_OPCODES:
+                command_id = self._command_id(index)
+                terminal = command.opcode in {172, 173, 174, 175} or (
+                    command.opcode == 213 and command.strings == ("END",)
+                )
+                if successors or terminal:
+                    self.audit.cfg[command_id] = "exact"
+                elif command.opcode == 213 and self._current_scope():
+                    self.audit.cfg[command_id] = "conservative"
+                else:
+                    self.audit.cfg[command_id] = "opaque"
+                for successor, _successor_limit in successors:
+                    target = "END" if successor is None else self._command_id(successor)
+                    self.audit.cfg_edges.add((command_id, target))
+                if terminal:
+                    self.audit.cfg_edges.add((command_id, "END"))
             for successor, successor_limit in successors:
                 if successor is None:
                     fallthrough.append(current.copy())
@@ -3263,6 +3541,42 @@ class _BlockAnalyzer:
                     self._execute(start + 1, end, state)
         else:
             self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
+        # Commands excluded by a proven branch still need a syntactic CFG and
+        # semantic ledger entry. They are safe because they are unreachable,
+        # not because the coverage denominator forgot them.
+        for index, command in enumerate(self.block.commands):
+            command_id = self._command_id(index)
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            if semantics is None:
+                continue
+            if command_id not in self.audit.transfers:
+                self.audit.transfers[command_id] = "unreachable"
+                if semantics.get("data_effects"):
+                    self.audit.data_effects[command_id] = (
+                        "exact", ("unreachable",)
+                    )
+            if command.opcode not in _CFG_CONTROL_OPCODES or command_id in self.audit.cfg:
+                continue
+            state = _AnalysisState({}, {}, {})
+            successors = self._cfg_successors(
+                index, len(self.block.commands), state, None
+            )
+            terminal = command.opcode in {172, 173, 174, 175} or (
+                command.opcode == 213 and command.strings == ("END",)
+            )
+            if successors or terminal:
+                self.audit.cfg[command_id] = "exact"
+            elif command.opcode == 213 and self._current_scope():
+                self.audit.cfg[command_id] = "conservative"
+            else:
+                self.audit.cfg[command_id] = "opaque"
+            for successor, _successor_limit in successors:
+                target = "END" if successor is None else self._command_id(successor)
+                self.audit.cfg_edges.add((command_id, target))
+            if terminal:
+                self.audit.cfg_edges.add((command_id, "END"))
         warnings = [
             {"opcode": opcode, "shape": shape, "count": count,
              "locations": self.unknown_locations[(opcode, shape)][:5]}
@@ -3275,7 +3589,13 @@ def _analyze_blocks(
     blocks: Iterable[_CommandBlock],
     items: list[TranslationItem],
     databases: dict[str, dict[int, _DatabaseType]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    candidate_values: dict[str, str] | None = None,
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    _AnalysisAudit,
+]:
     blocks = list(blocks)
     database_keys: dict[tuple[str, int, int, int], set[str]] = {}
     event_items: dict[str, list[TranslationItem]] = {}
@@ -3310,6 +3630,7 @@ def _analyze_blocks(
     unknown = Counter()
     locations: dict[tuple[int, str], list[str]] = {}
     call_cache: _CallCache = {}
+    audit = _AnalysisAudit.empty()
     for block in blocks:
         analyzer = _BlockAnalyzer(
             block,
@@ -3320,6 +3641,8 @@ def _analyze_blocks(
             common_by_name,
             event_scopes,
             call_cache=call_cache,
+            candidate_values=candidate_values,
+            audit=audit,
         )
         block_dependencies, _block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
@@ -3416,7 +3739,7 @@ def _analyze_blocks(
         )[:_VALUE_LIMIT]
         dependencies.append(current)
     blocking = [item for item in dependencies if item["status"] == "blocking"]
-    return dependencies, blocking, warnings
+    return dependencies, blocking, warnings, audit
 
 
 def _translation_usage_report(
@@ -3505,6 +3828,18 @@ def _command_transfer_complete(command: _Command) -> bool:
         source_kind = flags & 0x0F
         assignment = (flags >> 8) & 0x0F
         return source_kind in {0, 1, 2, 3} and assignment in set(range(12))
+    if command.opcode == 112:
+        if not command.ints:
+            return False
+        count = command.ints[0] & 0x0F
+        return (
+            len(command.strings) >= count
+            and len(command.ints) >= count + 1
+            and all(
+                _condition_operator(command.ints[index + 1])[1] is not None
+                for index in range(count)
+            )
+        )
     if command.opcode == 250:
         if len(command.ints) not in {4, 5}:
             return False
@@ -3654,6 +3989,28 @@ def _call_graph_report(blocks: list[_CommandBlock]) -> tuple[dict[str, object], 
                 "opcode": command.opcode,
                 "targets": [_event_node(target) for target in targets],
                 "dynamic": len(targets) != 1,
+                "resolution": (
+                    "exact"
+                    if len(targets) == 1
+                    else "exact_noop"
+                    if command.opcode == 300
+                    and command.strings
+                    and not _CSELF_REFERENCE_RE.search(command.strings[0])
+                    and not _STRING_REFERENCE_RE.search(command.strings[0])
+                    and not targets
+                    else "conservative"
+                ),
+                "conservative_scopes": (
+                    []
+                    if len(targets) == 1
+                    else []
+                    if command.opcode == 300
+                    and command.strings
+                    and not _CSELF_REFERENCE_RE.search(command.strings[0])
+                    and not _STRING_REFERENCE_RE.search(command.strings[0])
+                    and not targets
+                    else ["common:*"]
+                ),
             }
             calls.append(edge)
             edges.append(edge)
@@ -3735,6 +4092,7 @@ def analyze_auto_export(
     editor: EditorInfo,
     *,
     input_hash: str,
+    candidate_values: dict[str, str] | None = None,
 ) -> dict[str, object]:
     root = Path(auto_dir).resolve()
     common = root / "BasicData" / "CommonEvent.dat.Auto.txt"
@@ -3774,39 +4132,96 @@ def analyze_auto_export(
         database_counts[name] = counts
 
     project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
-    dependencies, blocking, warnings = _analyze_blocks(project.events, items, database_types)
+    dependencies, blocking, warnings, audit = _analyze_blocks(
+        project.events, items, database_types, candidate_values
+    )
     call_graph, event_summaries = _call_graph_report(list(project.events))
     usage_by_key, proven_display = _translation_usage_report(
         project.events, items, dependencies
     )
-    all_commands = [
-        command for block in project.events for command in block.commands
+    command_records = [
+        (
+            f"{block.source}:{block.event_type}:{block.event_id}:{block.page}:{index + 1}",
+            command,
+        )
+        for block in project.events
+        for index, command in enumerate(block.commands)
+    ]
+    all_commands = [command for _command_id, command in command_records]
+    for command_id, command in command_records:
+        semantics = command_semantics(
+            command.opcode, len(command.ints), len(command.strings)
+        )
+        if semantics is None or command_id in audit.transfers:
+            continue
+        audit.transfers[command_id] = "unreachable"
+        if semantics.get("data_effects"):
+            audit.data_effects[command_id] = ("exact", ("unreachable",))
+    shape_missing = [
+        command
+        for command in all_commands
+        if command_semantics(command.opcode, len(command.ints), len(command.strings))
+        is None
     ]
     semantic_missing = [
         command
-        for command in all_commands
+        for command_id, command in command_records
         if not _command_transfer_complete(command)
+        or audit.transfers.get(command_id) == "opaque"
     ]
-    control_commands = [
-        command
-        for command in all_commands
+    control_records = [
+        (command_id, command)
+        for command_id, command in command_records
+        if command.opcode in _CFG_CONTROL_OPCODES
+    ]
+    covered_control_commands = sum(
+        audit.cfg.get(command_id) in {"exact", "conservative"}
+        or command_id not in audit.transfers
+        and command.opcode in _CFG_IMPLEMENTED_OPCODES
+        and _command_transfer_complete(command)
+        for command_id, command in control_records
+    )
+    call_edges = list(call_graph.get("edges", []))
+    resolved_calls = sum(
+        edge.get("resolution") in {"exact", "exact_noop"}
+        for edge in call_edges
+        if isinstance(edge, dict)
+    )
+    conservative_calls = sum(
+        edge.get("resolution") == "conservative"
+        and bool(edge.get("conservative_scopes"))
+        for edge in call_edges
+        if isinstance(edge, dict)
+    )
+    data_effect_records = [
+        (command_id, command, semantics)
+        for command_id, command in command_records
         if (
             (semantics := command_semantics(
                 command.opcode, len(command.ints), len(command.strings)
             ))
-            and semantics.get("effect") == "control_flow"
+            and semantics.get("data_effects")
         )
     ]
-    covered_control_commands = sum(
-        command.opcode in _CFG_IMPLEMENTED_OPCODES
-        for command in control_commands
+    covered_data_effects = sum(
+        _command_transfer_complete(command)
+        and audit.data_effects.get(command_id, ("opaque", ()))[0]
+        in {"exact", "conservative"}
+        for command_id, command, _semantics in data_effect_records
     )
-    call_edges = list(call_graph.get("edges", []))
-    resolved_calls = sum(
-        bool(edge.get("targets")) and not edge.get("dynamic")
-        for edge in call_edges
-        if isinstance(edge, dict)
-    )
+    opaque_effects = [
+        command_id
+        for command_id, command in command_records
+        if not _command_transfer_complete(command)
+        or audit.transfers.get(command_id) == "opaque"
+        or (
+            (semantics := command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            ))
+            and semantics.get("data_effects")
+            and audit.data_effects.get(command_id, ("opaque", ()))[0] == "opaque"
+        )
+    ]
     unresolved_scopes = sorted({
         str(scope)
         for dependency in dependencies
@@ -3835,9 +4250,10 @@ def analyze_auto_export(
             "newer_editor": newer_editor,
             "shape_coverage": {
                 "commands": len(all_commands),
-                "covered": len(all_commands) - len(semantic_missing),
+                "covered": len(all_commands) - len(shape_missing),
+                "missing": len(shape_missing),
                 "ratio": (
-                    (len(all_commands) - len(semantic_missing)) / len(all_commands)
+                    (len(all_commands) - len(shape_missing)) / len(all_commands)
                     if all_commands else 1.0
                 ),
             },
@@ -3851,20 +4267,35 @@ def analyze_auto_export(
                 ),
             },
             "cfg_coverage": {
-                "control_commands": len(control_commands),
+                "control_commands": len(control_records),
                 "covered": covered_control_commands,
-                "missing": len(control_commands) - covered_control_commands,
+                "missing": len(control_records) - covered_control_commands,
                 "ratio": (
-                    covered_control_commands / len(control_commands)
-                    if control_commands else 1.0
+                    covered_control_commands / len(control_records)
+                    if control_records else 1.0
                 ),
             },
-            "call_summary_coverage": {
+            "call_target_coverage": {
                 "calls": len(call_edges),
-                "resolved": resolved_calls,
-                "conservative": len(call_edges) - resolved_calls,
-                "ratio": resolved_calls / len(call_edges) if call_edges else 1.0,
+                "exact": resolved_calls,
+                "conservative": conservative_calls,
+                "missing": len(call_edges) - resolved_calls - conservative_calls,
+                "ratio": (
+                    (resolved_calls + conservative_calls) / len(call_edges)
+                    if call_edges else 1.0
+                ),
             },
+            "data_effect_coverage": {
+                "commands": len(data_effect_records),
+                "covered": covered_data_effects,
+                "missing": len(data_effect_records) - covered_data_effects,
+                "ratio": (
+                    covered_data_effects / len(data_effect_records)
+                    if data_effect_records else 1.0
+                ),
+            },
+            "opaque_effects": len(opaque_effects),
+            "opaque_locations": sorted(set(opaque_effects))[:50],
         },
         "input_hash": input_hash,
         "output_hash": hash_directory(root),
@@ -3880,6 +4311,19 @@ def analyze_auto_export(
         "blocking_issues": blocking,
         "event_summaries": event_summaries,
         "call_graph": call_graph,
+        "runtime_semantics": {
+            "transfers": dict(sorted(audit.transfers.items())),
+            "cfg": dict(sorted(audit.cfg.items())),
+            "cfg_edges": [list(edge) for edge in sorted(audit.cfg_edges)],
+            "calls": {
+                key: {"status": value[0], "targets_or_scopes": list(value[1])}
+                for key, value in sorted(audit.calls.items())
+            },
+            "data_effects": {
+                key: {"status": value[0], "scopes": list(value[1])}
+                for key, value in sorted(audit.data_effects.items())
+            },
+        },
         "reachable_scopes": unresolved_scopes,
         "usage_by_key": usage_by_key,
         "safe_to_translate": proven_display,
@@ -3957,6 +4401,91 @@ def _scope_keys(
             cache[scope] = frozenset(matched)
         selected.update(matched)
     return selected
+
+
+def _condition_truth_signature(dependency: dict[str, object]) -> tuple[object, ...]:
+    operator = str(dependency.get("operator", ""))
+    if operator not in {"equals", "not_equals", "contains", "starts_with"}:
+        return ("opaque", operator)
+    left = tuple(map(str, dependency.get("left_values", ())))
+    right = tuple(map(str, dependency.get("right_values", ())))
+    if not right and not dependency.get("right_is_variable"):
+        right = (str(dependency.get("literal", "")),)
+    if not left or not right:
+        return ("dynamic", operator)
+    return (
+        "values",
+        operator,
+        tuple(
+            sorted(
+                {
+                    _safety_predicate(operator, left_value, right_value)
+                    for left_value in left
+                    for right_value in right
+                }
+            )
+        ),
+    )
+
+
+def _semantic_replay_signature(report: dict[str, object]) -> dict[str, object]:
+    runtime = report.get("runtime_semantics", {})
+    if not isinstance(runtime, dict):
+        raise ValueError("Editor 分析报告缺少运行语义账本。")
+    dependencies = report.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise ValueError("Editor 分析报告缺少依赖记录。")
+    conditions: list[tuple[object, ...]] = []
+    resources: list[tuple[object, ...]] = []
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            raise ValueError("Editor 分析报告包含损坏的依赖记录。")
+        identity = (
+            dependency.get("auto_file"),
+            dependency.get("event_type"),
+            dependency.get("event_id"),
+            dependency.get("page"),
+            dependency.get("command"),
+            dependency.get("string_index"),
+        )
+        kind = str(dependency.get("kind", ""))
+        if kind == "condition":
+            conditions.append((*identity, _condition_truth_signature(dependency)))
+        elif kind == "resource":
+            values = dependency.get("resource_values", ())
+            resources.append((*identity, tuple(sorted(map(str, values)))))
+    return {
+        "cfg_edges": tuple(
+            sorted(tuple(map(str, edge)) for edge in runtime.get("cfg_edges", ()))
+        ),
+        "calls": tuple(
+            sorted(
+                (
+                    str(key),
+                    str(value.get("status", "")),
+                    tuple(map(str, value.get("targets_or_scopes", ()))),
+                )
+                for key, value in dict(runtime.get("calls", {})).items()
+                if isinstance(value, dict)
+            )
+        ),
+        "data_effects": tuple(
+            sorted(
+                (
+                    str(key),
+                    str(value.get("status", "")),
+                    tuple(map(str, value.get("scopes", ()))),
+                )
+                for key, value in dict(runtime.get("data_effects", {})).items()
+                if isinstance(value, dict)
+            )
+        ),
+        "conditions": tuple(sorted(conditions, key=repr)),
+        "resources": tuple(sorted(resources, key=repr)),
+        "opaque_effects": int(
+            dict(report.get("command_catalog", {})).get("opaque_effects", 0)
+        ),
+    }
 
 
 def analyze_translation_safety(
@@ -4213,13 +4742,71 @@ def analyze_translation_safety(
             elif set(map(str, usage_by_key.get(key, ()))) <= {"logic"}:
                 safe.add(key)
 
+    for key in base_protected:
+        reasons.setdefault(key, set()).add("not_proven_safe")
+
+    editor_data = analysis.get("editor", {})
+    if not isinstance(editor_data, dict):
+        raise ValueError("Editor 分析报告缺少 Editor 身份。")
+    editor_version = str(editor_data.get("version", ""))
+    editor = EditorInfo(
+        Path(str(editor_data.get("path", "Editor.exe"))),
+        editor_version,
+        tuple(int(value) for value in editor_version.split(".") if value.isdigit()),
+        str(editor_data.get("sha256", "")),
+    )
+    baseline_report = analyze_auto_export(
+        root,
+        items,
+        editor,
+        input_hash=str(analysis.get("input_hash", "")),
+    )
+    original_signature = _semantic_replay_signature(baseline_report)
+    replay_report = baseline_report
+    replay_signature = original_signature
+    replay_differences: list[str] = []
     iterations = 0
     while True:
         protected_before = len(forced)
         for dependency in dependencies:
             evaluate_dependency(dependency)
+        active_candidates = {
+            key: final_value(key)
+            for key in candidates
+            if final_value(key) != originals[key]
+        }
+        replay_report = analyze_auto_export(
+            root,
+            items,
+            editor,
+            input_hash=str(analysis.get("input_hash", "")),
+            candidate_values=active_candidates,
+        )
+        replay_signature = _semantic_replay_signature(replay_report)
+        replay_differences = [
+            field
+            for field in (
+                "cfg_edges",
+                "calls",
+                "data_effects",
+                "conditions",
+                "resources",
+                "opaque_effects",
+            )
+            if original_signature[field] != replay_signature[field]
+        ]
+        if replay_differences:
+            risky = {
+                key
+                for key in active_candidates
+                if set(map(str, usage_by_key.get(key, ()))) != {"display_only"}
+            }
+            # A display-only candidate changing semantics means the usage proof
+            # itself is incomplete. Preserve all active candidates rather than
+            # letting a mislabeled key pass the safety gate.
+            protect(risky or active_candidates, "semantic_replay_difference")
         iterations += 1
-        if len(forced) == protected_before:
+        if len(forced) == protected_before and not replay_differences:
             break
         if iterations > len(candidates) + 1:
             raise RuntimeError("WOLF 候选译文安全保护集合无法收敛。")
@@ -4230,7 +4817,7 @@ def analyze_translation_safety(
     unresolved = sorted(
         {
             str(scope)
-            for dependency in dependencies
+            for dependency in replay_report.get("dependencies", [])
             if isinstance(dependency, dict) and dependency.get("status") != "resolved"
             for scope in dependency.get("unresolved_scopes", ())
         }
@@ -4242,7 +4829,7 @@ def analyze_translation_safety(
             f"{first}（{', '.join(sorted(reasons.get(first, {'not_proven_safe'})))}）。"
         )
     return {
-        "schema": 1,
+        "schema": TRANSLATION_SAFETY_SCHEMA,
         "safe_to_translate": sorted(safe),
         "keep_original": sorted(protected),
         "unresolved_scopes": unresolved,
@@ -4251,7 +4838,21 @@ def analyze_translation_safety(
             "candidate_changes": len(candidates),
             "safe_changes": len(safe),
             "protected_changes": len(protected),
-            "control_flow_equivalent": True,
+            "control_flow_equivalent": (
+                original_signature["cfg_edges"] == replay_signature["cfg_edges"]
+                and original_signature["calls"] == replay_signature["calls"]
+            ),
+            "data_effects_equivalent": (
+                original_signature["data_effects"]
+                == replay_signature["data_effects"]
+            ),
+            "condition_results_equivalent": (
+                original_signature["conditions"] == replay_signature["conditions"]
+            ),
+            "resource_targets_equivalent": (
+                original_signature["resources"] == replay_signature["resources"]
+            ),
+            "differences": replay_differences,
         },
         "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
     }

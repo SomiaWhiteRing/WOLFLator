@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-CATALOG_SCHEMA = 4
+CATALOG_SCHEMA = 5
 VERIFIED_EDITOR_VERSION = "3.713.2026.718"
 VERIFIED_EDITOR_SHA256 = "2ce5639f669643ded07a9390ef05054b8f95acbfa1b4dc1f4936246df5eae0c3"
 
@@ -15,8 +15,8 @@ EVIDENCE_RANK = {
 
 # BEGIN WOLFLATOR EDITOR CALIBRATION
 # Generated only from official Editor save/reopen/copy and Auto evidence.
-GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {105: ((0, 0),), 125: ((1, 0), (2, 0), (3, 0)), 177: ((0, 0),), 178: ((0, 0),), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 281: ((3, 0),), 402: ((1, 0),)}
-GENERATED_MANUAL_EVIDENCE: dict[int, str] = {105: 'roundtrip', 125: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 281: 'roundtrip', 402: 'roundtrip'}
+GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {105: ((0, 0),), 125: ((1, 0), (2, 0), (3, 0)), 177: ((0, 0),), 178: ((0, 0),), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 252: ((5, 4),), 255: ((5, 4),), 257: ((5, 4),), 281: ((3, 0),), 300: ((5, 3),), 402: ((1, 0),)}
+GENERATED_MANUAL_EVIDENCE: dict[int, str] = {105: 'roundtrip', 125: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 252: 'differential', 255: 'differential', 257: 'differential', 281: 'roundtrip', 300: 'differential', 402: 'roundtrip'}
 # END WOLFLATOR EDITOR CALIBRATION
 
 # The free 3.713 command inventory. ProFeature (1000) is deliberately absent.
@@ -72,6 +72,9 @@ COMMAND_CATALOG: dict[int, tuple[str, str, str]] = {
     242: ("OverwriteMapChips", "no_write", "roundtrip"),
     250: ("Database", "database", "runtime_verified"),
     251: ("ImportDatabase", "database", "manual"),
+    252: ("DatabaseTransform", "database", "differential"),
+    255: ("XYArray", "database", "differential"),
+    257: ("XYArrayTransform", "database", "differential"),
     270: ("Party", "no_write", "roundtrip"),
     280: ("MapEffect", "no_write", "roundtrip"),
     281: ("ScrollScreen", "no_write", "manual"),
@@ -127,20 +130,27 @@ CALIBRATED_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {
     222: ((4, 0),),
     242: ((6, 0),),
     250: ((4, 4), (5, 0), (5, 4)),
+    252: ((5, 4),),
+    255: ((5, 4),),
+    257: ((5, 4),),
     270: ((1, 0), (3, 0)),
     280: ((2, 0),),
     290: ((7, 0), (7, 1), (8, 0)),
-    300: ((2, 1), (3, 1), (4, 1), (4, 2), (5, 1), (5, 2), (6, 1), (6, 2), (6, 4), (7, 1), (7, 2), (8, 1), (8, 2), (8, 3), (9, 1), (9, 2), (9, 3), (10, 1), (10, 5), (12, 1), (12, 6), (13, 1)),
+    300: ((2, 1), (3, 1), (4, 1), (4, 2), (5, 1), (5, 2), (5, 3), (6, 1), (6, 2), (6, 4), (7, 1), (7, 2), (8, 1), (8, 2), (8, 3), (9, 1), (9, 2), (9, 3), (10, 1), (10, 5), (12, 1), (12, 6), (13, 1)),
     401: ((1, 0),),
     420: ((1, 0),),
     421: ((1, 0),),
     498: ((0, 0),),
     499: ((0, 0),),
 }
-CALIBRATED_SHAPES.update(GENERATED_MANUAL_SHAPES)
+for _opcode, _shapes in GENERATED_MANUAL_SHAPES.items():
+    CALIBRATED_SHAPES[_opcode] = tuple(
+        sorted(set(CALIBRATED_SHAPES.get(_opcode, ())) | set(_shapes))
+    )
 for _opcode, _evidence in GENERATED_MANUAL_EVIDENCE.items():
     _name, _effect, _old_evidence = COMMAND_CATALOG[_opcode]
-    COMMAND_CATALOG[_opcode] = (_name, _effect, _evidence)
+    if EVIDENCE_RANK[_evidence] > EVIDENCE_RANK[_old_evidence]:
+        COMMAND_CATALOG[_opcode] = (_name, _effect, _evidence)
 
 PRO_OPCODE = 1000
 SPECIALIZED_OPCODES = frozenset({112, 121, 122, 124, 210, 221, 250, 300})
@@ -162,6 +172,9 @@ STRING_PARAMETER_ROLES: dict[int, tuple[str, ...]] = {
     213: ("label_target",),
     250: ("database_selector_or_value",),
     251: ("file_path",),
+    252: ("database_selector_or_value",),
+    255: ("array_selector_or_value",),
+    257: ("array_selector_or_value",),
     290: ("resource_path",),
     300: ("common_event_name", "call_argument"),
 }
@@ -177,6 +190,79 @@ _TRANSFER_BY_EFFECT = {
     "event_call": "event_call",
     "opaque": "opaque",
 }
+
+_TRANSFER_BY_OPCODE = {
+    102: "choice",
+    111: "numeric_condition",
+    112: "string_condition",
+    121: "set_number",
+    122: "set_string",
+    123: "runtime_number",
+    124: "runtime_value",
+    170: "loop",
+    171: "break_loop",
+    172: "break_event",
+    173: "terminate_event",
+    174: "terminate_event",
+    175: "terminate_event",
+    176: "continue_loop",
+    179: "counted_loop",
+    210: "call_event",
+    211: "reserve_event",
+    212: "label",
+    213: "jump_label",
+    221: "runtime_string",
+    250: "database_operation",
+    251: "database_import",
+    252: "database_transform",
+    255: "xy_array",
+    257: "xy_array_transform",
+    300: "call_event_by_name",
+    401: "branch_marker",
+    402: "branch_marker",
+    420: "branch_marker",
+    421: "branch_marker",
+    498: "loop_end",
+    499: "branch_end",
+}
+
+_CONTROL_BY_OPCODE = {
+    0: "blank",
+    102: "choice",
+    111: "condition",
+    112: "condition",
+    170: "loop",
+    171: "loop_exit",
+    172: "event_exit",
+    173: "event_exit",
+    174: "event_exit",
+    175: "event_exit",
+    176: "loop_continue",
+    179: "loop",
+    212: "label",
+    213: "jump",
+    401: "branch",
+    402: "branch",
+    420: "branch",
+    421: "branch",
+    498: "loop_end",
+    499: "branch_end",
+}
+
+
+def _data_effects(opcode: int, effect: str, string_roles: list[str]) -> list[str]:
+    effects: list[str] = []
+    if effect == "numeric_write":
+        effects.append("number")
+    elif effect in {"string_read", "string_write"}:
+        effects.append("string")
+    elif effect == "database":
+        effects.append("database")
+    elif effect == "event_call":
+        effects.extend(("event", "global", "database"))
+    if any(role in {"resource_path", "file_path"} for role in string_roles):
+        effects.append("resource")
+    return effects
 
 
 def _roles(count: int, *names: str) -> list[str]:
@@ -216,7 +302,7 @@ def _integer_roles(opcode: int, int_count: int, effect: str) -> list[str]:
         return _roles(int_count, "reserved_common_event_target", "call_flags")
     if opcode in {212, 213}:
         return []
-    if opcode == 250:
+    if opcode in {250, 252}:
         return _roles(
             int_count,
             "database_type_selector",
@@ -224,6 +310,15 @@ def _integer_roles(opcode: int, int_count: int, effect: str) -> list[str]:
             "database_field_selector",
             "database_flags",
             "destination_variable",
+        )
+    if opcode in {255, 257}:
+        return _roles(
+            int_count,
+            "array_selector",
+            "array_x",
+            "array_y",
+            "array_flags",
+            "array_value_or_destination",
         )
     if opcode == 251:
         return _roles(
@@ -299,6 +394,54 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
         "record": '[251][5,4]<0>(0,0,0,0,1)("CAL-251-B.csv","","","")',
         "differential": "filename",
     },
+    {
+        "id": "CAL-252-DB-A",
+        "opcode": 252,
+        "record": '[252][5,4]<0>(0,0,0,0,1)("","","","")',
+        "differential": "database_value",
+    },
+    {
+        "id": "CAL-252-DB-B",
+        "opcode": 252,
+        "record": '[252][5,4]<0>(0,0,0,0,2)("","","","")',
+        "differential": "database_value",
+    },
+    {
+        "id": "CAL-255-XY-A",
+        "opcode": 255,
+        "record": '[255][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-A","","")',
+        "differential": "array_name",
+    },
+    {
+        "id": "CAL-255-XY-B",
+        "opcode": 255,
+        "record": '[255][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-B","","")',
+        "differential": "array_name",
+    },
+    {
+        "id": "CAL-257-XY-A",
+        "opcode": 257,
+        "record": '[257][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-A","","")',
+        "differential": "array_name",
+    },
+    {
+        "id": "CAL-257-XY-B",
+        "opcode": 257,
+        "record": '[257][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-B","","")',
+        "differential": "array_name",
+    },
+    {
+        "id": "CAL-300-ARGS-A",
+        "opcode": 300,
+        "record": '[300][5,3]<0>(0,12321,0,0,0)("選択肢の用意","A","")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-ARGS-B",
+        "opcode": 300,
+        "record": '[300][5,3]<0>(0,12321,0,0,0)("選択肢の用意","B","")',
+        "differential": "call_argument",
+    },
     {"id": "CAL-281-BASE", "opcode": 281, "record": "[281][3,0]<0>(0,0,0)()"},
     {"id": "CAL-402-BASE", "opcode": 402, "record": "[402][1,0]<0>(0)()"},
 )
@@ -330,16 +473,20 @@ def command_semantics(
         return None
     effect = item[1]
     roles = STRING_PARAMETER_ROLES.get(opcode, ())
+    string_roles = [
+        roles[min(index, len(roles) - 1)] if roles else "display_or_metadata"
+        for index in range(string_count)
+    ]
     return {
         "opcode": opcode,
         "shape": [int_count, string_count],
         "effect": effect,
-        "transfer": _TRANSFER_BY_EFFECT[effect],
+        "transfer": _TRANSFER_BY_OPCODE.get(opcode, _TRANSFER_BY_EFFECT[effect]),
+        "control": _CONTROL_BY_OPCODE.get(opcode),
         "integer_roles": _integer_roles(opcode, int_count, effect),
-        "string_roles": [
-            roles[min(index, len(roles) - 1)] if roles else "display_or_metadata"
-            for index in range(string_count)
-        ],
+        "string_roles": string_roles,
+        "data_effects": _data_effects(opcode, effect, string_roles),
+        "shape_complete": True,
         "semantic_complete": True,
         "reads_variables": effect in {"numeric_write", "string_read", "string_write", "condition", "database", "event_call"},
         "writes_variables": effect in {"numeric_write", "string_write", "database", "event_call"},

@@ -841,18 +841,24 @@ class Pipeline:
             shape_coverage = catalog.get("shape_coverage", {})
             semantic_coverage = catalog.get("semantic_coverage", {})
             cfg_coverage = catalog.get("cfg_coverage", {})
+            call_coverage = catalog.get("call_target_coverage", {})
+            data_coverage = catalog.get("data_effect_coverage", {})
             self.log(
                 "Editor 安全分析："
                 f"命令形状覆盖 {shape_coverage.get('covered', 0)}/{shape_coverage.get('commands', 0)}，"
                 f"语义覆盖 {semantic_coverage.get('covered', 0)}/{semantic_coverage.get('commands', 0)}，"
                 f"控制流覆盖 {cfg_coverage.get('covered', 0)}/{cfg_coverage.get('control_commands', 0)}，"
+                f"调用目标覆盖 {call_coverage.get('exact', 0)} 精确 + "
+                f"{call_coverage.get('conservative', 0)} 保守 / {call_coverage.get('calls', 0)}，"
+                f"数据副作用覆盖 {data_coverage.get('covered', 0)}/{data_coverage.get('commands', 0)}，"
+                f"不透明副作用 {catalog.get('opaque_effects', 0)}，"
                 f"事件摘要 {len(editor_analysis.get('event_summaries', []))} 个，"
                 f"调用边 {len(call_graph.get('edges', []))} 条，"
                 f"递归 SCC {len(call_graph.get('recursive_sccs', []))} 个。"
             )
             if editor_result.warning_count:
                 self.warning(
-                    f"Editor 事件分析完成，但有 {editor_result.warning_count} 类不透明命令；"
+                    f"Editor 事件分析完成，但有 {editor_result.warning_count} 项范围外或不透明语义；"
                     "若它们进入翻译相关逻辑，导入时会自动保留影响范围内的原文。"
                 )
 

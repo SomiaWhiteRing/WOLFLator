@@ -18,6 +18,7 @@ from models import (
     TranslationItem,
 )
 from pipeline import Pipeline, create_project, load_manifest
+from wolf_editor import EditorInfo, analyze_auto_export
 from wolf_tools import dump_items, full_export_scope, hash_directory, load_items
 
 
@@ -53,26 +54,41 @@ class PipelineTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         auto_dir = pipeline.artifacts_dir / "editor-auto"
         auto_dir.mkdir(parents=True, exist_ok=True)
-        (auto_dir / "fixture.txt").write_text("fixture", encoding="utf-8")
-        path.write_text(
-            json.dumps(
-                {
-                    "schema": 4,
-                    "output_hash": hash_directory(auto_dir),
-                    "dependencies": [],
-                    "blocking_issues": [],
-                    "unknown_commands": [],
-                    "usage_by_key": {
-                        "plain": ["display_only"],
-                        "control": ["display_only"],
-                        "text": ["display_only"],
-                    },
-                    "safe_to_translate": ["plain", "control", "text"],
-                },
-                ensure_ascii=False,
+        basic = auto_dir / "BasicData"
+        basic.mkdir()
+        (basic / "CommonEvent.dat.Auto.txt").write_text(
+            "\n".join(
+                (
+                    "[COMMON_EVENT_TEXT_OUTPUT]",
+                    "COMMON_EVENT_NUM=1",
+                    "COMMON_ID=1",
+                    "COMMON_NAME=Fixture",
+                    "COMMAND_NUM=3",
+                    "WoditorEvCOMMAND_START",
+                    '[101][0,1]<0>()("甲")',
+                    '[101][0,1]<0>()("\\\\C[1]乙")',
+                    '[101][0,1]<0>()("原文")',
+                    "WoditorEvCOMMAND_END",
+                )
             ),
             encoding="utf-8",
         )
+        items_path = pipeline.manifest.version.stage(Stage.EXTRACT).artifacts.get("items")
+        items = load_items(items_path) if items_path else []
+        editor_path = pipeline.artifacts_dir / "Editor.exe"
+        editor_path.write_bytes(b"editor")
+        report = analyze_auto_export(
+            auto_dir,
+            items,
+            EditorInfo(
+                editor_path,
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            ),
+            input_hash="fixture",
+        )
+        path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
         pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_analysis"] = str(path)
         pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["editor_auto_dir"] = str(auto_dir)
         return path
@@ -88,11 +104,11 @@ class PipelineTests(unittest.TestCase):
         )
         make_game(pipeline.work_dir)
         items = [
-            TranslationItem(key="plain", original="甲", code="COMMON-1"),
+            TranslationItem(key="plain", original="甲", code="COMMON-1-0-0"),
             TranslationItem(
                 key="control",
                 original=r"\C[1]乙",
-                code="COMMON-2",
+                code="COMMON-1-1-0",
                 control_signature=[r"\C[1]"],
             ),
         ]
@@ -239,7 +255,7 @@ class PipelineTests(unittest.TestCase):
                 TranslationItem(key=f"font-{index}", original=f"原字体{index}", code=f"BASICDATA-{index + 3}")
                 for index in range(4)
             ]
-            items.append(TranslationItem(key="text", original="原文", translation="中文∟", code="COMMON-1"))
+            items.append(TranslationItem(key="text", original="原文", translation="中文∟", code="COMMON-1-2-0"))
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts["items"] = str(items_path)
             workbook_path = pipeline.artifacts_dir / "source.xlsx"
@@ -396,7 +412,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pipeline = self._translation_pipeline(root)
-            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1")]
+            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1-0-0")]
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
                 "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
@@ -437,7 +453,7 @@ class PipelineTests(unittest.TestCase):
             pipeline = self._translation_pipeline(root)
             items = [
                 TranslationItem(
-                    key="plain", original="甲", translation="译文", code="COMMON-1"
+                    key="plain", original="甲", translation="译文", code="COMMON-1-0-0"
                 )
             ]
             items_path = dump_items(
@@ -483,7 +499,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pipeline = self._translation_pipeline(root)
-            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1")]
+            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1-0-0")]
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
                 "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
@@ -498,7 +514,7 @@ class PipelineTests(unittest.TestCase):
             runner.diagnostics = [
                 {
                     "mode": "TRANSLATE",
-                    "code": "COMMON-1",
+                    "code": "COMMON-1-0-0",
                     "source": "normalized-source",
                     "message": "warning",
                 }

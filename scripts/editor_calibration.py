@@ -729,6 +729,17 @@ def _validate_manual_cases(copied: str) -> list[dict[str, object]]:
     event_b = official.get("CAL-211-RESERVE-B", "")
     if not event_a or event_a.replace("(0,0)", "(1,0)") != event_b:
         raise CalibrationError("opcode 211 事件 ID 差分未被 Editor 原样保留。")
+    differential_pairs = (
+        ("CAL-252-DB-A", "CAL-252-DB-B", ",1)(", ",2)(", "opcode 252 数据库操作"),
+        ("CAL-255-XY-A", "CAL-255-XY-B", "CAL-ARRAY-A", "CAL-ARRAY-B", "opcode 255 XY 数组操作"),
+        ("CAL-257-XY-A", "CAL-257-XY-B", "CAL-ARRAY-A", "CAL-ARRAY-B", "opcode 257 XY 数组操作"),
+        ("CAL-300-ARGS-A", "CAL-300-ARGS-B", '"A"', '"B"', "opcode 300 公共事件参数"),
+    )
+    for left_id, right_id, old, new, label in differential_pairs:
+        left = official.get(left_id, "")
+        right = official.get(right_id, "")
+        if not left or left.replace(old, new) != right:
+            raise CalibrationError(f"{label}差分未被 Editor 原样保留。")
     return evidence
 
 

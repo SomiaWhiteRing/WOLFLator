@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,7 @@ from wolf_tools import (
     SUPPORT_DIR,
     _content_category,
     _console_delta,
+    _dismiss_process_dialogs,
     _official_config_text,
     _pe_import_name_offset,
     _process_startupinfo,
@@ -125,6 +127,92 @@ def make_workbook(path: Path) -> Path:
 
 
 class WorkbookTests(unittest.TestCase):
+    def test_calibrated_database_and_array_commands_have_conservative_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Safety",
+                        "COMMAND_NUM=4",
+                        "WoditorEvCOMMAND_START",
+                        '[252][5,4]<0>(0,0,0,0,1)("","","","")',
+                        '[255][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-A","","")',
+                        '[257][5,4]<0>(0,0,0,66304,1)("","CAL-ARRAY-A","","")',
+                        '[300][5,3]<0>(0,12321,0,0,0)("選択肢の用意","A","")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            editor = EditorInfo(
+                root / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            report = analyze_auto_export(
+                root / "Auto", [], editor, input_hash="input"
+            )
+            catalog = report["command_catalog"]
+            for name in (
+                "shape_coverage",
+                "semantic_coverage",
+                "cfg_coverage",
+                "call_target_coverage",
+                "data_effect_coverage",
+            ):
+                self.assertEqual(1.0, catalog[name]["ratio"], name)
+            self.assertEqual(0, catalog["opaque_effects"])
+            effects = report["runtime_semantics"]["data_effects"]
+            self.assertEqual(4, len(effects))
+            self.assertTrue(
+                all(
+                    effect["status"] == "conservative"
+                    for command_id, effect in effects.items()
+                    if not command_id.endswith(":4")
+                )
+            )
+            last_effect = next(
+                value for key, value in effects.items() if key.endswith(":4")
+            )
+            self.assertEqual("exact", last_effect["status"])
+
+    def test_known_shape_with_illegal_database_flags_is_not_semantically_covered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Invalid",
+                        "COMMAND_NUM=1",
+                        "WoditorEvCOMMAND_START",
+                        '[250][5,4]<0>(0,0,0,3840,0)("","","","")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            editor = EditorInfo(
+                root / "Editor.exe", "3.713.2026.718", (3, 713, 2026, 718), "a" * 64
+            )
+            report = analyze_auto_export(root / "Auto", [], editor, input_hash="input")
+            catalog = report["command_catalog"]
+            self.assertEqual(1.0, catalog["shape_coverage"]["ratio"])
+            self.assertEqual(0.0, catalog["semantic_coverage"]["ratio"])
+            self.assertEqual(0.0, catalog["data_effect_coverage"]["ratio"])
+            self.assertEqual(1, catalog["opaque_effects"])
+
     def test_official_external_row_names_are_classified_as_external(self):
         for code, type_name in (
             ("TXTFILE-1", "Text File"),
@@ -675,7 +763,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 4"):
+            with self.assertRaisesRegex(ValueError, "schema 5"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -702,7 +790,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 4,
+                "schema": 5,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -1058,7 +1146,7 @@ class WorkbookAndFontTests(unittest.TestCase):
             editor_path.write_bytes(b"editor")
             editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
             report = analyze_auto_export(auto, items, editor, input_hash="input")
-            self.assertEqual(4, report["schema"])
+            self.assertEqual(5, report["schema"])
             self.assertIn("event_summaries", report)
             self.assertIn("call_graph", report)
             self.assertNotIn("translated_replay", report)
@@ -1152,9 +1240,100 @@ class WorkbookAndFontTests(unittest.TestCase):
 
             report = analyze_auto_export(root / "Auto", [], editor, input_hash="input")
 
-            self.assertEqual(4, report["schema"])
+            self.assertEqual(5, report["schema"])
             self.assertFalse(
                 any("固定点超过" in issue["reason"] for issue in report["blocking_issues"])
+            )
+
+    def test_semantic_ledger_covers_choice_database_and_no_return_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=2",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Caller",
+                        "COMMAND_NUM=7",
+                        "WoditorEvCOMMAND_START",
+                        '[102][1,2]<0>(0)("甲","乙")',
+                        "[401][1,0]<0>(0)()",
+                        "[250][5,0]<1>(0,0,0,0,1600000)()",
+                        "[210][2,0]<1>(500002,0)()",
+                        "[401][1,0]<0>(1)()",
+                        '[101][0,1]<1>()("分支乙")',
+                        "[499][0,0]<0>()()",
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=2",
+                        "COMMON_NAME=Callee",
+                        "COMMAND_NUM=1",
+                        "WoditorEvCOMMAND_START",
+                        '[122][2,1]<0>(2000000,0)("全局值")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (basic / "CDataBase.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=0",
+                        "ITEM_NUM=1",
+                        "DATATYPE_0=0",
+                        "DATA_NUM=1",
+                        "TYPENAME=Numbers",
+                        "ITEMNAME_NUM=1",
+                        "ITEMNAME0=Value",
+                        "<<--CSV_START-->>",
+                        '"Value",',
+                        '"7","row",',
+                        "<<--CSV_END-->>",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            report = analyze_auto_export(
+                root / "Auto",
+                [],
+                EditorInfo(
+                    editor_path,
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "a" * 64,
+                ),
+                input_hash="input",
+            )
+
+            catalog = report["command_catalog"]
+            for field in (
+                "shape_coverage",
+                "semantic_coverage",
+                "cfg_coverage",
+                "call_target_coverage",
+                "data_effect_coverage",
+            ):
+                self.assertEqual(1.0, catalog[field]["ratio"], field)
+            self.assertEqual(0, catalog["opaque_effects"])
+            choice_edges = [
+                edge
+                for edge in report["runtime_semantics"]["cfg_edges"]
+                if edge[0].endswith(":1")
+            ]
+            self.assertGreaterEqual(len(choice_edges), 2)
+            self.assertTrue(
+                any(
+                    dependency["kind"] == "call"
+                    and dependency["status"] == "dynamic"
+                    and "common:2" in dependency["unresolved_scopes"]
+                    for dependency in report["dependencies"]
+                )
             )
 
     def test_translation_safety_requires_positive_display_proof(self):
@@ -1547,6 +1726,26 @@ class ControlTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows dialog contract")
+    def test_hidden_official_dialog_is_captured_and_dismissed(self):
+        import ctypes
+
+        thread = threading.Thread(
+            target=lambda: ctypes.windll.user32.MessageBoxW(
+                0, "Map Size Error! [Size 0 Error]", "Error", 0
+            )
+        )
+        thread.start()
+        dialogs = []
+        for _ in range(50):
+            dialogs = _dismiss_process_dialogs(os.getpid())
+            if dialogs:
+                break
+            time.sleep(0.02)
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertIn("Map Size Error! [Size 0 Error]", dialogs[0])
+
     def test_slow_process_warning_fires_once_without_stopping_process(self):
         warnings = []
         result = run_process(
@@ -1560,12 +1759,32 @@ class ProcessTests(unittest.TestCase):
         self.assertGreaterEqual(warnings[0], 0.05)
 
     def test_pe_import_name_offset_finds_named_import(self):
-        offset = _pe_import_name_offset(
-            sys.executable, "KERNEL32.dll", "GetProcAddress"
-        )
-        self.assertEqual(b"GetProcAddress\0", Path(sys.executable).read_bytes()[offset : offset + 15])
-        with self.assertRaisesRegex(ValueError, "未导入"):
-            _pe_import_name_offset(sys.executable, "KERNEL32.dll", "DefinitelyMissing")
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "fixture.exe"
+            data = bytearray(0x800)
+            struct.pack_into("<I", data, 0x3C, 0x80)
+            data[0x80:0x84] = b"PE\0\0"
+            struct.pack_into("<HHIIIHH", data, 0x84, 0x14C, 1, 0, 0, 0, 0xE0, 0)
+            optional = 0x98
+            struct.pack_into("<H", data, optional, 0x10B)
+            struct.pack_into("<I", data, optional + 96 + 8, 0x1000)
+            section = optional + 0xE0
+            struct.pack_into("<IIII", data, section + 8, 0x400, 0x1000, 0x400, 0x400)
+            struct.pack_into("<IIIII", data, 0x400, 0x1040, 0, 0, 0x1080, 0x1060)
+            struct.pack_into("<II", data, 0x440, 0x10A0, 0)
+            data[0x480:0x48D] = b"KERNEL32.dll\0"
+            data[0x4A0:0x4A2] = b"\0\0"
+            data[0x4A2:0x4B1] = b"GetProcAddress\0"
+            executable.write_bytes(data)
+
+            offset = _pe_import_name_offset(
+                executable, "KERNEL32.dll", "GetProcAddress"
+            )
+            self.assertEqual(0x4A2, offset)
+            with self.assertRaisesRegex(ValueError, "未导入"):
+                _pe_import_name_offset(
+                    executable, "KERNEL32.dll", "DefinitelyMissing"
+                )
 
     def test_silent_official_executable_does_not_modify_source(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -328,6 +328,63 @@ CONSOLE_CAPTURE_ARG = "--console-capture-worker"
 OFFICIAL_MISALIGNED_MESSAGE = "The command line seems to be misaligned."
 
 
+class OfficialToolDialogError(RuntimeError):
+    def __init__(self, dialogs: list[str]):
+        self.dialogs = tuple(dialogs)
+        super().__init__("官方工具弹出错误对话框：" + "；".join(dialogs))
+
+
+def _dismiss_process_dialogs(process_id: int) -> list[str]:
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    dialogs: list[str] = []
+
+    def window_text(window) -> str:
+        length = user32.GetWindowTextLengthW(window)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(window, buffer, length + 1)
+        return buffer.value.strip()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit_window(window, _parameter):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value != process_id:
+            return True
+        class_name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(window, class_name, len(class_name))
+        if class_name.value != "#32770":
+            return True
+        title = window_text(window)
+        body: list[str] = []
+        buttons: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def visit_child(child, _child_parameter):
+            child_class = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(child, child_class, len(child_class))
+            text = window_text(child)
+            if child_class.value == "Button":
+                buttons.append(child)
+            elif text:
+                body.append(text)
+            return True
+
+        user32.EnumChildWindows(window, visit_child, 0)
+        message = " | ".join(part for part in (title, *body) if part)
+        dialogs.append(message or "未命名错误对话框")
+        if buttons:
+            user32.PostMessageW(buttons[0], 0x00F5, 0, 0)  # BM_CLICK
+        return True
+
+    user32.EnumWindows(visit_window, 0)
+    return dialogs
+
+
 def _console_capture_command(process_id: int, snapshot_path: Path) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, CONSOLE_CAPTURE_ARG, str(process_id), str(snapshot_path)]
@@ -603,9 +660,15 @@ def run_process(
         reader.start()
     finished_streams: set[str] = set()
     slow_warning_sent = False
+    seen_dialogs: set[str] = set()
     try:
         while process.poll() is None or len(finished_streams) < len(readers):
             read_console_snapshot()
+            if capture_console and process.poll() is None:
+                for dialog in _dismiss_process_dialogs(process.pid):
+                    if dialog not in seen_dialogs:
+                        seen_dialogs.add(dialog)
+                        _emit_log(detail, f"process.dialog pid={process.pid} text={dialog}")
             if console_helper and console_helper.poll() is not None:
                 read_console_snapshot()
                 if not console_done and process.poll() is None:
@@ -699,6 +762,8 @@ def run_process(
     if result.return_code != 0:
         error_detail = "\n".join(part for part in (console_text, stderr, stdout) if part).strip()[-2000:]
         raise RuntimeError(f"外部工具退出码 {result.return_code}: {error_detail}")
+    if seen_dialogs:
+        raise OfficialToolDialogError(sorted(seen_dialogs))
     _emit_log(log, f"外部工具完成，耗时 {result.duration_seconds:.1f} 秒。")
     return result
 
@@ -1528,7 +1593,7 @@ def analyze_import_protection(
     unresolved_scope_entries: list[dict[str, object]] = []
     proven_safe: set[str] = set()
     if logic_safety is not None:
-        if logic_safety.get("schema") != 1:
+        if logic_safety.get("schema") != 2:
             raise ValueError("WOLF 候选译文安全报告格式错误。")
         safe_values = logic_safety.get("safe_to_translate")
         if not isinstance(safe_values, list):
@@ -1654,8 +1719,8 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 4:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 4 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 5:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 5 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
