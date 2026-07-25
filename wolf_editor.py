@@ -51,7 +51,7 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 8
+AUTO_ANALYSIS_SCHEMA = 11
 TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
@@ -2021,6 +2021,7 @@ class _BlockAnalyzer:
         role: str,
         scopes: frozenset[str] = frozenset(),
         global_string_variable: int | None = None,
+        target_database_cells: Iterable[tuple[str, int, int, int]] = (),
     ) -> None:
         if not value.tracked:
             return
@@ -2052,6 +2053,10 @@ class _BlockAnalyzer:
                 for cell in sorted(value.cells)
             ],
             "right_database_cells": [],
+            "target_database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(target_database_cells)
+            ],
             "trace": list(value.trace),
             "right_trace": [],
             "unresolved_scopes": sorted(value.scopes | scopes),
@@ -2105,6 +2110,7 @@ class _BlockAnalyzer:
         values: Iterable[_StringValue] = (),
         *,
         status: str = "blocking",
+        call_target_kind: str | None = None,
     ) -> None:
         values = tuple(values)
         source_keys = sorted({key for value in values for key in value.source_keys})
@@ -2140,6 +2146,8 @@ class _BlockAnalyzer:
             "status": status,
             "reason": reason,
         }
+        if call_target_kind is not None:
+            dependency["call_target_kind"] = call_target_kind
         self.dependencies.append(dependency)
         if status == "blocking":
             self.blocking.append(dependency)
@@ -2176,9 +2184,20 @@ class _BlockAnalyzer:
         if database is None:
             self._record_unknown(command, index, f"250-flags-{flags:08x}")
             return
-        if len(command.ints) == 4:
-            if command.strings:
-                self._write_database_string(command, index, state, database, byte2)
+        write_value = (
+            state.strings.get(command.ints[4] & 0x00FFFFFF)
+            if len(command.ints) == 5
+            else None
+        )
+        is_read = len(command.ints) == 5 and (
+            bool(byte1 & 0x10)
+            or (not any(command.strings) and write_value is None)
+        )
+        if not is_read:
+            if command.strings or write_value is not None:
+                self._write_database_string(
+                    command, index, state, database, byte2, write_value
+                )
             else:
                 type_ids = self._type_ids(database, command, byte2, state)
                 scopes = frozenset(
@@ -2193,10 +2212,8 @@ class _BlockAnalyzer:
                         tuple(sorted(scopes)),
                     )
             return
-        # All five-integer 3.713 forms read a DB value into the destination.
-        # The high nibble selects the value mode; it does not turn the command
-        # into a write. Treating only 0x10 as a read silently dropped numeric
-        # lookups in real games.
+        # In the 3.713 Auto form, byte1 bit 0x10 marks a database read. The
+        # otherwise identical five-integer form writes its final string slot.
         destination = command.ints[4] & 0x00FFFFFF
         selected_type_ids = self._type_ids(database, command, byte2, state)
         if selected_type_ids == set():
@@ -2358,6 +2375,7 @@ class _BlockAnalyzer:
                         runtime_value = state.database_strings.get(coordinate)
                         if runtime_value is not None:
                             keys.update(runtime_value.source_keys)
+                            cells.add(coordinate)
                             cells.update(runtime_value.cells)
                             if runtime_value.literals is not None:
                                 string_values.update(runtime_value.literals)
@@ -2369,6 +2387,12 @@ class _BlockAnalyzer:
                                 self.candidate_values.get(key, original_value)
                                 for key in coordinate_keys
                             )
+                        else:
+                            # Keep the field identity even when its current
+                            # value is not a workbook item: a runtime writer
+                            # may feed this exact storage slot to a display.
+                            cells.add(coordinate)
+                            string_values.add(db_type.rows[data_id][field_id])
                     else:
                         try:
                             numeric_values.add(int(db_type.rows[data_id][field_id]))
@@ -2418,6 +2442,7 @@ class _BlockAnalyzer:
         state: _AnalysisState,
         database: str,
         selector_flags: int,
+        value: _StringValue | None = None,
     ) -> None:
         type_ids = self._type_ids(database, command, selector_flags, state)
         if not type_ids:
@@ -2469,18 +2494,27 @@ class _BlockAnalyzer:
                 scopes,
             )
             return
-        value = self._literal_string(command, index, 0, state)
+        if value is None:
+            value = self._literal_string(command, index, 0, state)
         for coordinate in coordinates:
             state.database_strings[coordinate] = value
+        field_scopes = frozenset(
+            f"database:{database}:{type_id}:*:{field_id}"
+            for type_id in type_ids
+            for field_id in field_ids
+        )
         self._value_boundary_reference(
             command,
             index,
             value,
             "database_string_write",
-            frozenset(
+            field_scopes
+            if not coordinates
+            else frozenset(
                 f"database:{item[0]}:{item[1]}:{item[2]}:{item[3]}"
                 for item in coordinates
             ),
+            target_database_cells=coordinates,
         )
 
     def _set_runtime_value(
@@ -3026,6 +3060,7 @@ class _BlockAnalyzer:
         *,
         status: str = "blocking",
         taint_state: bool = True,
+        call_target_kind: str | None = None,
     ) -> None:
         if scopes is None:
             scopes = frozenset({"project"})
@@ -3040,7 +3075,14 @@ class _BlockAnalyzer:
             for string_index in range(literal_start, len(command.strings))
         )
         self._blocking_scope_dependency(
-            command, index, "call", reason, scopes, input_values, status=status
+            command,
+            index,
+            "call",
+            reason,
+            scopes,
+            input_values,
+            status=status,
+            call_target_kind=call_target_kind,
         )
         if taint_state:
             self._apply_conservative_scopes(
@@ -3148,6 +3190,7 @@ class _BlockAnalyzer:
                     frozenset({"common:*"}),
                     (value,),
                     status="dynamic",
+                    call_target_kind="event_name",
                 )
             elif command.opcode == 210 and command.ints and command.ints[0] < 0:
                 self._record_call(command_id, "exact", ("noop",))
@@ -3160,6 +3203,7 @@ class _BlockAnalyzer:
                     "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
                     frozenset({"common:*"}),
                     status="dynamic",
+                    call_target_kind="numeric_id",
                 )
             self._record_call(command_id, "conservative", ("common:*",))
             self._set_unknown_target_return(command, state)
@@ -3498,6 +3542,7 @@ class _BlockAnalyzer:
                 "预约公共事件目标为运行时动态值",
                 frozenset({"common:*"}),
                 status="dynamic",
+                call_target_kind="numeric_id",
             )
             return
         target_id = (
@@ -4172,7 +4217,7 @@ def _analyze_blocks(
     }
     common_by_name = {name: tuple(group) for name, group in common_names.items()}
     candidate_lookup = candidate_values or {}
-    pooled_calls: dict[tuple[object, ...], list[tuple[str, tuple[_StringValue, ...]]]] = {}
+    call_argument_pool: _CallArgumentPool = {}
     for block in blocks:
         for index, command in enumerate(block.commands):
             if command.opcode not in {210, 300} or len(command.ints) < 2:
@@ -4237,44 +4282,13 @@ def _analyze_blocks(
             if len(values) != string_count:
                 continue
             choice = command.ints[2] if numeric_count else 0
-            group = (
-                target.event_id,
-                choice,
-                tuple(command.ints[2:string_start]),
-                string_count,
-            )
             command_id = (
                 f"{block.source}:{block.event_type}:{block.event_id}:"
                 f"{block.page}:{index + 1}"
             )
-            pooled_calls.setdefault(group, []).append((command_id, tuple(values)))
-
-    call_argument_pool: _CallArgumentPool = {}
-    for calls in pooled_calls.values():
-        # ponytail: batches cap provenance below the 256-value widening limit.
-        # A parameterized event-summary engine can replace this conservative union.
-        for batch_start in range(0, len(calls), 128):
-            batch = calls[batch_start : batch_start + 128]
-            pooled: list[_StringValue] = []
-            for argument_index in range(len(batch[0][1])):
-                values = [arguments[argument_index] for _command_id, arguments in batch]
-                pooled.append(
-                    _StringValue(
-                        frozenset().union(*(value.source_keys for value in values)),
-                        frozenset().union(*(value.cells for value in values)),
-                        tuple(
-                            dict.fromkeys(
-                                trace for value in values for trace in value.trace
-                            )
-                        ),
-                        literals=frozenset().union(
-                            *(value.literals or frozenset() for value in values)
-                        ),
-                    )
-                )
-            pooled_tuple = tuple(pooled)
-            for command_id, _arguments in batch:
-                call_argument_pool[command_id] = pooled_tuple
+            # Keep each call site's provenance separate. A batch-level union can
+            # make unrelated player-facing messages look like condition inputs.
+            call_argument_pool[command_id] = tuple(values)
     event_scopes = _conservative_event_scopes(blocks, common_by_id, common_by_name)
     dependencies: list[dict[str, object]] = []
     unknown = Counter()
@@ -4302,9 +4316,36 @@ def _analyze_blocks(
             unknown[key] += int(warning["count"])
             locations.setdefault(key, []).extend(str(value) for value in warning["locations"])
 
-    def global_writes(
-        records: Iterable[dict[str, object]],
-    ) -> dict[int, _StringValue]:
+    def dependency_value(dependency: dict[str, object]) -> _StringValue:
+        status = str(dependency.get("status", "blocking"))
+        source_values = dependency.get("source_values")
+        literals = (
+            frozenset(map(str, source_values))
+            if isinstance(source_values, list)
+            else None
+        )
+        cells = frozenset(
+            (
+                str(cell["database"]),
+                int(cell["type"]),
+                int(cell["data"]),
+                int(cell["field"]),
+            )
+            for cell in dependency.get("database_cells", ())
+            if isinstance(cell, dict)
+            and all(key in cell for key in ("database", "type", "data", "field"))
+        )
+        return _StringValue(
+            frozenset(map(str, dependency.get("source_keys", ()))),
+            cells,
+            tuple(map(str, dependency.get("trace", ()))),
+            str(dependency.get("reason", "")) if status != "resolved" else "",
+            status == "dynamic",
+            frozenset(map(str, dependency.get("unresolved_scopes", ()))),
+            literals,
+        )
+
+    def global_writes(records: Iterable[dict[str, object]]) -> dict[int, _StringValue]:
         values: dict[int, _StringValue] = {}
         for dependency in records:
             if (
@@ -4315,52 +4356,52 @@ def _analyze_blocks(
             raw_variable = dependency.get("global_string_variable")
             if not isinstance(raw_variable, int) or 1_600_000 <= raw_variable < 1_600_100:
                 continue
-            status = str(dependency.get("status", "blocking"))
-            source_values = dependency.get("source_values")
-            literals = (
-                frozenset(map(str, source_values))
-                if isinstance(source_values, list)
-                else None
-            )
-            cells = frozenset(
-                (
+            value = dependency_value(dependency)
+            values[raw_variable] = _merge_strings(values.get(raw_variable), value) or value
+        return values
+
+    def database_writes(
+        records: Iterable[dict[str, object]],
+    ) -> dict[tuple[str, int, int, int], _StringValue]:
+        values: dict[tuple[str, int, int, int], _StringValue] = {}
+        for dependency in records:
+            if (
+                dependency.get("kind") != "resource"
+                or dependency.get("resource_role") != "database_string_write"
+            ):
+                continue
+            value = dependency_value(dependency)
+            for cell in dependency.get("target_database_cells", ()):
+                if not isinstance(cell, dict) or not all(
+                    key in cell for key in ("database", "type", "data", "field")
+                ):
+                    continue
+                coordinate = (
                     str(cell["database"]),
                     int(cell["type"]),
                     int(cell["data"]),
                     int(cell["field"]),
                 )
-                for cell in dependency.get("database_cells", ())
-                if isinstance(cell, dict)
-                and all(key in cell for key in ("database", "type", "data", "field"))
-            )
-            value = _StringValue(
-                frozenset(map(str, dependency.get("source_keys", ()))),
-                cells,
-                tuple(map(str, dependency.get("trace", ()))),
-                str(dependency.get("reason", "")) if status != "resolved" else "",
-                status == "dynamic",
-                frozenset(map(str, dependency.get("unresolved_scopes", ()))),
-                literals,
-            )
-            values[raw_variable] = _merge_strings(values.get(raw_variable), value) or value
+                values[coordinate] = _merge_strings(values.get(coordinate), value) or value
         return values
 
     def global_values_equal(
-        left: dict[int, _StringValue], right: dict[int, _StringValue]
+        left: dict[object, _StringValue], right: dict[object, _StringValue]
     ) -> bool:
         return left.keys() == right.keys() and all(
             _string_semantic_key(value) == _string_semantic_key(right[key])
             for key, value in left.items()
         )
 
-    # A global string may be written by one root event and consumed by another.
-    # Re-run every root with the joined write set until its abstract value stops
-    # growing, so a later condition/resource/call keeps the original text.
+    # Persistent strings may be written by one root event and consumed by another.
+    # ponytail: Root writes are joined without an event-order model; scheduling
+    # analysis can regain approvals if a project needs that precision.
     initial_dependencies = list(dependencies)
     global_strings = global_writes(initial_dependencies)
+    global_database_strings = database_writes(initial_dependencies)
     global_iterations = 0
     global_converged = True
-    while global_strings:
+    while global_strings or global_database_strings:
         if global_iterations >= _GLOBAL_STRING_FLOW_MAX_ITERATIONS:
             global_converged = False
             break
@@ -4380,19 +4421,27 @@ def _analyze_blocks(
                 audit=audit,
             )
             block_dependencies, _block_blocking, _block_unknown = analyzer.run(
-                _AnalysisState({}, global_strings, {})
+                _AnalysisState({}, global_strings, global_database_strings)
             )
             propagated.extend(block_dependencies)
         global_iterations += 1
         next_global_strings = global_writes([*initial_dependencies, *propagated])
-        if global_values_equal(global_strings, next_global_strings):
+        next_global_database_strings = database_writes(
+            [*initial_dependencies, *propagated]
+        )
+        if (
+            global_values_equal(global_strings, next_global_strings)
+            and global_values_equal(global_database_strings, next_global_database_strings)
+        ):
             dependencies.extend(propagated)
             break
         global_strings = next_global_strings
+        global_database_strings = next_global_database_strings
     global_string_flow = {
         "converged": global_converged,
         "iterations": global_iterations,
         "variables": len(global_strings),
+        "database_cells": len(global_database_strings),
         "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
     }
     warnings = [
@@ -4401,9 +4450,21 @@ def _analyze_blocks(
     ]
     merged_dependencies: dict[tuple[object, ...], dict[str, object]] = {}
     for dependency in dependencies:
+        # ponytail: retain source correlation in the report. Collapsing every
+        # invocation of one callee into a single union makes display arguments
+        # look like each other's logic inputs; a compact provenance table can
+        # replace these per-source records if a project makes reports too large.
+        provenance = (
+            tuple(map(str, dependency.get("condition_keys", ()))),
+            tuple(map(str, dependency.get("source_keys", ()))),
+            tuple(map(str, dependency.get("right_source_keys", ()))),
+            tuple(map(str, dependency.get("left_values", ()))),
+            tuple(map(str, dependency.get("right_values", ()))),
+        )
         identity = (
             dependency["auto_file"], dependency["event_type"], dependency["event_id"],
             dependency["page"], dependency["command"], dependency["string_index"],
+            provenance,
         )
         current = merged_dependencies.get(identity)
         if current is None:
@@ -4420,6 +4481,10 @@ def _analyze_blocks(
             current["_right_database_cells"] = {
                 (cell["database"], cell["type"], cell["data"], cell["field"])
                 for cell in dependency.get("right_database_cells", [])
+            }
+            current["_target_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency.get("target_database_cells", [])
             }
             current["_trace"] = dict.fromkeys(dependency["trace"])
             current["_left_values"] = set(dependency.get("left_values", []))
@@ -4446,6 +4511,10 @@ def _analyze_blocks(
         current["_right_database_cells"].update(
             (cell["database"], cell["type"], cell["data"], cell["field"])
             for cell in dependency.get("right_database_cells", [])
+        )
+        current["_target_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency.get("target_database_cells", [])
         )
         current["_trace"].update(dict.fromkeys(dependency["trace"]))
         current["_left_values"].update(dependency.get("left_values", []))
@@ -4479,7 +4548,11 @@ def _analyze_blocks(
         current["condition_keys"] = sorted(current.pop("_condition_keys"))
         current["source_keys"] = sorted(current.pop("_source_keys"))
         current["right_source_keys"] = sorted(current.pop("_right_source_keys"))
-        for field in ("database_cells", "right_database_cells"):
+        for field in (
+            "database_cells",
+            "right_database_cells",
+            "target_database_cells",
+        ):
             current[field] = [
                 {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
                 for cell in sorted(current.pop(f"_{field}"))
@@ -4507,6 +4580,31 @@ def _translation_usage_report(
         by_code.setdefault(item.code.upper(), []).append(item)
     usages: dict[str, set[str]] = {}
     scope_cache: dict[str, frozenset[str]] = {}
+
+    def database_cells(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, int]]:
+        cells: set[tuple[str, int, int, int]] = set()
+        for cell in dependency.get(field, ()):
+            if not isinstance(cell, dict) or not all(
+                name in cell for name in ("database", "type", "data", "field")
+            ):
+                continue
+            cells.add(
+                (
+                    str(cell["database"]),
+                    int(cell["type"]),
+                    int(cell["data"]),
+                    int(cell["field"]),
+                )
+            )
+        return cells
+
+    display_storage_cells: set[tuple[str, int, int, int]] = set()
+    for dependency in dependencies:
+        kind = str(dependency.get("kind", "condition"))
+        if kind == "display":
+            display_storage_cells.update(database_cells(dependency, "database_cells"))
     for block in blocks:
         for index, command in enumerate(block.commands, start=1):
             semantics = command_semantics(
@@ -4552,6 +4650,18 @@ def _translation_usage_report(
             "flow": "flow",
             "state": "logic",
         }.get(kind, "unresolved")
+        if (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            usage = "display_storage"
+            target_cells = database_cells(dependency, "target_database_cells")
+            dependency["display_sink_proven"] = (
+                bool(target_cells) and target_cells <= display_storage_cells
+            )
+            if dependency["display_sink_proven"]:
+                for key in dependency.get("source_keys", []):
+                    usages.setdefault(str(key), set()).add("display_only")
         if usage == "flow":
             continue
         for field in ("condition_keys", "source_keys", "right_source_keys"):
@@ -5340,7 +5450,8 @@ def analyze_translation_safety(
         key
         for key in candidates
         if (uses := set(map(str, usage_by_key.get(key, ()))))
-        and uses <= {"display_only", "logic", "event_target"}
+        and uses <= {"display_only", "display_storage", "logic", "event_target"}
+        and ("display_storage" not in uses or "display_only" in uses)
         and (
             "event_target" not in uses
             or event_targets.get(originals[key]) == event_targets.get(candidates[key])
@@ -5385,6 +5496,10 @@ def analyze_translation_safety(
 
     def same_event_target(key: str) -> bool:
         return event_targets.get(originals[key]) == event_targets.get(final_value(key))
+
+    def has_display_evidence(key: str) -> bool:
+        return "display_only" in set(map(str, usage_by_key.get(key, ())))
+
     scope_sets: dict[str, set[str]] = {"project": set(originals)}
     for item in items:
         upper = item.code.upper()
@@ -5512,6 +5627,21 @@ def analyze_translation_safety(
         if kind in {"display", "flow"}:
             return
         if (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            if not dependency.get("display_sink_proven"):
+                protect(
+                    [*source_keys, *right_keys],
+                    "database_storage_without_display_sink",
+                )
+            elif not global_string_flow_converged:
+                protect(
+                    [*source_keys, *right_keys],
+                    "database_string_flow_not_converged",
+                )
+            return
+        if (
             kind == "state"
             and dependency.get("resource_role") == "global_string_write"
             and global_string_flow_converged
@@ -5521,9 +5651,8 @@ def analyze_translation_safety(
             return
         if status != "resolved":
             reason = str(dependency.get("reason", "unresolved"))
-            target_equivalence = (
-                kind == "call" and reason.startswith("公共事件目标为运行时动态值")
-            )
+            call_target_kind = str(dependency.get("call_target_kind", ""))
+            target_equivalence = kind == "call" and call_target_kind == "event_name"
             protect(
                 (
                     key
@@ -5536,7 +5665,13 @@ def analyze_translation_safety(
                 ),
                 reason,
             )
-            raw_scopes = tuple(dependency.get("unresolved_scopes", ()))
+            raw_scopes = tuple(
+                scope
+                for scope in dependency.get("unresolved_scopes", ())
+                if not (
+                    call_target_kind == "numeric_id" and scope == "common:*"
+                )
+            )
             if raw_scopes or status == "blocking":
                 scoped = _scope_keys(
                     items,
@@ -5547,7 +5682,7 @@ def analyze_translation_safety(
                     (
                         key
                         for key in scoped
-                        if set(map(str, usage_by_key.get(key, ()))) != {"display_only"}
+                        if not has_display_evidence(key)
                         and (
                             not target_equivalence
                             or key not in candidates

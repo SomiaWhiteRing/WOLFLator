@@ -101,6 +101,7 @@ from wolf_editor import (
     _merge_numbers,
     _merge_strings,
     _restore_editor_map_paths,
+    _translation_usage_report,
     analyze_auto_export,
     analyze_translation_safety,
     compare_auto_structure,
@@ -1041,7 +1042,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 8"):
+            with self.assertRaisesRegex(ValueError, "schema 11"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -1068,7 +1069,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 8,
+                "schema": 11,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -1756,7 +1757,7 @@ class WorkbookAndFontTests(unittest.TestCase):
         self.assertEqual(left.audit.calls, right.audit.calls)
         self.assertEqual(left.audit.data_effects, right.audit.data_effects)
 
-    def test_literal_no_return_calls_are_pooled_without_losing_display_proof(self):
+    def test_literal_no_return_calls_keep_per_call_display_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             basic = root / "Auto" / "BasicData"
@@ -1810,6 +1811,14 @@ class WorkbookAndFontTests(unittest.TestCase):
             )
 
             self.assertEqual(260, len(set(report["safe_to_translate"])))
+            display_sources = {
+                tuple(dependency["source_keys"])
+                for dependency in report["dependencies"]
+                if dependency["kind"] == "display" and dependency["source_keys"]
+            }
+            self.assertEqual(
+                {(f"call-{index}",) for index in range(260)}, display_sources
+            )
             self.assertEqual([], report["blocking_issues"])
             self.assertEqual(0, report["command_catalog"]["opaque_effects"])
 
@@ -1943,7 +1952,13 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analysis=analysis,
             )
             self.assertEqual(
-                ["display", "dynamic_safe", "global_state", "picture_text", "unmapped"],
+                [
+                    "display",
+                    "dynamic_safe",
+                    "global_state",
+                    "picture_text",
+                    "unmapped",
+                ],
                 safety["safe_to_translate"],
             )
             self.assertEqual(
@@ -1970,10 +1985,281 @@ class WorkbookAndFontTests(unittest.TestCase):
             )
             self.assertEqual(6, protection["schema"])
             self.assertEqual(
-                ["display", "dynamic_safe", "global_state", "picture_text", "unmapped"],
+                [
+                    "display",
+                    "dynamic_safe",
+                    "global_state",
+                    "picture_text",
+                    "unmapped",
+                ],
                 protection["safe_to_translate"],
             )
             self.assertNotIn("unchanged", protection["keep_original"])
+
+    def test_translation_safety_allows_display_database_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Display transport",
+                        "COMMAND_NUM=4",
+                        "WoditorEvCOMMAND_START",
+                        # Write a display payload into a text field, read it back,
+                        # then pass it to a verified message command.
+                        '[122][3,1]<0>(1600002,0,0)("状态提示")',
+                        '[250][5,4]<0>(0,0,0,328192,1600002)("","可视文本","","正文")',
+                        '[250][5,4]<0>(0,0,0,332288,1600001)("","可视文本","","正文")',
+                        '[101][0,1]<0>()("\\cself[1]")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (basic / "DataBase.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=7",
+                        "ITEM_NUM=2",
+                        "DATATYPE_0=2000",
+                        "DATATYPE_1=2000",
+                        "DATA_NUM=1",
+                        "TYPENAME=可视文本",
+                        "ITEMNAME_NUM=2",
+                        "ITEMNAME0=名称",
+                        "ITEMNAME1=正文",
+                        "<<--CSV_START-->>",
+                        '"名称","正文",',
+                        '"展示条目","",',
+                        "<<--CSV_END-->>",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="display_payload",
+                original="状态提示",
+                translation="状态说明",
+                code="COMMON-1-0-0",
+                category=ImportCategory.EXTERNAL,
+            )
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            editor = EditorInfo(
+                editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64
+            )
+            analysis = analyze_auto_export(
+                root / "Auto", [item], editor, input_hash="input"
+            )
+            self.assertEqual(
+                ["display_only", "display_storage"],
+                analysis["usage_by_key"][item.key],
+            )
+            self.assertTrue(
+                any(
+                    dependency.get("resource_role") == "database_string_write"
+                    and dependency["source_keys"] == [item.key]
+                    for dependency in analysis["dependencies"]
+                )
+            )
+            safety = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([item.key], safety["safe_to_translate"])
+            self.assertEqual([], safety["keep_original"])
+            self.assertTrue(safety["replay"]["control_flow_equivalent"])
+
+    def test_database_storage_tracks_display_sink_and_direct_logic(self):
+        item = TranslationItem(
+            key="display_payload",
+            original="状态提示",
+            translation="状态说明",
+            code="COMMON-1-0-0",
+        )
+        writer = {
+            "kind": "resource",
+            "resource_role": "database_string_write",
+            "source_keys": [item.key],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "unresolved_scopes": ["database:CDB:58:*:1"],
+            "target_database_cells": [
+                {"database": "CDB", "type": 58, "data": 0, "field": 1}
+            ],
+        }
+        display = {
+            "kind": "display",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "database_cells": [
+                {"database": "CDB", "type": 58, "data": 0, "field": 1}
+            ],
+        }
+        usage, _ = _translation_usage_report((), [item], [writer, display])
+        self.assertEqual(
+            ["display_only", "display_storage"], usage[item.key]
+        )
+        logic = {
+            "kind": "condition",
+            "source_keys": [item.key],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "database_cells": display["database_cells"],
+        }
+        usage, _ = _translation_usage_report((), [item], [writer, display, logic])
+        self.assertEqual(
+            ["display_only", "display_storage", "logic"], usage[item.key]
+        )
+
+    def test_database_display_sink_requires_exact_cell(self):
+        item = TranslationItem(
+            key="display_payload",
+            original="状态提示",
+            translation="状态说明",
+            code="COMMON-1-0-0",
+        )
+        writer = {
+            "kind": "resource",
+            "resource_role": "database_string_write",
+            "source_keys": [item.key],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "target_database_cells": [
+                {"database": "CDB", "type": 58, "data": 1, "field": 1}
+            ],
+        }
+        display = {
+            "kind": "display",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "database_cells": [
+                {"database": "CDB", "type": 58, "data": 0, "field": 1}
+            ],
+        }
+
+        usage, _ = _translation_usage_report((), [item], [writer, display])
+
+        self.assertEqual(["display_storage"], usage[item.key])
+        self.assertFalse(writer["display_sink_proven"])
+
+    def test_translation_safety_protects_cross_event_database_condition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=3",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Writer",
+                        "COMMAND_NUM=2",
+                        "WoditorEvCOMMAND_START",
+                        '[122][2,1]<0>(1600000,0)("Selector")',
+                        '[250][5,4]<0>(0,0,1,328192,1600000)("","Text","","Value")',
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=2",
+                        "COMMON_NAME=Display",
+                        "COMMAND_NUM=2",
+                        "WoditorEvCOMMAND_START",
+                        '[250][5,4]<0>(0,0,1,332288,1600001)("","Text","","Value")',
+                        '[101][0,1]<0>()("\\cself[1]")',
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=3",
+                        "COMMON_NAME=Condition",
+                        "COMMAND_NUM=2",
+                        "WoditorEvCOMMAND_START",
+                        '[250][5,4]<0>(0,0,1,332288,1600001)("","Text","","Value")',
+                        '[112][2,1]<0>(1,1600001)("Selector")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (basic / "DataBase.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[DATABASE_TEXT_OUTPUT]",
+                        "TYPE_NUM=1",
+                        "TYPE_ID=0",
+                        "ITEM_NUM=2",
+                        "DATATYPE_0=2000",
+                        "DATATYPE_1=2000",
+                        "DATA_NUM=1",
+                        "TYPENAME=Text",
+                        "ITEMNAME_NUM=2",
+                        "ITEMNAME0=Name",
+                        "ITEMNAME1=Value",
+                        "<<--CSV_START-->>",
+                        '"Name","Value",',
+                        '"Entry","",',
+                        "<<--CSV_END-->>",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="writer",
+                original="Selector",
+                translation="选择器",
+                code="COMMON-1-0-0",
+                category=ImportCategory.EXTERNAL,
+            )
+            editor = EditorInfo(
+                root / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            analysis = analyze_auto_export(root / "Auto", [item], editor, input_hash="input")
+
+            writer = next(
+                dependency
+                for dependency in analysis["dependencies"]
+                if dependency.get("resource_role") == "database_string_write"
+            )
+            condition = next(
+                dependency
+                for dependency in analysis["dependencies"]
+                if dependency["kind"] == "condition"
+                and dependency["event_id"] == 3
+                and dependency["source_keys"] == [item.key]
+            )
+            self.assertEqual(
+                [{"database": "UDB", "type": 0, "data": 0, "field": 1}],
+                writer["target_database_cells"],
+            )
+            self.assertTrue(writer["display_sink_proven"])
+            self.assertEqual([item.key], condition["source_keys"])
+            self.assertEqual(
+                ["display_only", "display_storage", "logic"],
+                analysis["usage_by_key"][item.key],
+            )
+
+            safety = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([], safety["safe_to_translate"])
+            self.assertEqual([item.key], safety["keep_original"])
+            self.assertIn("condition_truth_change", safety["reasons"][item.key])
 
     def test_translation_safety_allows_global_state_only_without_field_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2132,13 +2418,15 @@ class WorkbookAndFontTests(unittest.TestCase):
             condition = next(
                 dependency
                 for dependency in analysis["dependencies"]
-                if dependency["kind"] == "condition" and dependency["event_id"] == 2
+                if dependency["kind"] == "condition"
+                and dependency["event_id"] == 2
+                and dependency["source_keys"] == ["writer"]
             )
 
             self.assertTrue(analysis["global_string_flow"]["converged"])
             self.assertGreaterEqual(analysis["global_string_flow"]["iterations"], 1)
             self.assertEqual(["writer"], condition["source_keys"])
-            self.assertEqual("dynamic", condition["status"])
+            self.assertEqual("resolved", condition["status"])
 
             safety = analyze_translation_safety(
                 root / "Auto",
@@ -2250,7 +2538,61 @@ class WorkbookAndFontTests(unittest.TestCase):
             )
             self.assertEqual("dynamic", reserved["status"])
             self.assertEqual(["common:*"], reserved["unresolved_scopes"])
+            self.assertEqual("numeric_id", reserved["call_target_kind"])
             self.assertEqual([], report["blocking_issues"])
+
+    def test_dynamic_reserved_numeric_target_does_not_protect_common_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Caller",
+                        "COMMAND_NUM=2",
+                        "WoditorEvCOMMAND_START",
+                        "[211][2,0]<0>(1600001,0)()",
+                        '[122][2,1]<0>(1600000,0)("Player text")',
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="message",
+                original="Player text",
+                translation="玩家文本",
+                code="COMMON-1-1-0",
+                category=ImportCategory.DISPLAY,
+            )
+            editor = EditorInfo(
+                root / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            report = analyze_auto_export(root / "Auto", [item], editor, input_hash="input")
+            reserved = next(
+                dependency
+                for dependency in report["dependencies"]
+                if dependency.get("call_target_kind") == "numeric_id"
+            )
+            reserved["reason"] = "reason text must not select this rule"
+
+            safety = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=report,
+            )
+
+            self.assertEqual(["message"], safety["safe_to_translate"])
+            self.assertEqual([], safety["keep_original"])
 
     def test_static_reserved_event_does_not_protect_unrelated_database_display(self):
         with tempfile.TemporaryDirectory() as directory:

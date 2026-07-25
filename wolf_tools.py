@@ -1990,8 +1990,8 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references and logic_safety is not None:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 8:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 8 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 11:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 11 Editor 分析报告，请重新执行导出文本。")
         keep_values = logic_safety.get("keep_original")
         safety_reasons = logic_safety.get("reasons")
         if not isinstance(keep_values, list) or not isinstance(safety_reasons, dict):
@@ -2034,8 +2034,8 @@ def analyze_import_protection(
                 "WOLF 静态安全分析需要保留风险原文，严格模式已阻止导入。"
             )
     elif rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 8:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 8 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 11:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 11 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
