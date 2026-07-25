@@ -67,6 +67,7 @@ from wolf_tools import (
     merge_ainiee_output,
     name_baseline_scope,
     parse_official_diagnostics,
+    parse_official_map_failures,
     protect_control_tokens,
     read_translation_items,
     read_font_slots,
@@ -1460,6 +1461,60 @@ class WorkbookAndFontTests(unittest.TestCase):
                 any("固定点超过" in issue["reason"] for issue in report["blocking_issues"])
             )
 
+    def test_editor_cfg_widens_large_forward_join_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            commands: list[str] = []
+            items: list[TranslationItem] = []
+            for branch in range(70):
+                start = len(commands)
+                commands.extend((
+                    "[111][4,0]<0>(1,1600000,0,0)()",
+                    "[401][1,0]<0>(0)()",
+                    f'[122][2,1]<1>(1600005,0)("Text {branch}")',
+                    '[213][0,1]<1>()("join")',
+                    "[420][1,0]<0>(0)()",
+                    "[499][0,0]<0>()()",
+                ))
+                items.append(TranslationItem(
+                    key=f"branch-{branch}",
+                    original=f"Text {branch}",
+                    translation=f"译文 {branch}",
+                    code=f"COMMON-1-{start + 2}-0",
+                ))
+            commands.extend(('[212][0,1]<0>()("join")', '[101][0,1]<0>()("\\s[5]")'))
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join((
+                    "[COMMON_EVENT_TEXT_OUTPUT]",
+                    "COMMON_EVENT_NUM=1",
+                    "COMMON_ID=1",
+                    "COMMON_NAME=Large join",
+                    f"COMMAND_NUM={len(commands)}",
+                    "WoditorEvCOMMAND_START",
+                    *commands,
+                    "WoditorEvCOMMAND_END",
+                )),
+                encoding="utf-8",
+            )
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            report = analyze_auto_export(
+                root / "Auto",
+                items,
+                EditorInfo(
+                    editor_path,
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "a" * 64,
+                ),
+                input_hash="input",
+            )
+
+            self.assertEqual(1.0, report["command_catalog"]["cfg_coverage"]["ratio"])
+            self.assertFalse(report["blocking_issues"])
+
     def test_semantic_ledger_covers_choice_database_and_no_return_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1572,6 +1627,63 @@ class WorkbookAndFontTests(unittest.TestCase):
         )
         self.assertEqual(left.audit.calls, right.audit.calls)
         self.assertEqual(left.audit.data_effects, right.audit.data_effects)
+
+    def test_literal_no_return_calls_are_pooled_without_losing_display_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            calls = [
+                f'[300][3,2]<0>(0,4112,0)("Callee","Text {index}")'
+                for index in range(260)
+            ]
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    [
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=2",
+                        "COMMON_ID=1",
+                        "COMMON_NAME=Caller",
+                        f"COMMAND_NUM={len(calls)}",
+                        "WoditorEvCOMMAND_START",
+                        *calls,
+                        "WoditorEvCOMMAND_END",
+                        "COMMON_ID=2",
+                        "COMMON_NAME=Callee",
+                        "COMMAND_NUM=1",
+                        "WoditorEvCOMMAND_START",
+                        '[101][0,1]<0>()("\\cself[5]")',
+                        "WoditorEvCOMMAND_END",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            items = [
+                TranslationItem(
+                    key=f"call-{index}",
+                    original=f"Text {index}",
+                    translation=f"译文 {index}",
+                    code=f"COMMON-1-{index}-1",
+                )
+                for index in range(260)
+            ]
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            report = analyze_auto_export(
+                root / "Auto",
+                items,
+                EditorInfo(
+                    editor_path,
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "a" * 64,
+                ),
+                input_hash="input",
+            )
+
+            self.assertEqual(260, len(set(report["safe_to_translate"])))
+            self.assertEqual([], report["blocking_issues"])
+            self.assertEqual(0, report["command_catalog"]["opaque_effects"])
 
     def test_translation_safety_uses_official_display_contract_and_auto_proof(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1953,7 +2065,17 @@ class WorkbookAndFontTests(unittest.TestCase):
                 key="copied",
                 original="前\n后",
                 code="COMMON-1-1-0",
-                flag="<Half-Width Characters Only>\nCOPY-FROM-COMMON-1-0-0",
+                flag=(
+                    "<Half-Width Characters Only>\n"
+                    "NEXT=SEGMENT_1-COMMON-1-1-0\n"
+                    "COPY-FROM-COMMON-1-0-0"
+                ),
+            )
+            copied_segment = TranslationItem(
+                key="copied-segment",
+                original="后",
+                translation="错误",
+                code="SEGMENT_1-COMMON-1-1-0",
             )
             name_source = TranslationItem(
                 key="name-source",
@@ -1970,8 +2092,8 @@ class WorkbookAndFontTests(unittest.TestCase):
             segmented = compare_auto_structure(
                 root / "before",
                 root / "after",
-                [base, segment, copied, name_source, name_copy],
-                {segment.key, name_source.key},
+                [base, segment, copied, copied_segment, name_source, name_copy],
+                {segment.key, copied_segment.key, name_source.key},
             )
             self.assertEqual("passed", segmented["status"])
             path_after.write_text(
@@ -1981,8 +2103,8 @@ class WorkbookAndFontTests(unittest.TestCase):
             segmented_failed = compare_auto_structure(
                 root / "before",
                 root / "after",
-                [base, segment, copied, name_source, name_copy],
-                {segment.key, name_source.key},
+                [base, segment, copied, copied_segment, name_source, name_copy],
+                {segment.key, copied_segment.key, name_source.key},
             )
             self.assertEqual("segmented_string", segmented_failed["differences"][0]["kind"])
 
@@ -2014,7 +2136,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "TYPE_ID=0",
                 "ITEM_NUM=1",
                 "DATATYPE_0=2000",
-                "DATA_NUM=6",
+                "DATA_NUM=7",
                 "TYPENAME=Maps",
                 "ITEMNAME_NUM=1",
                 "ITEMNAME0=Path",
@@ -2025,6 +2147,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 '"",',
                 '"",',
                 '"",',
+                '"MapData/Fancy.mps",',
                 '"MapData/Fancy.mps",',
                 "<<--CSV_END-->>",
             ))
@@ -2045,7 +2168,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 key="map-text",
                 original="原文",
                 translation="译文",
-                code="MAP-5-Ev007-Page1-0-0",
+                code="MAP-6-Ev007-Page1-0-0",
             )
             name_item = TranslationItem(
                 key="map-name",
@@ -2305,6 +2428,21 @@ class ControlTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_official_map_failure_parser_requires_corruption_evidence(self):
+        output = (
+            "Map 86 : Data\\MapData/Map001.mps が読み込めませんでした\n"
+            "該当ファイルが 破損しているか アクセス権限 => Failed..."
+        )
+        failures = parse_official_map_failures(output)
+        self.assertEqual(1, len(failures))
+        self.assertIn("Map 86", failures[0])
+        self.assertEqual(
+            [],
+            parse_official_map_failures(
+                "Map 1 : Data/MapData/A.mps が読み込めませんでした => Failed..."
+            ),
+        )
+
     @unittest.skipUnless(os.name == "nt", "Windows dialog contract")
     def test_hidden_official_dialog_is_captured_and_dismissed(self):
         import ctypes
@@ -2436,6 +2574,7 @@ gned. [Error!] COMMON-243-Name => エンドリスト
             root = Path(directory)
             executable = root / "official.exe"
             executable.touch()
+            (root / "LibXL.dll").touch()
             details = []
             with mock.patch(
                 "wolf_tools.run_process",
@@ -2454,6 +2593,9 @@ gned. [Error!] COMMON-243-Name => エンドリスト
                 )
             command = run.call_args.args[0]
             self.assertNotIn("-wait", command)
+            self.assertNotEqual(executable, Path(command[0]))
+            self.assertEqual(Path(command[0]).parent, run.call_args.kwargs["cwd"])
+            self.assertFalse(Path(command[0]).parent.exists())
             self.assertTrue(run.call_args.kwargs["hide_window"])
             self.assertTrue(run.call_args.kwargs["capture_console"])
             self.assertTrue(any("MessageBeep" in line and "IsWindow" in line for line in details))

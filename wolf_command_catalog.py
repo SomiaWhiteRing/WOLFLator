@@ -15,8 +15,8 @@ EVIDENCE_RANK = {
 
 # BEGIN WOLFLATOR EDITOR CALIBRATION
 # Generated only from official Editor save/reopen/copy and Auto evidence.
-GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {99: ((0, 0),), 102: ((1, 4), (1, 6), (1, 9), (1, 10)), 104: ((0, 0),), 105: ((0, 0),), 121: ((7, 0),), 125: ((1, 0), (2, 0), (3, 0)), 140: ((7, 0),), 151: ((5, 0),), 177: ((0, 0),), 178: ((0, 0),), 210: ((3, 2), (10, 0), (10, 5)), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 252: ((5, 4),), 255: ((5, 4),), 257: ((5, 4),), 260: ((3, 3),), 270: ((1, 1), (2, 0), (2, 1)), 281: ((3, 0),), 300: ((5, 3), (6, 3), (8, 4), (11, 5)), 402: ((1, 0),)}
-GENERATED_MANUAL_EVIDENCE: dict[int, str] = {99: 'roundtrip', 102: 'roundtrip', 104: 'roundtrip', 105: 'roundtrip', 121: 'roundtrip', 125: 'roundtrip', 140: 'roundtrip', 151: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 210: 'roundtrip', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 252: 'differential', 255: 'differential', 257: 'differential', 260: 'differential', 270: 'differential', 281: 'roundtrip', 300: 'differential', 402: 'roundtrip'}
+GENERATED_MANUAL_SHAPES: dict[int, tuple[tuple[int, int], ...]] = {99: ((0, 0),), 102: ((1, 4), (1, 6), (1, 8), (1, 9), (1, 10)), 104: ((0, 0),), 105: ((0, 0),), 121: ((7, 0),), 122: ((4, 0),), 125: ((1, 0), (2, 0), (3, 0)), 130: ((4, 0),), 140: ((7, 0),), 151: ((5, 0),), 177: ((0, 0),), 178: ((0, 0),), 210: ((3, 2), (4, 2), (5, 2), (5, 3), (10, 0), (10, 5)), 211: ((2, 0),), 230: ((0, 0),), 231: ((0, 0),), 240: ((2, 0),), 241: ((1, 0),), 251: ((5, 4),), 252: ((5, 4),), 255: ((5, 4),), 257: ((5, 4),), 260: ((3, 3),), 270: ((1, 1), (2, 0), (2, 1)), 281: ((3, 0),), 300: ((3, 2), (5, 3), (6, 3), (7, 3), (8, 4), (10, 4), (11, 5)), 402: ((1, 0),)}
+GENERATED_MANUAL_EVIDENCE: dict[int, str] = {99: 'roundtrip', 102: 'roundtrip', 104: 'roundtrip', 105: 'roundtrip', 121: 'roundtrip', 122: 'roundtrip', 125: 'roundtrip', 130: 'roundtrip', 140: 'roundtrip', 151: 'roundtrip', 177: 'roundtrip', 178: 'roundtrip', 210: 'differential', 211: 'differential', 230: 'roundtrip', 231: 'roundtrip', 240: 'roundtrip', 241: 'roundtrip', 251: 'differential', 252: 'differential', 255: 'differential', 257: 'differential', 260: 'differential', 270: 'differential', 281: 'roundtrip', 300: 'differential', 402: 'roundtrip'}
 # END WOLFLATOR EDITOR CALIBRATION
 
 # The free 3.713 command inventory. ProFeature (1000) is deliberately absent.
@@ -479,6 +479,11 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
         "record": '[102][1,9]<0>(9)("0","1","2","3","4","5","6","7","8")',
     },
     {
+        "id": "CAL-102-EIGHT",
+        "opcode": 102,
+        "record": '[102][1,8]<0>(152)("A","B","C","D","E","F","G","H")',
+    },
+    {
         "id": "CAL-121-DYNAMIC-TARGET",
         "opcode": 121,
         "record": "[121][7,0]<0>(1100000000,0,320,24576,23,0,1100003)()",
@@ -489,6 +494,18 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
         "id": "CAL-210-STRING-ARG",
         "opcode": 210,
         "record": '[210][3,2]<0>(500031,4112,0)("","CAL.txt")',
+    },
+    {
+        "id": "CAL-210-TWO-NUMERIC-ONE-STRING-A",
+        "opcode": 210,
+        "record": '[210][5,2]<0>(500216,4114,-1,0,0)("","Data/EP/CAL-A")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-210-TWO-NUMERIC-ONE-STRING-B",
+        "opcode": 210,
+        "record": '[210][5,2]<0>(500216,4114,-1,0,0)("","Data/EP/CAL-B")',
+        "differential": "call_argument",
     },
     {
         "id": "CAL-210-MANY-VARS",
@@ -535,6 +552,35 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
         "opcode": 300,
         "record": '[300][8,4]<0>(0,16801842,2,1600014,3000000,0,0,1600007)("CAL-EVENT","",",","")',
     },
+    {
+        "id": "CAL-122-FILE-READ",
+        "opcode": 122,
+        "record": "[122][4,0]<0>(1600005,1281,1600005,1)()",
+    },
+    {
+        "id": "CAL-300-ONE-STRING-A",
+        "opcode": 300,
+        "record": '[300][3,2]<0>(0,4112,0)("CAL-EVENT","A")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-ONE-STRING-B",
+        "opcode": 300,
+        "record": '[300][3,2]<0>(0,4112,0)("CAL-EVENT","B")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-FIVE-NUMERIC-THREE-STRING-A",
+        "opcode": 300,
+        "record": '[300][10,4]<0>(0,28725,1,4,0,0,0,0,0,0)("CAL-EVENT","A","BODY","OK")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-FIVE-NUMERIC-THREE-STRING-B",
+        "opcode": 300,
+        "record": '[300][10,4]<0>(0,28725,1,4,0,0,0,0,0,0)("CAL-EVENT","B","BODY","OK")',
+        "differential": "call_argument",
+    },
     {"id": "CAL-099-EMPTY", "opcode": 99, "record": "[99][0,0]<0>()()"},
     {"id": "CAL-104-ABORT-CHOICE", "opcode": 104, "record": "[104][0,0]<0>()()"},
     {
@@ -559,6 +605,47 @@ MANUAL_CALIBRATION_CASES: tuple[dict[str, object], ...] = (
         "id": "CAL-300-MANY-ARGS-B",
         "opcode": 300,
         "record": '[300][11,5]<0>(0,16838724,335,20,-2,0,1600005,1600005,1600005,1600005,1600000)("CAL-EVENT","B","115","100","20")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-130-LEGACY-TELEPORT",
+        "opcode": 130,
+        "record": "[130][4,0]<0>(-1,0,0,2000021)()",
+    },
+    {
+        "id": "CAL-210-ONE-NUMERIC-ONE-STRING-A",
+        "opcode": 210,
+        "record": '[210][4,2]<0>(500109,4113,1,0)("","CAL-A")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-210-ONE-NUMERIC-ONE-STRING-B",
+        "opcode": 210,
+        "record": '[210][4,2]<0>(500109,4113,1,0)("","CAL-B")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-210-ONE-NUMERIC-TWO-STRING-A",
+        "opcode": 210,
+        "record": '[210][5,3]<0>(500470,8225,0,0,0)("","CAL-A","BODY")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-210-ONE-NUMERIC-TWO-STRING-B",
+        "opcode": 210,
+        "record": '[210][5,3]<0>(500470,8225,0,0,0)("","CAL-B","BODY")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-THREE-NUMERIC-TWO-STRING-A",
+        "opcode": 300,
+        "record": '[300][7,3]<0>(0,12323,1,-1001,-1001,0,0)("CAL-EVENT","CAL-A","BODY")',
+        "differential": "call_argument",
+    },
+    {
+        "id": "CAL-300-THREE-NUMERIC-TWO-STRING-B",
+        "opcode": 300,
+        "record": '[300][7,3]<0>(0,12323,1,-1001,-1001,0,0)("CAL-EVENT","CAL-B","BODY")',
         "differential": "call_argument",
     },
 )

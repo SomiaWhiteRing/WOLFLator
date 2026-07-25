@@ -47,7 +47,6 @@ _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
 # selectors; switch to a symbolic string-set domain if a corpus exceeds this cap.
 _STRING_LITERAL_LIMIT = 4096
-_LOOP_LIMIT = 64
 
 
 @contextmanager
@@ -175,6 +174,7 @@ class _CommandBlock:
     string_inputs: int = 0
     return_target: int = -1
     map_id: int = -1
+    map_ids: tuple[int, ...] = ()
 
 
 AutoEvent = _CommandBlock
@@ -286,14 +286,7 @@ class _CallSummary:
 
 
 _CallCache = dict[tuple[object, ...], _CallSummary]
-
-
-class _BreakLoop(Exception):
-    pass
-
-
-class _ContinueLoop(Exception):
-    pass
+_CallArgumentPool = dict[str, tuple[_StringValue, ...]]
 
 
 class _LinkParser(HTMLParser):
@@ -1213,10 +1206,18 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
 
 
 def _block_map_id(block: _CommandBlock) -> int:
+    if block.map_ids:
+        return block.map_ids[0]
     if block.map_id >= 0:
         return block.map_id
     match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", block.source, re.IGNORECASE)
     return int(match.group(1)) if match else -1
+
+
+def _block_map_ids(block: _CommandBlock) -> tuple[int, ...]:
+    if block.map_ids:
+        return block.map_ids
+    return (_block_map_id(block),)
 
 
 def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
@@ -1226,19 +1227,52 @@ def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> 
     return f"MAP-{map_id}-Ev{block.event_id:03d}-Page{block.page}-{command_index - 1}-{string_index}"
 
 
+def _event_codes(
+    block: _CommandBlock, command_index: int, string_index: int
+) -> tuple[str, ...]:
+    if block.event_type == "common":
+        return (_event_code(block, command_index, string_index),)
+    return tuple(
+        f"MAP-{map_id}-Ev{block.event_id:03d}-Page{block.page}-{command_index - 1}-{string_index}"
+        for map_id in _block_map_ids(block)
+    )
+
+
 def _event_name_code(block: _CommandBlock) -> str:
     if block.event_type == "common":
         return f"COMMON-{block.event_id}-Name"
     return f"MAP-{_block_map_id(block)}-Ev{block.event_id:03d}-Name"
 
 
+def _event_name_codes(block: _CommandBlock) -> tuple[str, ...]:
+    if block.event_type == "common":
+        return (_event_name_code(block),)
+    return tuple(
+        f"MAP-{map_id}-Ev{block.event_id:03d}-Name"
+        for map_id in _block_map_ids(block)
+    )
+
+
+def _items_for_event_codes(
+    event_items: dict[str, tuple[TranslationItem, ...]],
+    block: _CommandBlock,
+    command_index: int,
+    string_index: int,
+) -> tuple[TranslationItem, ...]:
+    by_key: dict[str, TranslationItem] = {}
+    for code in _event_codes(block, command_index, string_index):
+        for item in event_items.get(code.upper(), ()):
+            by_key.setdefault(item.key, item)
+    return tuple(by_key.values())
+
+
 def _map_ids_from_databases(
     databases: dict[str, dict[int, _DatabaseType]],
-) -> dict[str, int]:
+) -> dict[str, tuple[int, ...]]:
     table = databases.get("SDB", {}).get(0)
     if table is None:
         return {}
-    result: dict[str, int] = {}
+    result: dict[str, list[int]] = {}
     for map_id, row in enumerate(table.rows):
         if not row or not row[0].strip():
             continue
@@ -1246,12 +1280,8 @@ def _map_ids_from_databases(
         if relative.casefold().startswith("data/"):
             relative = relative[5:]
         key = f"{relative}.Auto.txt".casefold()
-        previous = result.setdefault(key, map_id)
-        if previous != map_id:
-            raise ValueError(
-                f"SDB 地图文件坐标重复: {relative} -> {previous}, {map_id}"
-            )
-    return result
+        result.setdefault(key, []).append(map_id)
+    return {key: tuple(values) for key, values in result.items()}
 
 
 class _BlockAnalyzer:
@@ -1266,6 +1296,7 @@ class _BlockAnalyzer:
         event_scopes: dict[int, frozenset[str]] | None = None,
         call_stack: tuple[tuple[int, int | None], ...] = (),
         call_cache: _CallCache | None = None,
+        call_argument_pool: _CallArgumentPool | None = None,
         candidate_values: dict[str, str] | None = None,
         audit: _AnalysisAudit | None = None,
     ) -> None:
@@ -1278,6 +1309,9 @@ class _BlockAnalyzer:
         self.event_scopes = event_scopes or {}
         self.call_stack = call_stack
         self.call_cache = call_cache if call_cache is not None else {}
+        self.call_argument_pool = (
+            call_argument_pool if call_argument_pool is not None else {}
+        )
         self.candidate_values = candidate_values or {}
         self.audit = audit if audit is not None else _AnalysisAudit.empty()
         self.dependencies: list[dict[str, object]] = []
@@ -1321,8 +1355,8 @@ class _BlockAnalyzer:
         literal = command.strings[string_index] if string_index < len(command.strings) else ""
         values = {
             self.candidate_values.get(item.key, literal)
-            for item in self.event_items.get(
-                _event_code(self.block, index + 1, string_index).upper(), ()
+            for item in _items_for_event_codes(
+                self.event_items, self.block, index + 1, string_index
             )
             if item.original == literal
         }
@@ -2068,17 +2102,16 @@ class _BlockAnalyzer:
         literal = command.strings[string_index] if string_index < len(command.strings) else ""
         keys = frozenset(
             item.key
-            for item in self.event_items.get(
-                _event_code(self.block, index + 1, string_index).upper(), ()
+            for item in _items_for_event_codes(
+                self.event_items, self.block, index + 1, string_index
             )
             if item.original == literal
         )
         if self.block.event_type == "common":
             source_scope = f"common:{self.block.event_id}"
         else:
-            match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", self.block.source, re.IGNORECASE)
-            map_id = int(match.group(1)) if match else 0
-            source_scope = f"map:{map_id}:{self.block.event_id}:{self.block.page}"
+            map_ids = ",".join(map(str, _block_map_ids(self.block)))
+            source_scope = f"map:{map_ids}:{self.block.event_id}:{self.block.page}"
         candidate_literals = self._candidate_literal_values(
             command, index, string_index
         )
@@ -2228,8 +2261,8 @@ class _BlockAnalyzer:
             literal_keys = {
                 item.key
                 for string_index, literal in enumerate(command.strings)
-                for item in self.event_items.get(
-                    _event_code(self.block, index + 1, string_index).upper(), ()
+                for item in _items_for_event_codes(
+                    self.event_items, self.block, index + 1, string_index
                 )
                 if item.original == literal
             }
@@ -2284,7 +2317,9 @@ class _BlockAnalyzer:
             literal_values = condition_literal.literals
             condition_keys = sorted(
                 item.key
-                for item in self.event_items.get(condition_code, ())
+                for item in _items_for_event_codes(
+                    self.event_items, self.block, index + 1, condition_index
+                )
                 if item.original == command.strings[condition_index]
             )
             value = state.strings.get(variable)
@@ -2396,53 +2431,6 @@ class _BlockAnalyzer:
             if command.opcode == opcode and command.indent == indent:
                 return index
         return None
-
-    def _branches(
-        self,
-        start: int,
-        end: int,
-        state: _AnalysisState,
-        exits: list[_AnalysisState] | None = None,
-        truth: bool | None = None,
-    ) -> tuple[_AnalysisState | None, int] | None:
-        closing = self._matching(start, end, 499)
-        if closing is None:
-            return None
-        indent = self.block.commands[start].indent
-        all_markers = [
-            index for index in range(start + 1, closing)
-            if self.block.commands[index].indent == indent
-            and self.block.commands[index].opcode in {401, 420, 421}
-        ]
-        if not all_markers:
-            return state, closing + 1
-        if truth is True:
-            markers = all_markers[:1]
-        elif truth is False:
-            markers = [
-                marker for marker in all_markers
-                if self.block.commands[marker].opcode in {420, 421}
-            ]
-            if not markers:
-                return state, closing + 1
-        else:
-            markers = all_markers
-        branch_states: list[_AnalysisState] = []
-        for marker in markers:
-            position = all_markers.index(marker)
-            branch_end = (
-                all_markers[position + 1]
-                if position + 1 < len(all_markers)
-                else closing
-            )
-            branch_state = state.copy()
-            if self._execute(marker + 1, branch_end, branch_state, exits):
-                branch_states.append(branch_state)
-        if truth is None and not any(
-            self.block.commands[index].opcode in {420, 421} for index in markers
-        ):
-            branch_states.append(state.copy())
-        return (_merge_states(branch_states) if branch_states else None), closing + 1
 
     @staticmethod
     def _numeric_condition_truth(
@@ -2808,11 +2796,16 @@ class _BlockAnalyzer:
                     ),
                 )
             else:
-                callee_state.strings[destination] = self._literal_string(
-                    command,
-                    index,
-                    string_offset + offset,
-                    state,
+                pooled = self.call_argument_pool.get(command_id, ())
+                callee_state.strings[destination] = (
+                    pooled[offset]
+                    if offset < len(pooled)
+                    else self._literal_string(
+                        command,
+                        index,
+                        string_offset + offset,
+                        state,
+                    )
                 )
 
         if not has_return and not any(
@@ -2870,6 +2863,7 @@ class _BlockAnalyzer:
                 self.event_scopes,
                 self.call_stack + (call_key,),
                 self.call_cache,
+                self.call_argument_pool,
                 self.candidate_values,
                 self.audit,
             )
@@ -3138,9 +3132,7 @@ class _BlockAnalyzer:
         state: _AnalysisState,
         exits: list[_AnalysisState] | None = None,
     ) -> bool:
-        start = index
         end = index + 1
-        jump_counts: Counter[int] = Counter()
         while index < end:
             command = self.block.commands[index]
             command_id = self._command_id(index)
@@ -3192,176 +3184,12 @@ class _BlockAnalyzer:
                 )
             elif command.opcode == 112:
                 self._condition(command, index, state)
-                branch = self._branches(index, end, state, exits)
-                if branch:
-                    merged, index = branch
-                    if merged is None:
-                        return False
-                    state.numbers = merged.numbers
-                    state.strings = merged.strings
-                    state.database_strings = merged.database_strings
-                    state.unknown_scopes = merged.unknown_scopes
-                    state.unknown_reasons = merged.unknown_reasons
-                    continue
             elif command.opcode == 111:
-                branch = self._branches(
-                    index,
-                    end,
-                    state,
-                    exits,
-                    truth=self._numeric_condition_truth(command, state),
-                )
-                if branch:
-                    merged, index = branch
-                    if merged is None:
-                        return False
-                    state.numbers = merged.numbers
-                    state.strings = merged.strings
-                    state.database_strings = merged.database_strings
-                    state.unknown_scopes = merged.unknown_scopes
-                    state.unknown_reasons = merged.unknown_reasons
-                    continue
+                pass
             elif command.opcode in {210, 300}:
                 self._call_event(command, index, state)
             elif command.opcode == 211:
                 self._reserve_event(command, index, state)
-            elif command.opcode in {170, 179}:
-                closing = self._matching(index, end, 498)
-                if closing is None:
-                    self._record_unknown(command, index, "loop-without-end")
-                else:
-                    count_value = (
-                        _number_argument(command.ints[0], state)
-                        if command.opcode == 179 and command.ints
-                        else _NumberValue(None, "无限循环")
-                    )
-                    iterations = (
-                        next(iter(count_value.values))
-                        if count_value.values is not None and len(count_value.values) == 1
-                        else _LOOP_LIMIT + 1
-                    )
-                    before = state.copy()
-                    stable = False
-                    previous = before
-                    for _ in range(min(max(iterations, 0), _LOOP_LIMIT)):
-                        previous = state.copy()
-                        try:
-                            if not self._execute(index + 1, closing, state, exits):
-                                return False
-                        except _BreakLoop:
-                            stable = True
-                            break
-                        except _ContinueLoop:
-                            pass
-                        if state == previous:
-                            stable = True
-                            break
-                    if iterations > _LOOP_LIMIT or command.opcode == 170:
-                        states = [before, state]
-                        if not stable:
-                            widened = state.copy()
-                            for variable in set(previous.numbers) | set(state.numbers):
-                                if previous.numbers.get(variable) != state.numbers.get(variable):
-                                    current = state.numbers.get(variable)
-                                    widened.numbers[variable] = _NumberValue(
-                                        None,
-                                        "循环数值未稳定",
-                                        current.tracked if current else False,
-                                    )
-                            widened_before = widened.copy()
-                            try:
-                                if not self._execute(index + 1, closing, widened, exits):
-                                    return False
-                            except _BreakLoop:
-                                stable = True
-                            except _ContinueLoop:
-                                pass
-                            stable = widened == widened_before
-                            states.append(widened)
-                            previous = widened_before
-                            state = widened
-                        merged = _merge_states(states)
-                        for variable in set(before.strings) | set(state.strings):
-                            if not stable and previous.strings.get(variable) != state.strings.get(variable):
-                                value = merged.strings.get(variable) or _StringValue()
-                                if value.symbolic_all:
-                                    continue
-                                merged.strings[variable] = _StringValue(
-                                    value.source_keys, value.cells, value.trace,
-                                    "循环扩大后字符串仍未稳定", True,
-                                    value.scopes,
-                                    None,
-                                )
-                        state.numbers = merged.numbers
-                        state.strings = merged.strings
-                        state.database_strings = merged.database_strings
-                        state.unknown_scopes = merged.unknown_scopes
-                        state.unknown_reasons = merged.unknown_reasons
-                    index = closing + 1
-                    continue
-            elif command.opcode == 171:
-                raise _BreakLoop
-            elif command.opcode == 176:
-                raise _ContinueLoop
-            elif command.opcode == 172:
-                if exits is not None:
-                    exits.append(state.copy())
-                return False
-            elif command.opcode in {173, 174, 175}:
-                return False
-            elif command.opcode == 213:
-                if command.strings == ("END",):
-                    if exits is not None:
-                        exits.append(state.copy())
-                    return False
-                target_names = (
-                    _expand_string_references(
-                        frozenset({command.strings[0]}), state
-                    )
-                    if len(command.strings) == 1
-                    else None
-                )
-                target_name = (
-                    next(iter(target_names))
-                    if target_names is not None and len(target_names) == 1
-                    else command.strings[0] if len(command.strings) == 1 else ""
-                )
-                targets = tuple(sorted({
-                    position
-                    for name in (target_names or ())
-                    for position in self.labels.get(name, ())
-                }))
-                if len(targets) == 1:
-                    target = targets[0]
-                    jump_counts[target] += 1
-                    if jump_counts[target] <= _LOOP_LIMIT:
-                        end = len(self.block.commands)
-                        index = target + 1
-                        continue
-                    scopes = self._current_scope()
-                    state.unknown_scopes = state.unknown_scopes | scopes
-                    state.unknown_reasons = state.unknown_reasons | frozenset({
-                        f"{self._location(index)}: 标签跳转 {target_name!r} 未收敛"
-                    })
-                    self.summary_failed = f"标签跳转 {target_name!r} 超过 64 次仍未收敛"
-                    self._blocking_scope_dependency(
-                        command,
-                        index,
-                        "control_flow",
-                        self.summary_failed,
-                        scopes,
-                    )
-                    return False
-                scopes = self._current_scope()
-                self._blocking_scope_dependency(
-                    command,
-                    index,
-                    "control_flow",
-                    f"标签目标为运行时动态值，已保守保护当前事件范围 {target_name!r}",
-                    scopes,
-                    status="dynamic",
-                )
-                return False
             elif command.opcode not in {0, 401, 420, 421, 498, 499}:
                 effect = str(semantics["effect"]) if semantics else None
                 if effect in {"no_write", "control_flow"}:
@@ -3658,6 +3486,7 @@ class _BlockAnalyzer:
         }
         pending: deque[tuple[int, int]] = deque(((start, initial_limit),))
         visits: Counter[tuple[int, int]] = Counter()
+        processed: dict[tuple[int, int], _AnalysisState] = {}
         fallthrough: list[_AnalysisState] = []
         structural = {170, 171, 172, 173, 174, 175, 176, 179, 213}
 
@@ -3667,13 +3496,15 @@ class _BlockAnalyzer:
             current = states[key].copy()
             visits[key] += 1
             if visits[key] > _CFG_STATE_VISIT_LIMIT:
-                self._cfg_failure(
-                    self.block.commands[index],
-                    index,
-                    current,
-                    f"控制流固定点超过 {_CFG_STATE_VISIT_LIMIT} 次仍未收敛",
-                )
-                continue
+                previous = processed.get(key)
+                if previous is not None:
+                    # ponytail: widen only the hot join's changing domains. A
+                    # path-sensitive BDD can replace this if coverage ever needs
+                    # exact values across hundreds of incoming branches.
+                    current = self._widen_back_edge(previous, current)
+                    states[key] = current.copy()
+                visits[key] = 0
+            processed[key] = current.copy()
 
             command = self.block.commands[index]
             if command.opcode not in structural:
@@ -3854,6 +3685,110 @@ def _analyze_blocks(
         if len(group) == 1
     }
     common_by_name = {name: tuple(group) for name, group in common_names.items()}
+    candidate_lookup = candidate_values or {}
+    pooled_calls: dict[tuple[object, ...], list[tuple[str, tuple[_StringValue, ...]]]] = {}
+    for block in blocks:
+        for index, command in enumerate(block.commands):
+            if command.opcode not in {210, 300} or len(command.ints) < 2:
+                continue
+            flags = command.ints[1]
+            if flags & 0x01000000:
+                continue
+            target: _CommandBlock | None = None
+            if command.opcode == 300 and command.strings:
+                matches = common_by_name.get(command.strings[0], ())
+                target = matches[0] if len(matches) == 1 else None
+            elif command.opcode == 210:
+                reference = command.ints[0]
+                if 599_000 <= reference < 601_000 and block.event_type == "common":
+                    target_id = block.event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                else:
+                    target_id = -1
+                target = common_by_id.get(target_id)
+            numeric_count = flags & 0x0F
+            string_count = (flags >> 4) & 0x0F
+            string_start = 2 + numeric_count
+            string_end = string_start + string_count
+            literal_offset = 1
+            if (
+                target is None
+                or len(command.ints) != string_end
+                or len(command.strings) < literal_offset + string_count
+                or any(raw >= 1_000_000 for raw in command.ints[2:string_end])
+            ):
+                continue
+            values: list[_StringValue] = []
+            for string_index in range(string_count):
+                text = command.strings[literal_offset + string_index]
+                if _CSELF_REFERENCE_RE.search(text) or _STRING_REFERENCE_RE.search(text):
+                    values = []
+                    break
+                keys = frozenset(
+                    item.key
+                    for item in _items_for_event_codes(
+                        frozen_event_items,
+                        block,
+                        index + 1,
+                        literal_offset + string_index,
+                    )
+                    if item.original == text
+                )
+                literals = frozenset(
+                    candidate_lookup.get(key, text) for key in keys
+                ) or frozenset({text})
+                values.append(
+                    _StringValue(
+                        keys,
+                        trace=(
+                            f"{block.source} event={block.event_id} page={block.page} "
+                            f"command={index + 1} call-argument={string_index}",
+                        ),
+                        literals=literals,
+                    )
+                )
+            if len(values) != string_count:
+                continue
+            choice = command.ints[2] if numeric_count else 0
+            group = (
+                target.event_id,
+                choice,
+                tuple(command.ints[2:string_start]),
+                string_count,
+            )
+            command_id = (
+                f"{block.source}:{block.event_type}:{block.event_id}:"
+                f"{block.page}:{index + 1}"
+            )
+            pooled_calls.setdefault(group, []).append((command_id, tuple(values)))
+
+    call_argument_pool: _CallArgumentPool = {}
+    for calls in pooled_calls.values():
+        # ponytail: batches cap provenance below the 256-value widening limit.
+        # A parameterized event-summary engine can replace this conservative union.
+        for batch_start in range(0, len(calls), 128):
+            batch = calls[batch_start : batch_start + 128]
+            pooled: list[_StringValue] = []
+            for argument_index in range(len(batch[0][1])):
+                values = [arguments[argument_index] for _command_id, arguments in batch]
+                pooled.append(
+                    _StringValue(
+                        frozenset().union(*(value.source_keys for value in values)),
+                        frozenset().union(*(value.cells for value in values)),
+                        tuple(
+                            dict.fromkeys(
+                                trace for value in values for trace in value.trace
+                            )
+                        ),
+                        literals=frozenset().union(
+                            *(value.literals or frozenset() for value in values)
+                        ),
+                    )
+                )
+            pooled_tuple = tuple(pooled)
+            for command_id, _arguments in batch:
+                call_argument_pool[command_id] = pooled_tuple
     event_scopes = _conservative_event_scopes(blocks, common_by_id, common_by_name)
     dependencies: list[dict[str, object]] = []
     unknown = Counter()
@@ -3870,6 +3805,7 @@ def _analyze_blocks(
             common_by_name,
             event_scopes,
             call_cache=call_cache,
+            call_argument_pool=call_argument_pool,
             candidate_values=candidate_values,
             audit=audit,
         )
@@ -3988,7 +3924,6 @@ def _translation_usage_report(
             )
             roles = _command_string_roles(command, semantics)
             for string_index, text in enumerate(command.strings):
-                code = _event_code(block, index, string_index).upper()
                 role = roles[string_index] if string_index < len(roles) else "unresolved"
                 if role in {
                     "assignment_literal",
@@ -4007,7 +3942,11 @@ def _translation_usage_report(
                     )
                     )
                 )
-                for item in by_code.get(code, ()):
+                matching_items: dict[str, TranslationItem] = {}
+                for code in _event_codes(block, index, string_index):
+                    for item in by_code.get(code.upper(), ()):
+                        matching_items.setdefault(item.key, item)
+                for item in matching_items.values():
                     if item.original == text:
                         usages.setdefault(item.key, set()).add(usage)
     for dependency in dependencies:
@@ -4362,8 +4301,12 @@ def analyze_auto_export(
 
     map_ids = _map_ids_from_databases(database_types)
     blocks = [
-        replace(block, map_id=map_ids.get(block.source.casefold(), block.map_id))
-        if block.event_type == "map"
+        replace(
+            block,
+            map_id=map_ids[block.source.casefold()][0],
+            map_ids=map_ids[block.source.casefold()],
+        )
+        if block.event_type == "map" and block.source.casefold() in map_ids
         else block
         for block in blocks
     ]
@@ -5260,11 +5203,11 @@ def compare_auto_structure(
                 approved_codes.add(target)
                 queue.append(target)
 
-    segment_expected: dict[str, str] = {}
-    for code, code_items in by_code.items():
-        if len(code_items) != 1 or code.startswith("SEGMENT_"):
-            continue
-        current = code_items[0]
+    def segment_chain(code: str) -> list[TranslationItem]:
+        candidates = by_code.get(code, [])
+        if len(candidates) != 1:
+            return []
+        current = candidates[0]
         parts = [current]
         seen_segments = {code}
         while True:
@@ -5278,11 +5221,35 @@ def compare_auto_structure(
             next_code = match.group(1).upper()
             candidates = by_code.get(next_code, [])
             if len(candidates) != 1 or next_code in seen_segments:
-                parts = []
-                break
+                return []
             seen_segments.add(next_code)
             current = candidates[0]
             parts.append(current)
+        return parts
+
+    def copy_source(code: str) -> str | None:
+        seen = {code}
+        while True:
+            candidates = by_code.get(code, [])
+            if len(candidates) != 1:
+                return None
+            match = COPY_FROM_RE.search(candidates[0].flag)
+            if match is None:
+                return code
+            code = match.group(1).upper()
+            if code in seen:
+                return None
+            seen.add(code)
+
+    segment_expected: dict[str, str] = {}
+    for code in by_code:
+        if code.startswith("SEGMENT_"):
+            continue
+        target_parts = segment_chain(code)
+        if len(target_parts) <= 1:
+            continue
+        source_code = copy_source(code)
+        parts = segment_chain(source_code) if source_code is not None else []
         if len(parts) <= 1:
             continue
         expected = "".join(
@@ -5296,7 +5263,7 @@ def compare_auto_structure(
             .replace("\r", "\n")
             .replace("\n", r"<\n>")
         )
-        if any(part.key in approved_keys for part in parts):
+        if any(part.key in approved_keys for part in parts + target_parts):
             approved_codes.add(code)
     queue = deque(approved_codes)
     while queue:
@@ -5321,10 +5288,9 @@ def compare_auto_structure(
             event_type = "common" if path.name == "CommonEvent.dat.Auto.txt" else "map"
             for block in _event_blocks(path, event_type, source=path.relative_to(root).as_posix())[0]:
                 if event_type == "map":
-                    block = replace(
-                        block,
-                        map_id=map_ids.get(block.source.casefold(), block.map_id),
-                    )
+                    aliases = map_ids.get(block.source.casefold())
+                    if aliases:
+                        block = replace(block, map_id=aliases[0], map_ids=aliases)
                 result[(block.source, block.event_id, block.page)] = block
         return result
 
@@ -5390,7 +5356,9 @@ def compare_auto_structure(
         after = after_events[key]
         location = f"{before.source} event={before.event_id} page={before.page}"
         if before.event_name != after.event_name:
-            if _event_name_code(before).upper() not in approved_codes:
+            if not any(
+                code.upper() in approved_codes for code in _event_name_codes(before)
+            ):
                 add("event_name", location, before.event_name, after.event_name)
         if len(before.commands) != len(after.commands):
             add("command_count", location, len(before.commands), len(after.commands))
@@ -5411,18 +5379,25 @@ def compare_auto_structure(
             for string_index, (left_text, right_text) in enumerate(zip(left.strings, right.strings, strict=True)):
                 if left_text == right_text:
                     continue
-                code = _event_code(before, index, string_index).upper()
-                expected = segment_expected.get(code)
-                if expected is not None:
-                    if right_text != expected:
+                codes = tuple(
+                    code.upper()
+                    for code in _event_codes(before, index, string_index)
+                )
+                expected_values = {
+                    segment_expected[code]
+                    for code in codes
+                    if code in segment_expected
+                }
+                if expected_values:
+                    if right_text not in expected_values:
                         add(
                             "segmented_string",
                             f"{command_location} string={string_index}",
-                            expected,
+                            sorted(expected_values),
                             right_text,
                         )
                     continue
-                if code not in approved_codes:
+                if not any(code in approved_codes for code in codes):
                     add("unapproved_string", f"{command_location} string={string_index}", left_text, right_text)
 
     database_names = (("DataBase", "UDB"), ("CDataBase", "CDB"), ("SysDataBase", "SDB"))

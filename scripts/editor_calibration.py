@@ -762,6 +762,48 @@ def _validate_manual_cases(copied: str) -> list[dict[str, object]]:
             '"B"',
             "opcode 300 多参数公共事件调用",
         ),
+        (
+            "CAL-210-TWO-NUMERIC-ONE-STRING-A",
+            "CAL-210-TWO-NUMERIC-ONE-STRING-B",
+            "Data/EP/CAL-A",
+            "Data/EP/CAL-B",
+            "opcode 210 字符串参数调用",
+        ),
+        (
+            "CAL-300-ONE-STRING-A",
+            "CAL-300-ONE-STRING-B",
+            '"A"',
+            '"B"',
+            "opcode 300 单字符串参数调用",
+        ),
+        (
+            "CAL-300-FIVE-NUMERIC-THREE-STRING-A",
+            "CAL-300-FIVE-NUMERIC-THREE-STRING-B",
+            '"A"',
+            '"B"',
+            "opcode 300 多字符串参数调用",
+        ),
+        (
+            "CAL-210-ONE-NUMERIC-ONE-STRING-A",
+            "CAL-210-ONE-NUMERIC-ONE-STRING-B",
+            "CAL-A",
+            "CAL-B",
+            "opcode 210 单数值单字符串参数调用",
+        ),
+        (
+            "CAL-210-ONE-NUMERIC-TWO-STRING-A",
+            "CAL-210-ONE-NUMERIC-TWO-STRING-B",
+            "CAL-A",
+            "CAL-B",
+            "opcode 210 单数值双字符串参数调用",
+        ),
+        (
+            "CAL-300-THREE-NUMERIC-TWO-STRING-A",
+            "CAL-300-THREE-NUMERIC-TWO-STRING-B",
+            "CAL-A",
+            "CAL-B",
+            "opcode 300 三数值双字符串参数调用",
+        ),
     )
     for left_id, right_id, old, new, label in differential_pairs:
         left = official.get(left_id, "")

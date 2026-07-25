@@ -31,6 +31,7 @@ from wolf_command_catalog import VERIFIED_EDITOR_SHA256, VERIFIED_EDITOR_VERSION
 from wolf_editor import analyze_auto_export, inspect_wolf_editor  # noqa: E402
 from wolf_tools import (  # noqa: E402
     CancelledError,
+    OfficialArtifactMissingError,
     OfficialToolDialogError,
     ToolProcessError,
     dump_items,
@@ -602,6 +603,24 @@ def _run_candidate(
             )
             return report
         report["status"] = "PASS"
+    except OfficialArtifactMissingError as error:
+        evidence = [
+            {"kind": "damaged_map_data", "diagnostic": diagnostic}
+            for diagnostic in error.diagnostics
+        ]
+        report.update(
+            {
+                "status": "OUT_OF_SCOPE",
+                "source_fingerprint_after": game_fingerprint(
+                    source, str(candidate["kind"])
+                ),
+                "failure_stage": current_stage,
+                "failure_class": "damaged_map_data",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "evidence": evidence[:5],
+            }
+        )
     except OfficialToolDialogError as error:
         evidence = _official_out_of_scope(error.dialogs)
         if evidence:

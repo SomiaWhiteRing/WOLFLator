@@ -337,6 +337,14 @@ class OfficialToolDialogError(RuntimeError):
         super().__init__("官方工具弹出错误对话框：" + "；".join(dialogs))
 
 
+class OfficialArtifactMissingError(FileNotFoundError):
+    def __init__(self, artifact: str | Path, diagnostics: list[str]):
+        self.artifact = Path(artifact)
+        self.diagnostics = tuple(diagnostics)
+        detail = "；".join(diagnostics[:5])
+        super().__init__(f"官方工具没有生成 {self.artifact}；控制台诊断：{detail}")
+
+
 class ToolProcessError(RuntimeError):
     def __init__(
         self,
@@ -451,6 +459,23 @@ def parse_official_diagnostics(text: str) -> list[dict[str, str]]:
             }
         )
     return diagnostics
+
+
+def parse_official_map_failures(text: str) -> list[str]:
+    compact = re.sub(r"\s+", "", text)
+    failures = []
+    for match in re.finditer(
+        r"Map(?P<map>\d+):(?P<path>Data[\\/]+MapData[\\/]+.{1,500}?)"
+        r"が読み込めませんでした(?P<detail>.{0,500}?)=>Failed",
+        compact,
+    ):
+        detail = match.group("detail")
+        if "破損" not in detail and "アクセス権限" not in detail:
+            continue
+        failures.append(
+            f"Map {match.group('map')} {match.group('path')}: 読み込み失敗 ({detail[:160]})"
+        )
+    return failures
 
 
 def _write_console_snapshot(path: Path, *, text: str = "", done: bool = False, error: str = "") -> None:
@@ -969,14 +994,6 @@ class OfficialToolRunner:
             diagnostic_log,
             "official.sound_suppression method=import-redirection source=MessageBeep target=IsWindow",
         )
-        command = [
-            str(self.executable),
-            "-mode",
-            mode,
-        ]
-        if language_index is not None:
-            command.append(str(language_index))
-        command.extend(["-gamedata", str(root) + os.sep, "-mes_lang", "EN"])
         slow_warning_callback = None
         if mode in {"EXTRACT", "UPDATE_EXCEL"} and (warning or log):
             sink = warning or log
@@ -984,17 +1001,34 @@ class OfficialToolRunner:
                 f"官方工具 {mode} 已运行超过 5 分钟；"
                 "请检查“自动排除大文件”是否启用，或适当降低大小上限。"
             )
-        result = run_process(
-            command,
-            cwd=self.executable.parent,
-            cancel_event=cancel_event,
-            log=log,
-            diagnostic_log=diagnostic_log,
-            hide_window=True,
-            capture_console=True,
-            slow_warning_after=300 if mode in {"EXTRACT", "UPDATE_EXCEL"} else None,
-            slow_warning=slow_warning_callback,
-        )
+        lib = self.executable.parent / "LibXL.dll"
+        if not lib.is_file():
+            raise FileNotFoundError(f"官方工具目录缺少 {lib.name}。")
+        with tempfile.TemporaryDirectory(
+            prefix="wolflator-official-", dir=self.executable.parent.parent
+        ) as temporary_directory:
+            isolated_dir = Path(temporary_directory)
+            isolated_executable = isolated_dir / self.executable.name
+            shutil.copy2(self.executable, isolated_executable)
+            shutil.copy2(lib, isolated_dir / lib.name)
+            _emit_log(diagnostic_log, f"official.instance isolated={isolated_dir}")
+            command = [str(isolated_executable), "-mode", mode]
+            if language_index is not None:
+                command.append(str(language_index))
+            command.extend(["-gamedata", str(root) + os.sep, "-mes_lang", "EN"])
+            result = run_process(
+                command,
+                cwd=isolated_dir,
+                cancel_event=cancel_event,
+                log=log,
+                diagnostic_log=diagnostic_log,
+                hide_window=True,
+                capture_console=True,
+                slow_warning_after=(
+                    300 if mode in {"EXTRACT", "UPDATE_EXCEL"} else None
+                ),
+                slow_warning=slow_warning_callback,
+            )
         self.console_outputs.append(
             {
                 "mode": mode,
@@ -1018,7 +1052,17 @@ class OfficialToolRunner:
             backup.unlink(missing_ok=True)
             replace_with_retry(existing, backup)
         self.run("EXTRACT", game_root, **kwargs)
-        return locate_workbook(game_root)
+        try:
+            return locate_workbook(game_root)
+        except FileNotFoundError:
+            console = self.console_outputs[-1]["final"] if self.console_outputs else ""
+            diagnostics = parse_official_map_failures(console)
+            if diagnostics:
+                raise OfficialArtifactMissingError(
+                    Path(game_root) / SUPPORT_DIR / WORKBOOK_NAME,
+                    diagnostics,
+                ) from None
+            raise
 
     def update_excel(self, game_root: str | Path, **kwargs) -> Path:
         self.run("UPDATE_EXCEL", game_root, **kwargs)
