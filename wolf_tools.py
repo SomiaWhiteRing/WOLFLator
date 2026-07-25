@@ -337,6 +337,14 @@ class OfficialToolDialogError(RuntimeError):
         super().__init__("官方工具弹出错误对话框：" + "；".join(dialogs))
 
 
+def official_dialogs_indicate_legacy_game(dialogs: Iterable[str]) -> bool:
+    return any(
+        "editor.exe version used to create the game data seems to be old"
+        in " ".join(dialog.casefold().split())
+        for dialog in dialogs
+    )
+
+
 class OfficialArtifactMissingError(FileNotFoundError):
     def __init__(self, artifact: str | Path, diagnostics: list[str]):
         self.artifact = Path(artifact)

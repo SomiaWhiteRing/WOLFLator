@@ -231,6 +231,7 @@ def _settings_check(args: argparse.Namespace) -> int:
     result = {
         "valid": not errors,
         "errors": errors,
+        "auto_convert_legacy_games": settings.auto_convert_legacy_games,
         "tools": {"wolf_editor": editor_result},
     }
     if args.json:

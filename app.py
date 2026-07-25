@@ -589,6 +589,11 @@ class SettingsDialog(QDialog):
         self.editor_status = QLabel("")
         self.editor_status.setObjectName("secondaryText")
         form.addRow("", self.editor_status)
+        self.auto_convert_legacy_games = QCheckBox("自动转换 Ver2 及更早版本的游戏")
+        self.auto_convert_legacy_games.setChecked(
+            self.settings.auto_convert_legacy_games
+        )
+        form.addRow("", self.auto_convert_legacy_games)
         self.editor_path.editingFinished.connect(self._probe_editor)
         self._probe_editor()
 
@@ -964,6 +969,7 @@ class SettingsDialog(QDialog):
         item = self.settings
         item.wolf_tool_path = self.wolf_path.text().strip()
         item.wolf_editor_path = self.editor_path.text().strip()
+        item.auto_convert_legacy_games = self.auto_convert_legacy_games.isChecked()
         item.ainiee_source = self.ainiee_path.text().strip()
         item.api_base_url = self.api_url.text().strip().rstrip("/")
         item.api_model = self.api_model.text().strip()

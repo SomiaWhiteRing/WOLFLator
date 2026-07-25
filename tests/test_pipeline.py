@@ -22,6 +22,7 @@ from pipeline import Pipeline, create_project, load_manifest
 from wolf_editor import EditorInfo, analyze_auto_export
 from wolf_tools import (
     IMPORT_PROTECTION_SCHEMA,
+    OfficialToolDialogError,
     UberWolfRunner,
     dump_items,
     full_export_scope,
@@ -57,6 +58,42 @@ class FailingPipeline(FakePipeline):
 
 
 class PipelineTests(unittest.TestCase):
+    _LEGACY_DIALOG = (
+        "Warning! | The process completed, but the Editor.exe version used "
+        "to create the game data seems to be old!"
+    )
+
+    def test_legacy_export_respects_auto_conversion_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            messages = []
+            pipeline = Pipeline(
+                manifest_path,
+                AppSettings(auto_convert_legacy_games=False),
+                "",
+                root / "cache",
+                glossary_api_key="",
+                log=messages.append,
+            )
+            runner = mock.Mock(scope=ImportScope(external=False))
+            runner.extract.side_effect = OfficialToolDialogError([self._LEGACY_DIALOG])
+            with self.assertRaisesRegex(RuntimeError, "自动转换 Ver2"):
+                pipeline._run_scoped_export(runner, "EXTRACT")
+            self.assertTrue(any("请在设置中开启" in message for message in messages))
+
+            pipeline.settings.auto_convert_legacy_games = True
+            workbook = root / "source.xlsx"
+            runner.extract.side_effect = [
+                OfficialToolDialogError([self._LEGACY_DIALOG]),
+                workbook,
+            ]
+            conversion = mock.Mock()
+            with mock.patch("pipeline.convert_legacy_game", return_value=conversion) as convert:
+                self.assertEqual(workbook, pipeline._run_scoped_export(runner, "EXTRACT"))
+            convert.assert_called_once()
+            self.assertIs(conversion, pipeline._legacy_conversion_result)
+
     def test_unpack_excludes_mtool_trsdata_with_hash_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -36,6 +36,7 @@ from wolf_tools import (  # noqa: E402
     ToolProcessError,
     dump_items,
     load_items,
+    official_dialogs_indicate_legacy_game,
     protect_control_tokens,
     restore_control_tokens,
     selected_translation_requirements,
@@ -55,7 +56,7 @@ def _official_out_of_scope(dialogs: Sequence[str]) -> list[dict[str, object]]:
     evidence = []
     for dialog in dialogs:
         normalized = " ".join(dialog.casefold().split())
-        if "editor.exe version used to create the game data seems to be old" in normalized:
+        if official_dialogs_indicate_legacy_game([dialog]):
             kind = "legacy_editor_data"
         elif "map size error" in normalized:
             kind = "damaged_map_data"

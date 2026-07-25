@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -17,13 +18,14 @@ from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Callable, Iterable, Iterator
 
 from models import TranslationItem
 from safe_io import (
     ResourceBusyError,
     ResourceLock,
+    atomic_output_path,
     atomic_write_json,
     package_lock,
     replace_with_retry,
@@ -33,7 +35,15 @@ from wolf_command_catalog import (
     VERIFIED_EDITOR_VERSION,
     command_semantics,
 )
-from wolf_tools import COPY_FROM_RE, CancelledError, hash_directory, run_process, sha256_file
+from wolf_tools import (
+    COPY_FROM_RE,
+    CancelledError,
+    _kill_process_tree,
+    _process_startupinfo,
+    hash_directory,
+    run_process,
+    sha256_file,
+)
 
 
 EDITOR_DOWNLOAD_URL = "https://silversecond.com/WolfRPGEditor/Download.shtml"
@@ -146,6 +156,18 @@ class EditorExportResult:
     editor: EditorInfo
     warning_count: int
     warnings: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class LegacyConversionResult:
+    editor: EditorInfo
+    runtime_path: Path
+    runtime_sha256: str
+    log_path: Path
+    report_path: Path
+    before_hash: str
+    after_hash: str
+    converted_files: int
 
 
 @dataclass(frozen=True)
@@ -585,6 +607,461 @@ def install_supported_editor(
             part.unlink(missing_ok=True)
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
+
+
+def _inspect_matching_runtime(path: Path, editor: EditorInfo) -> str:
+    version, version_tuple, description = _windows_version_resource(path)
+    if path.name.casefold() != "game.exe" or description != "Game / WOLF RPG Editor":
+        raise ValueError("文件不是 WOLF RPG Editor 的 Game.exe。")
+    if version_tuple != editor.version_tuple:
+        raise ValueError(
+            f"Game.exe 版本 {version} 与 Editor.exe {editor.version} 不一致。"
+        )
+    return sha256_file(path)
+
+
+def _matching_editor_runtime(
+    editor: EditorInfo,
+    cache_root: str | Path,
+    *,
+    log: Callable[[str], None] | None,
+) -> tuple[Path, str]:
+    sibling = editor.path.with_name("Game.exe")
+    try:
+        return sibling, _inspect_matching_runtime(sibling, editor)
+    except (OSError, ValueError):
+        pass
+
+    cache = Path(cache_root).resolve()
+    version = ".".join(editor.version.split(".")[:2])
+    release = EditorRelease(
+        version,
+        tuple(int(part) for part in version.split(".")),
+        f"https://www.silversecond.com/WolfRPGEditor/Data/WolfRPGEditor_{version}.zip",
+        False,
+    )
+    final = cache / version
+    metadata_path = final / "wolflator-runtime.json"
+    with package_lock(cache, "install-wolf-runtime"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            runtime = final / "Game.exe"
+            runtime_sha256 = _inspect_matching_runtime(runtime, editor)
+            if (
+                metadata.get("source_url") == release.url
+                and metadata.get("editor_version") == editor.version
+                and metadata.get("game_sha256") == runtime_sha256
+            ):
+                return runtime, runtime_sha256
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+        cache.mkdir(parents=True, exist_ok=True)
+        part = cache / f".{version}.runtime.zip.part"
+        staging = Path(tempfile.mkdtemp(prefix=f".{version}.runtime.", dir=cache))
+        if log:
+            log(f"Editor 目录缺少配套 Game.exe，正在下载官方 {version} 完整包...")
+        try:
+            part.unlink(missing_ok=True)
+            archive_sha256, archive_size = _download_editor_archive(release, part)
+            with zipfile.ZipFile(part) as package:
+                members = [
+                    member
+                    for member in package.infolist()
+                    if PurePath(member.filename.replace("\\", "/")).name.casefold()
+                    == "game.exe"
+                ]
+                if len(members) != 1:
+                    raise ValueError("Editor 官方完整包缺少唯一的 Game.exe。")
+                member = members[0]
+                file_type = (member.external_attr >> 16) & 0o170000
+                if (
+                    member.is_dir()
+                    or file_type == 0o120000
+                    or member.file_size > MAX_EDITOR_ARCHIVE_BYTES
+                ):
+                    raise ValueError("Editor 官方包中的 Game.exe 结构异常。")
+                runtime = staging / "Game.exe"
+                with package.open(member) as source, runtime.open("wb") as target:
+                    shutil.copyfileobj(source, target, 1024 * 1024)
+            runtime_sha256 = _inspect_matching_runtime(runtime, editor)
+            atomic_write_json(
+                staging / "wolflator-runtime.json",
+                {
+                    "schema": 1,
+                    "source_url": release.url,
+                    "archive_size": archive_size,
+                    "archive_sha256": archive_sha256,
+                    "editor_version": editor.version,
+                    "game_sha256": runtime_sha256,
+                },
+            )
+            shutil.rmtree(final, ignore_errors=True)
+            replace_with_retry(staging, final)
+            return final / "Game.exe", runtime_sha256
+        finally:
+            part.unlink(missing_ok=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+# ponytail: This fail-closed dialog contract is calibrated against the official
+# Japanese 3.713 UI; recalibrate the tokens if a later Editor changes the flow.
+def _legacy_conversion_action(
+    title: str,
+    text: str,
+    has_buttons: bool,
+    *,
+    started: bool,
+) -> tuple[str, str] | None:
+    message = f"{title} | {text}"
+    if "Ver2以前" in title and "コンバート" in title:
+        if not has_buttons:
+            return None
+        return None if started else ("start", "start")
+    if "Ver3では挙動が大きく変わります" in message:
+        return ("legacy-behavior", "no")
+    for token, action in (
+        ("旧Ver2.29時点の挙動", "legacy-confirmed"),
+        ("バックアップを開始します", "backup-start"),
+        ("バックアップが完了しました", "backup-complete"),
+        ("コンバート作業を開始します", "conversion-start"),
+        ("コンバート作業が完了しました", "conversion-complete"),
+    ):
+        if token in message:
+            return (action, "ok")
+    if not text.strip():
+        return None
+    if has_buttons:
+        raise RuntimeError(f"Editor 自动转换出现未识别的对话框：{message[:1000]}")
+    return None
+
+
+def _legacy_dialog_button(
+    buttons: list[tuple[int, int, str]], role: str
+) -> tuple[int, int, str] | None:
+    if role == "no":
+        return next(
+            (
+                button
+                for button in buttons
+                if button[0] == 7 or button[2].replace("&", "") in {"いいえ", "No"}
+            ),
+            None,
+        )
+    if role == "ok":
+        selected = next(
+            (
+                button
+                for button in buttons
+                if button[0] == 1
+                or button[2].replace("&", "").casefold() == "ok"
+                or button[2] == "确定"
+            ),
+            None,
+        )
+        return selected or (buttons[0] if len(buttons) == 1 else None)
+    candidates = [
+        button
+        for button in buttons
+        if "コンバート" in button[2] or "開始" in button[2]
+    ]
+    return candidates[0] if len(candidates) == 1 else (buttons[0] if len(buttons) == 1 else None)
+
+
+def _drive_legacy_conversion(
+    process: subprocess.Popen[bytes],
+    game_root: Path,
+    *,
+    timeout: int,
+    cancel_event: threading.Event | None,
+    diagnostic_log: Callable[[str], None] | None,
+    warning: Callable[[str], None] | None,
+) -> tuple[Path, set[str]]:
+    if os.name != "nt":
+        raise OSError("WOLF RPG Editor 自动转换仅支持 Windows。")
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    started_at = time.monotonic()
+    actions: set[str] = set()
+    slow_warning_sent = False
+    main_windows: set[int] = set()
+
+    def window_text(window: int) -> str:
+        length = user32.GetWindowTextLengthW(window)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(window, buffer, length + 1)
+        return buffer.value.strip()
+
+    def process_windows() -> list[tuple[int, str, str, list[tuple[int, int, str]]]]:
+        found: list[tuple[int, str, str, list[tuple[int, int, str]]]] = []
+
+        @callback_type
+        def visit_window(window, _parameter):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+            if owner.value != process.pid:
+                return True
+            user32.ShowWindow(window, 0)
+            class_name = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(window, class_name, len(class_name))
+            title = window_text(window)
+            body: list[str] = []
+            buttons: list[tuple[int, int, str]] = []
+
+            @callback_type
+            def visit_child(child, _child_parameter):
+                child_class = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(child, child_class, len(child_class))
+                child_text = window_text(child)
+                if "button" in child_class.value.casefold():
+                    buttons.append(
+                        (int(user32.GetDlgCtrlID(child)), int(child), child_text)
+                    )
+                elif child_text:
+                    body.append(child_text)
+                return True
+
+            user32.EnumChildWindows(window, visit_child, 0)
+            found.append((int(window), title, " | ".join(body), buttons))
+            return True
+
+        user32.EnumWindows(visit_window, 0)
+        return found
+
+    conversion_log = game_root / "Backup_Before_Ver3" / "ConvertLog.txt"
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError("Editor 自动转换已取消。")
+            elapsed = time.monotonic() - started_at
+            if elapsed > timeout:
+                raise TimeoutError(f"Editor 自动转换超过 {timeout} 秒。")
+            if not slow_warning_sent and elapsed >= 300:
+                slow_warning_sent = True
+                if warning:
+                    warning("WOLF RPG Editor 自动转换已运行超过 5 分钟，请继续等待。")
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Editor 在转换完成前退出，退出码 {process.returncode}。"
+                )
+
+            windows = process_windows()
+            for window, title, body, buttons in windows:
+                if "Ver2以前" in title and "コンバート" in title:
+                    main_windows.add(window)
+                action = _legacy_conversion_action(
+                    title,
+                    body,
+                    bool(buttons),
+                    started="start" in actions,
+                )
+                if action is None or action[0] in actions:
+                    continue
+                name, role = action
+                selected = _legacy_dialog_button(buttons, role)
+                button = selected[1] if selected else None
+                if button is None:
+                    raise RuntimeError(
+                        f"Editor 自动转换对话框缺少 {role} 按钮：{title} | {body}；"
+                        f"buttons={[(item[0], item[2]) for item in buttons]}"
+                    )
+                actions.add(name)
+                if diagnostic_log:
+                    diagnostic_log(
+                        f"editor.legacy.action name={name} window={window} "
+                        f"button_id={selected[0]} button_text={selected[2]}"
+                    )
+                user32.SendMessageW(button, 0x00F5, 0, 0)  # BM_CLICK
+
+            if "conversion-complete" in actions and conversion_log.is_file():
+                break
+            time.sleep(0.05)
+    finally:
+        if process.poll() is None:
+            for window in main_windows:
+                user32.PostMessageW(window, 0x0010, 0, 0)  # WM_CLOSE
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(process)
+                process.wait()
+    return conversion_log, actions
+
+
+def convert_legacy_game(
+    editor_path: str | Path,
+    game_root: str | Path,
+    evidence_dir: str | Path,
+    *,
+    runtime_cache: str | Path | None = None,
+    cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
+    diagnostic_log: Callable[[str], None] | None = None,
+    warning: Callable[[str], None] | None = None,
+) -> LegacyConversionResult:
+    editor = inspect_wolf_editor(editor_path)
+    game = Path(game_root).resolve()
+    source_data = game / "Data"
+    if not (source_data / "BasicData" / "Game.dat").is_file():
+        raise ValueError("Editor 自动转换需要松散 Data/BasicData/Game.dat。")
+    game_executable = game / "Game.exe"
+    if not game_executable.is_file():
+        raise ValueError("Editor 自动转换需要工作副本中的 Game.exe。")
+    output = Path(evidence_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    runtime_root = runtime_cache or (
+        Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
+        / "WOLFLator"
+        / "packages"
+        / "editor-runtime"
+    )
+    runtime, runtime_sha256 = _matching_editor_runtime(
+        editor,
+        runtime_root,
+        log=log,
+    )
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix=".wolflator-legacy-", dir=game.parent)
+    )
+    staged_game = temporary_root / "game"
+    backup_data = game.parent / f".{game.name}.legacy-backup-{time.time_ns():x}"
+    backup_executable = game.parent / f".{game.name}.legacy-game-{time.time_ns():x}.exe"
+    before_hash = hash_directory(source_data)
+    before_executable_hash = sha256_file(game_executable)
+    promoted = False
+    try:
+        if log:
+            log("正在后台复制工作副本并调用官方 Editor 转换 Ver2 数据...")
+        shutil.copytree(game, staged_game)
+        shutil.copy2(editor.path, staged_game / "Editor.exe")
+        shutil.copy2(runtime, staged_game / "Game.exe")
+        shutil.rmtree(staged_game / "Backup_Before_Ver3", ignore_errors=True)
+        with _editor_execution_lock(
+            editor,
+            cancel_event=cancel_event,
+            diagnostic_log=diagnostic_log,
+            warning=warning,
+        ):
+            process = subprocess.Popen(
+                [str(staged_game / "Editor.exe")],
+                cwd=staged_game,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                startupinfo=_process_startupinfo(True),
+            )
+            if diagnostic_log:
+                diagnostic_log(
+                    f"editor.legacy.start pid={process.pid} game={staged_game} editor={editor.path}"
+                )
+            conversion_log, actions = _drive_legacy_conversion(
+                process,
+                staged_game,
+                timeout=1800,
+                cancel_event=cancel_event,
+                diagnostic_log=diagnostic_log,
+                warning=warning,
+            )
+
+        log_text = conversion_log.read_text(encoding="utf-8")
+        converted_files = log_text.count("●変換OK!")
+        if (
+            converted_files < 1
+            or "Data/BasicData/Game.dat" not in log_text
+            or re.search(r"失敗|エラー|\bError\b", log_text, re.IGNORECASE)
+        ):
+            raise RuntimeError("Editor 自动转换日志未通过校验。")
+        required_actions = {
+            "start",
+            "legacy-behavior",
+            "conversion-start",
+            "conversion-complete",
+        }
+        missing_actions = required_actions - actions
+        if missing_actions:
+            raise RuntimeError(
+                "Editor 自动转换没有完成预期步骤：" + ", ".join(sorted(missing_actions))
+            )
+        converted_data = staged_game / "Data"
+        after_hash = hash_directory(converted_data)
+        if before_hash == after_hash:
+            raise RuntimeError("Editor 报告转换完成，但 Data 内容没有变化。")
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("Editor 自动转换已取消。")
+
+        evidence_log = output / "ConvertLog.txt"
+        with atomic_output_path(evidence_log) as temporary:
+            shutil.copy2(conversion_log, temporary)
+        report_path = output / "conversion.json"
+        atomic_write_json(
+            report_path,
+            {
+                "schema": 1,
+                "editor_version": editor.version,
+                "editor_sha256": editor.sha256,
+                "before_data_hash": before_hash,
+                "after_data_hash": after_hash,
+                "before_game_exe_sha256": before_executable_hash,
+                "after_game_exe_sha256": runtime_sha256,
+                "runtime_path": str(runtime),
+                "converted_files": converted_files,
+                "runtime_behavior": "Ver2.29",
+                "actions": sorted(actions),
+                "log": str(evidence_log),
+            },
+        )
+
+        shutil.copy2(game_executable, backup_executable)
+        replace_with_retry(source_data, backup_data)
+        try:
+            replace_with_retry(converted_data, source_data)
+            with atomic_output_path(game_executable) as temporary:
+                shutil.copy2(runtime, temporary)
+            if hash_directory(source_data) != after_hash:
+                raise RuntimeError("转换后的 Data 提升校验失败。")
+            if sha256_file(game_executable) != runtime_sha256:
+                raise RuntimeError("Ver3 Game.exe 提升校验失败。")
+        except Exception:
+            shutil.rmtree(source_data, ignore_errors=True)
+            replace_with_retry(backup_data, source_data)
+            with atomic_output_path(game_executable) as temporary:
+                shutil.copy2(backup_executable, temporary)
+            raise
+        promoted = True
+        shutil.rmtree(backup_data, ignore_errors=True)
+        backup_executable.unlink(missing_ok=True)
+        if log:
+            log(f"旧版数据转换完成，共转换 {converted_files} 个文件。")
+        if diagnostic_log:
+            diagnostic_log(
+                f"editor.legacy.complete before={before_hash} after={after_hash} "
+                f"files={converted_files} report={report_path}"
+            )
+        return LegacyConversionResult(
+            editor,
+            runtime,
+            runtime_sha256,
+            evidence_log,
+            report_path,
+            before_hash,
+            after_hash,
+            converted_files,
+        )
+    finally:
+        if backup_data.exists():
+            if promoted and source_data.exists():
+                shutil.rmtree(backup_data, ignore_errors=True)
+            elif not source_data.exists():
+                replace_with_retry(backup_data, source_data)
+        if backup_executable.exists():
+            if promoted and game_executable.exists():
+                backup_executable.unlink(missing_ok=True)
+            elif not game_executable.exists():
+                replace_with_retry(backup_executable, game_executable)
+        shutil.rmtree(temporary_root, ignore_errors=True)
 
 
 def _copy_editor_sandbox(editor: Path, game_root: Path, sandbox: Path) -> list[Path]:

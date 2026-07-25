@@ -107,6 +107,7 @@ def _require_fields(data: object, expected: set[str], label: str) -> None:
 class AppSettings:
     wolf_tool_path: str = ""
     wolf_editor_path: str = ""
+    auto_convert_legacy_games: bool = True
     ainiee_source: str = ""
     ascii_runner_dir: str = ""
     projects_root: str = ""

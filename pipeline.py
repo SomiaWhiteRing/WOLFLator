@@ -61,11 +61,13 @@ from wolf_editor import (
     AUTO_ANALYSIS_SCHEMA,
     analyze_translation_safety,
     compare_auto_structure,
+    convert_legacy_game,
     export_and_analyze,
     inspect_wolf_editor,
 )
 from wolf_tools import (
     CancelledError,
+    OfficialToolDialogError,
     OfficialToolRunner,
     UberWolfRunner,
     analyze_import_protection,
@@ -79,6 +81,7 @@ from wolf_tools import (
     locate_workbook,
     merge_ainiee_output,
     name_baseline_scope,
+    official_dialogs_indicate_legacy_game,
     prepare_official_tool,
     prepare_uberwolf,
     read_translation_items,
@@ -242,6 +245,7 @@ class Pipeline:
         self.cancel_event = threading.Event()
         self._project_lock_depth = 0
         self._project_lock_owner: int | None = None
+        self._legacy_conversion_result = None
         self.manifest = load_manifest(self.manifest_path)
 
     @property
@@ -338,6 +342,7 @@ class Pipeline:
                 f"glossary_api_url={self._safe_glossary_api_url}",
                 f"glossary_api_model={self.settings.glossary_api_model}",
                 f"wolf_tool={self.settings.wolf_tool_path}",
+                f"auto_convert_legacy_games={self.settings.auto_convert_legacy_games}",
                 f"ainiee_source={self.settings.ainiee_source}",
                 f"ascii_runner_dir={self.settings.ascii_runner_dir}",
                 f"cache_root={self.cache_root}",
@@ -534,6 +539,7 @@ class Pipeline:
                 extra["wolf_editor_sha256"] = ""
             extra["editor_analysis_schema"] = AUTO_ANALYSIS_SCHEMA
             extra["export_schema"] = EXPORT_SCHEMA
+            extra["auto_convert_legacy_games"] = self.settings.auto_convert_legacy_games
             extra["export_scope"] = self.manifest.export_scope.__dict__
             extra["exclude_large_external_files"] = self.manifest.exclude_large_external_files
             extra["external_file_limit_kb"] = self.manifest.external_file_limit_kb
@@ -699,7 +705,7 @@ class Pipeline:
         )
         return OfficialToolRunner(executable, scope)
 
-    def _run_scoped_export(self, runner: OfficialToolRunner, mode: str) -> Path:
+    def _run_scoped_export_once(self, runner: OfficialToolRunner, mode: str) -> Path:
         operation = runner.update_excel if mode == "UPDATE_EXCEL" else runner.extract
         kwargs = {
             "cancel_event": self.cancel_event,
@@ -708,7 +714,7 @@ class Pipeline:
             "warning": self.warning,
         }
         if not (
-            self.manifest.export_scope.external
+            runner.scope.external
             and self.manifest.exclude_large_external_files
         ):
             return operation(self.work_dir, **kwargs)
@@ -740,6 +746,42 @@ class Pipeline:
             with atomic_output_path(target) as temporary:
                 shutil.copy2(workbook, temporary)
             return target
+
+    def _run_scoped_export(self, runner: OfficialToolRunner, mode: str) -> Path:
+        try:
+            return self._run_scoped_export_once(runner, mode)
+        except OfficialToolDialogError as error:
+            if not official_dialogs_indicate_legacy_game(error.dialogs):
+                raise
+            disabled_message = (
+                "检测到游戏数据由 Ver3 之前的 WOLF RPG Editor 制作；"
+                "请在设置中开启“自动转换 Ver2 及更早版本的游戏”后重试。"
+            )
+            if not self.settings.auto_convert_legacy_games:
+                self.warning(disabled_message)
+                raise RuntimeError(disabled_message) from error
+            self.warning(
+                "检测到 Ver3 之前的游戏数据，正在使用官方 Editor 后台转换为 Ver3 格式，"
+                "并保留旧 Ver2.29 运行行为。"
+            )
+            self._legacy_conversion_result = convert_legacy_game(
+                self.settings.wolf_editor_path,
+                self.work_dir,
+                self.artifacts_dir / "legacy-conversion",
+                runtime_cache=self.cache_root / "packages" / "editor-runtime",
+                cancel_event=self.cancel_event,
+                log=self.log,
+                diagnostic_log=self.detail,
+                warning=self.warning,
+            )
+            try:
+                return self._run_scoped_export_once(runner, mode)
+            except OfficialToolDialogError as retry_error:
+                if official_dialogs_indicate_legacy_game(retry_error.dialogs):
+                    raise RuntimeError(
+                        "官方 Editor 已报告转换完成，但官方翻译工具仍判定数据早于 Ver3。"
+                    ) from retry_error
+                raise
 
     def _copy(self) -> dict[str, str]:
         original = _validate_game(self.manifest.version.original_path)
@@ -812,6 +854,7 @@ class Pipeline:
         }
 
     def _extract(self) -> dict[str, str]:
+        self._legacy_conversion_result = None
         runner = self._official_runner(self.manifest.export_scope)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         token = f"{int(time.time())}-{os.getpid()}-{time.time_ns() & 0xFFFFFF:x}"
@@ -842,14 +885,9 @@ class Pipeline:
             shutil.copy2(workbook, extracted)
 
             self.log("正在生成名称分类基准工作簿...")
-            baseline_workbook = self._official_runner(
-                name_baseline_scope(self.manifest.export_scope)
-            ).extract(
-                self.work_dir,
-                cancel_event=self.cancel_event,
-                log=self.log,
-                diagnostic_log=self.detail,
-                warning=self.warning,
+            baseline_workbook = self._run_scoped_export(
+                self._official_runner(name_baseline_scope(self.manifest.export_scope)),
+                "EXTRACT",
             )
             baseline = staging / "source-baseline.xlsx"
             shutil.copy2(baseline_workbook, baseline)
@@ -938,6 +976,18 @@ class Pipeline:
             }
             if editor_result.warning_count:
                 artifacts["editor_warnings"] = str(editor_analysis)
+            if self._legacy_conversion_result is not None:
+                conversion = self._legacy_conversion_result
+                artifacts.update(
+                    {
+                        "legacy_conversion_report": str(conversion.report_path),
+                        "legacy_conversion_log": str(conversion.log_path),
+                        "legacy_conversion_before_hash": conversion.before_hash,
+                        "legacy_conversion_after_hash": conversion.after_hash,
+                        "legacy_runtime": str(conversion.runtime_path),
+                        "legacy_runtime_sha256": conversion.runtime_sha256,
+                    }
+                )
             if conflicts:
                 conflicts_path = final_dir / "incremental-conflicts.json"
                 artifacts["incremental_conflicts"] = str(conflicts_path)

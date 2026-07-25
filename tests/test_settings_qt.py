@@ -84,6 +84,9 @@ class SettingsQtTests(unittest.TestCase):
             dialog = SettingsDialog(store)
             self.assertEqual(item.wolf_tool_path, dialog.wolf_path.text())
             self.assertEqual(item.wolf_editor_path, dialog.editor_path.text())
+            self.assertTrue(dialog.auto_convert_legacy_games.isChecked())
+            dialog.auto_convert_legacy_games.setChecked(False)
+            self.assertFalse(dialog._current_settings().auto_convert_legacy_games)
             self.assertEqual(item.ainiee_source, dialog.ainiee_path.text())
             self.assertIn(
                 "官方下载页",

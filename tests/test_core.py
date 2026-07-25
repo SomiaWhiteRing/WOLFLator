@@ -68,6 +68,7 @@ from wolf_tools import (
     name_baseline_scope,
     parse_official_diagnostics,
     parse_official_map_failures,
+    official_dialogs_indicate_legacy_game,
     protect_control_tokens,
     read_translation_items,
     read_font_slots,
@@ -91,8 +92,10 @@ from wolf_editor import (
     _NumberValue,
     _StringValue,
     _copy_editor_sandbox,
+    _legacy_conversion_action,
     _database_index,
     _editor_execution_lock,
+    _inspect_matching_runtime,
     _merge_numbers,
     _merge_strings,
     _restore_editor_map_paths,
@@ -114,6 +117,69 @@ HEADERS = [
     "Original text (No Change)",
     "Translated text 1 / Chinese (Simplified)",
 ]
+
+
+class LegacyConversionContractTests(unittest.TestCase):
+    def test_old_editor_dialog_and_conversion_sequence_are_exact(self):
+        self.assertTrue(
+            official_dialogs_indicate_legacy_game(
+                [
+                    "Warning! | The process completed, but the Editor.exe version used "
+                    "to create the game data seems to be old!"
+                ]
+            )
+        )
+        self.assertFalse(official_dialogs_indicate_legacy_game(["unknown warning"]))
+        self.assertEqual(
+            ("start", "start"),
+            _legacy_conversion_action(
+                "【Ver2以前のWOLF RPGエディターをご利用だった方へ】 最初にファイルのコンバートを行います",
+                "",
+                True,
+                started=False,
+            ),
+        )
+        self.assertEqual(
+            ("legacy-behavior", "no"),
+            _legacy_conversion_action(
+                "確認",
+                "【注意！ Ver3では挙動が大きく変わります！】",
+                True,
+                started=True,
+            ),
+        )
+        self.assertEqual(
+            ("conversion-complete", "ok"),
+            _legacy_conversion_action(
+                "完了",
+                "ファイルのコンバート作業が完了しました。",
+                True,
+                started=True,
+            ),
+        )
+
+    def test_legacy_runtime_must_match_editor_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "Game.exe"
+            runtime.write_bytes(b"runtime")
+            editor = EditorInfo(
+                Path(directory) / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            with mock.patch(
+                "wolf_editor._windows_version_resource",
+                return_value=(
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "Game / WOLF RPG Editor",
+                ),
+            ):
+                self.assertEqual(
+                    hashlib.sha256(b"runtime").hexdigest(),
+                    _inspect_matching_runtime(runtime, editor),
+                )
 
 
 def make_workbook(path: Path) -> Path:
