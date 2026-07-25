@@ -329,7 +329,7 @@ class SettingsQtTests(unittest.TestCase):
                 _completed_import_protection(manifest, items)["protected_keys"],
             )
 
-    def test_pending_import_font_coverage_contains_original_and_translation(self):
+    def test_pending_import_font_coverage_contains_translations_only(self):
         manifest = SimpleNamespace(
             import_scope=ImportScope(),
             import_protection=ImportProtectionRules(),
@@ -344,7 +344,8 @@ class SettingsQtTests(unittest.TestCase):
         ]
         required, exact = _font_required_characters(manifest, items, None)
         self.assertFalse(exact)
-        self.assertTrue(set("原文甲译乙") <= required)
+        self.assertTrue(set("译文乙") <= required)
+        self.assertFalse(set("原文甲") <= required)
 
     def test_incompatible_project_manifest_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:

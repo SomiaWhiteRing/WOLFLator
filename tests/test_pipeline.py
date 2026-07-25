@@ -385,6 +385,14 @@ class PipelineTests(unittest.TestCase):
                 for index in range(4)
             ]
             items.append(TranslationItem(key="text", original="原文", translation="中文𠀀", code="COMMON-1-2-0"))
+            items.append(
+                TranslationItem(
+                    key="protected",
+                    original="·隣𠀁",
+                    translation="不会导入",
+                    code="COMMON-1-3-0",
+                )
+            )
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts["items"] = str(items_path)
             workbook_path = pipeline.artifacts_dir / "source.xlsx"
@@ -429,7 +437,7 @@ class PipelineTests(unittest.TestCase):
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["workbook"] = str(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
             self._attach_editor_analysis(pipeline)
-            self._attach_import_protection(pipeline)
+            self._attach_import_protection(pipeline, ("protected",))
 
             verification = root / "verification.xlsx"
             verify_book = Workbook()
@@ -494,6 +502,11 @@ class PipelineTests(unittest.TestCase):
             )
             result = json.loads(Path(artifacts["font_result"]).read_text(encoding="utf-8"))
             self.assertEqual([BUNDLED_FONT_FAMILY] * 4, result["applied_slots"])
+            self.assertEqual("approved_import_translations", result["coverage_scope"])
+            warnings = json.loads(Path(artifacts["font_warnings"]).read_text(encoding="utf-8"))
+            self.assertTrue(
+                all("𠀁" not in warning["missing"] for warning in warnings["warnings"])
+            )
             runner.translate.assert_called_once()
             self.assertEqual(2, runner.extract.call_count)
 

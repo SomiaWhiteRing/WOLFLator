@@ -62,6 +62,7 @@ from wolf_tools import (
     dump_items,
     final_display_texts,
     full_export_scope,
+    imported_display_texts,
     load_items,
     locate_workbook,
     merge_ainiee_output,
@@ -533,6 +534,43 @@ class WorkbookTests(unittest.TestCase):
             self.assertNotIn(r"中文\C[1]", texts)
             self.assertIn("主人公", texts)
             self.assertNotIn("Picture/顔.png", texts)
+
+    def test_imported_display_texts_exclude_preserved_originals(self):
+        source = TranslationItem(
+            key="source",
+            original="原文甲",
+            translation="译文乙\\C[1]",
+            code="COMMON-1",
+        )
+        copied = TranslationItem(
+            key="copy",
+            original="原文甲",
+            code="COMMON-2",
+            flag="COPY-FROM-COMMON-1",
+            category=ImportCategory.COPY,
+            copy_category=ImportCategory.DISPLAY,
+        )
+        protected = TranslationItem(
+            key="protected",
+            original="·隣",
+            translation="相邻",
+            code="COMMON-3",
+        )
+        unchanged = TranslationItem(
+            key="unchanged",
+            original="原文丙",
+            translation="原文丙",
+            code="COMMON-4",
+        )
+
+        self.assertEqual(
+            ["译文乙", "译文乙"],
+            imported_display_texts(
+                [source, copied, protected, unchanged],
+                ImportScope(),
+                protected_keys={protected.key},
+            ),
+        )
 
 
 class WorkbookAndFontTests(unittest.TestCase):

@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import traceback
-from itertools import chain
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
@@ -96,7 +95,7 @@ from wolf_editor import (
 )
 from wolf_tools import (
     analyze_import_protection,
-    final_display_texts,
+    imported_display_texts,
     load_items,
     read_font_slots,
     selected_translation_requirements,
@@ -269,33 +268,16 @@ def _font_required_characters(
         )
     }
     if protection is not None:
-        texts = final_display_texts(
+        texts = imported_display_texts(
             items,
             manifest.import_scope,
             protected_keys=set(protection["protected_keys"]),
             **options,
         )
         return required_characters(texts), True
-    requirements = set(
-        selected_translation_requirements(items, manifest.import_scope, **options)
-    )
-    # ponytail: when Import is stale, the final value of every selected item is
-    # either its original or translation. Their union avoids rerunning event analysis.
-    texts = chain(
-        final_display_texts(
-            items,
-            manifest.import_scope,
-            protected_keys=set(),
-            **options,
-        ),
-        final_display_texts(
-            items,
-            manifest.import_scope,
-            protected_keys=requirements,
-            **options,
-        ),
-    )
-    return required_characters(texts), False
+    return required_characters(
+        imported_display_texts(items, manifest.import_scope, **options)
+    ), False
 
 
 class PipelineThread(QThread):

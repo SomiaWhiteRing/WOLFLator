@@ -2400,6 +2400,51 @@ def final_display_texts(
     return result
 
 
+def imported_display_texts(
+    items: list[TranslationItem],
+    scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
+    protected_keys: set[str] | None = None,
+) -> list[str]:
+    """Return translated display targets that the scoped import can write."""
+    requirements = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    )
+    requirements = {
+        key: categories
+        for key, categories in requirements.items()
+        if key not in (protected_keys or set())
+    }
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
+    result: list[str] = []
+    for item in items:
+        if is_font_setting(item):
+            continue
+        intrinsic = _content_category(item.code, item.flag, item.type)
+        if intrinsic in {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}:
+            continue
+        if item.category is ImportCategory.COPY:
+            source = _copy_source(item, by_code)
+            text = source.translation if source.key in requirements else ""
+        else:
+            text = (
+                item.translation
+                if item.key in requirements and item.translation != item.original
+                else ""
+            )
+        if not text:
+            continue
+        for token in _scan_control_tokens(text):
+            text = text.replace(token, "")
+        result.append(text)
+    return result
+
+
 def _filename_target_exists(game_root: Path, translated_name: str) -> bool:
     name = translated_name.strip().replace("\\", "/").lstrip("/")
     if not name or ".." in Path(name).parts:

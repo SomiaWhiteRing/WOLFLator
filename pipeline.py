@@ -74,10 +74,10 @@ from wolf_tools import (
     analyze_import_protection,
     classify_optional_name_delta,
     dump_items,
-    final_display_texts,
     full_export_scope,
     hash_directory,
     IMPORT_PROTECTION_SCHEMA,
+    imported_display_texts,
     load_items,
     locate_workbook,
     merge_ainiee_output,
@@ -587,12 +587,25 @@ class Pipeline:
                 ]
                 items_path = self.manifest.version.stage(Stage.VALIDATE).artifacts.get("items", "")
                 if items_path and Path(items_path).is_file():
-                    corpus = final_display_texts(
+                    protection_path = self.manifest.version.stage(
+                        Stage.IMPORT
+                    ).artifacts.get("import_protection", "")
+                    protected_keys: set[str] = set()
+                    if protection_path and Path(protection_path).is_file():
+                        protection = json.loads(
+                            Path(protection_path).read_text(encoding="utf-8")
+                        )
+                        if isinstance(protection, dict):
+                            protected_keys = set(
+                                map(str, protection.get("protected_keys", ()))
+                            )
+                    corpus = imported_display_texts(
                         load_items(items_path),
                         self.manifest.import_scope,
                         allow_copy_condition_groups=(
                             self.manifest.import_protection.allow_copy_condition_groups
                         ),
+                        protected_keys=protected_keys,
                     )
                     extra["font_corpus_sha256"] = hashlib.sha256(
                         json.dumps(corpus, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1568,7 +1581,7 @@ class Pipeline:
         ):
             raise RuntimeError("导入保护报告未通过官方 Editor 回读验证。")
         required = required_characters(
-            final_display_texts(
+            imported_display_texts(
                 validated_items,
                 self.manifest.import_scope,
                 allow_copy_condition_groups=(
@@ -1711,6 +1724,7 @@ class Pipeline:
             {
                 "scheme_sha256": scheme_hash(scheme),
                 "coverage_fingerprint": fingerprint,
+                "coverage_scope": "approved_import_translations",
                 "required_character_count": len(required),
                 "original_slots": original_slots,
                 "applied_slots": desired_slots,
