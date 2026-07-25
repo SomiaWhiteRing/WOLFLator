@@ -67,6 +67,7 @@ from wolf_editor import (
 )
 from wolf_tools import (
     CancelledError,
+    COPY_FROM_RE,
     OfficialToolDialogError,
     OfficialToolRunner,
     UberWolfRunner,
@@ -1626,6 +1627,7 @@ class Pipeline:
             support = font_base / SUPPORT_DIR
             support.mkdir(parents=True, exist_ok=True)
             shutil.copy2(font_workbook, support / WORKBOOK_NAME)
+            font_base_entries = list(font_base.rglob("*"))
             self.log("正在通过官方工具应用四槽位字体方案...")
             generated = runner.translate(
                 font_base,
@@ -1633,6 +1635,16 @@ class Pipeline:
                 log=self.log,
                 diagnostic_log=self.detail,
             )
+            # ponytail: one O(n) missing-file pass preserves files the official
+            # folder builder omits; use a persisted manifest if huge games make this material.
+            for source in font_base_entries:
+                relative = source.relative_to(font_base)
+                target = generated / relative
+                if source.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif source.is_file() and not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
             copied_files = self._copy_font_files(generated, scheme, resolved, original_slots)
             verification_workbook = runner.extract(
                 generated,
@@ -1648,16 +1660,28 @@ class Pipeline:
                     "字体导入回读不一致: "
                     + json.dumps({"expected": desired_slots, "actual": actual_slots}, ensure_ascii=False)
                 )
-            baseline_non_font = [
-                (item.code, item.flag, item.type, item.info, item.original)
+            baseline_non_font = sorted(
+                (
+                    item.code,
+                    COPY_FROM_RE.sub("", item.flag).strip("\r\n"),
+                    item.type,
+                    item.info,
+                    item.original,
+                )
                 for item in baseline_items
                 if item.code not in FONT_CODES
-            ]
-            verification_non_font = [
-                (item.code, item.flag, item.type, item.info, item.original)
+            )
+            verification_non_font = sorted(
+                (
+                    item.code,
+                    COPY_FROM_RE.sub("", item.flag).strip("\r\n"),
+                    item.type,
+                    item.info,
+                    item.original,
+                )
                 for item in verification_items
                 if item.code not in FONT_CODES
-            ]
+            )
             if verification_non_font != baseline_non_font:
                 raise RuntimeError("字体修改导致四个字体字段以外的导出文本发生变化。")
             for item in copied_files:

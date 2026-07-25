@@ -51,12 +51,15 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 6
+AUTO_ANALYSIS_SCHEMA = 8
 TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
 # selectors; switch to a symbolic string-set domain if a corpus exceeds this cap.
 _STRING_LITERAL_LIMIT = 4096
+# ponytail: global writes are joined for at most 32 rounds; non-convergence
+# remains protected. A summarized call graph can raise this bound if needed.
+_GLOBAL_STRING_FLOW_MAX_ITERATIONS = 32
 
 
 @contextmanager
@@ -2017,6 +2020,7 @@ class _BlockAnalyzer:
         value: _StringValue,
         role: str,
         scopes: frozenset[str] = frozenset(),
+        global_string_variable: int | None = None,
     ) -> None:
         if not value.tracked:
             return
@@ -2054,6 +2058,10 @@ class _BlockAnalyzer:
             "status": status,
             "reason": reason,
             "resource_role": role,
+            "global_string_variable": global_string_variable,
+            "source_values": (
+                sorted(value.literals) if value.literals is not None else None
+            ),
         }
         self.dependencies.append(dependency)
         if dependency["status"] == "blocking":
@@ -2763,10 +2771,19 @@ class _BlockAnalyzer:
         if assignment in {3, 4} and source_kind == 1:
             source = source_raw & 0x00FFFFFF
             writes_global = writes_global or not 1_600_000 <= source < 1_600_100
+        global_destinations = {destination}
+        if assignment in {3, 4} and source_kind == 1:
+            global_destinations.add(source_raw & 0x00FFFFFF)
         if writes_global:
-            self._value_boundary_reference(
-                command, index, result, "global_string_write"
-            )
+            for global_destination in sorted(global_destinations):
+                if not 1_600_000 <= global_destination < 1_600_100:
+                    self._value_boundary_reference(
+                        command,
+                        index,
+                        result,
+                        "global_string_write",
+                        global_string_variable=global_destination,
+                    )
         if (
             self.block.event_type == "common"
             and self.block.return_target >= 5
@@ -3492,20 +3509,9 @@ class _BlockAnalyzer:
         if target is None:
             self._record_call(command_id, "exact", ("noop",))
             return
-        scopes = self.event_scopes.get(
-            target.event_id, frozenset({f"common:{target.event_id}"})
-        )
         self._record_call(command_id, "exact", (f"common:{target.event_id}",))
-        if scopes:
-            reason = "预约公共事件存在延迟的全局或数据库副作用"
-            self._blocking_scope_dependency(
-                command,
-                index,
-                "call",
-                reason,
-                scopes,
-                status="dynamic",
-            )
+        # The target is fixed. Its delayed effects are analyzed in the target
+        # event; attaching their broad scope here would taint unrelated text.
 
     def _import_database(
         self, command: _Command, index: int, state: _AnalysisState
@@ -4045,7 +4051,10 @@ class _BlockAnalyzer:
         state.unknown_reasons = result.unknown_reasons
         return True
 
-    def run(self) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    def run(
+        self, initial_state: _AnalysisState | None = None
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+        initial_state = initial_state.copy() if initial_state is not None else _AnalysisState({}, {}, {})
         entry_labels = [
             (index, int(command.strings[0].removeprefix("cmd:")))
             for index, command in enumerate(self.block.commands)
@@ -4060,22 +4069,21 @@ class _BlockAnalyzer:
             first = entry_labels[0][0]
             dispatcher = self._dynamic_entry_dispatcher()
             if first and dispatcher is None:
-                self._execute(0, first, _AnalysisState({}, {}, {}))
+                self._execute(0, first, initial_state.copy())
             for label_index, (start, choice) in enumerate(entry_labels):
                 end = (
                     entry_labels[label_index + 1][0]
                     if label_index + 1 < len(entry_labels)
                     else len(self.block.commands)
                 )
-                state = _AnalysisState(
-                    {1_600_000: _NumberValue(frozenset({choice}))}, {}, {}
-                )
+                state = initial_state.copy()
+                state.numbers[1_600_000] = _NumberValue(frozenset({choice}))
                 if dispatcher is not None:
                     self._execute(dispatcher, len(self.block.commands), state)
                 else:
                     self._execute(start + 1, end, state)
         else:
-            self._execute(0, len(self.block.commands), _AnalysisState({}, {}, {}))
+            self._execute(0, len(self.block.commands), initial_state.copy())
         # Commands excluded by a proven branch still need a syntactic CFG and
         # semantic ledger entry. They are safe because they are unreachable,
         # not because the coverage denominator forgot them.
@@ -4132,6 +4140,7 @@ def _analyze_blocks(
     list[dict[str, object]],
     list[dict[str, object]],
     _AnalysisAudit,
+    dict[str, object],
 ]:
     blocks = list(blocks)
     database_keys: dict[tuple[str, int, int, int], set[str]] = {}
@@ -4292,6 +4301,100 @@ def _analyze_blocks(
             key = (int(warning["opcode"]), str(warning["shape"]))
             unknown[key] += int(warning["count"])
             locations.setdefault(key, []).extend(str(value) for value in warning["locations"])
+
+    def global_writes(
+        records: Iterable[dict[str, object]],
+    ) -> dict[int, _StringValue]:
+        values: dict[int, _StringValue] = {}
+        for dependency in records:
+            if (
+                dependency.get("kind") != "state"
+                or dependency.get("resource_role") != "global_string_write"
+            ):
+                continue
+            raw_variable = dependency.get("global_string_variable")
+            if not isinstance(raw_variable, int) or 1_600_000 <= raw_variable < 1_600_100:
+                continue
+            status = str(dependency.get("status", "blocking"))
+            source_values = dependency.get("source_values")
+            literals = (
+                frozenset(map(str, source_values))
+                if isinstance(source_values, list)
+                else None
+            )
+            cells = frozenset(
+                (
+                    str(cell["database"]),
+                    int(cell["type"]),
+                    int(cell["data"]),
+                    int(cell["field"]),
+                )
+                for cell in dependency.get("database_cells", ())
+                if isinstance(cell, dict)
+                and all(key in cell for key in ("database", "type", "data", "field"))
+            )
+            value = _StringValue(
+                frozenset(map(str, dependency.get("source_keys", ()))),
+                cells,
+                tuple(map(str, dependency.get("trace", ()))),
+                str(dependency.get("reason", "")) if status != "resolved" else "",
+                status == "dynamic",
+                frozenset(map(str, dependency.get("unresolved_scopes", ()))),
+                literals,
+            )
+            values[raw_variable] = _merge_strings(values.get(raw_variable), value) or value
+        return values
+
+    def global_values_equal(
+        left: dict[int, _StringValue], right: dict[int, _StringValue]
+    ) -> bool:
+        return left.keys() == right.keys() and all(
+            _string_semantic_key(value) == _string_semantic_key(right[key])
+            for key, value in left.items()
+        )
+
+    # A global string may be written by one root event and consumed by another.
+    # Re-run every root with the joined write set until its abstract value stops
+    # growing, so a later condition/resource/call keeps the original text.
+    initial_dependencies = list(dependencies)
+    global_strings = global_writes(initial_dependencies)
+    global_iterations = 0
+    global_converged = True
+    while global_strings:
+        if global_iterations >= _GLOBAL_STRING_FLOW_MAX_ITERATIONS:
+            global_converged = False
+            break
+        propagated: list[dict[str, object]] = []
+        for block in blocks:
+            analyzer = _BlockAnalyzer(
+                block,
+                databases,
+                frozen_database_keys,
+                frozen_event_items,
+                common_by_id,
+                common_by_name,
+                event_scopes,
+                call_cache={},
+                call_argument_pool=call_argument_pool,
+                candidate_values=candidate_values,
+                audit=audit,
+            )
+            block_dependencies, _block_blocking, _block_unknown = analyzer.run(
+                _AnalysisState({}, global_strings, {})
+            )
+            propagated.extend(block_dependencies)
+        global_iterations += 1
+        next_global_strings = global_writes([*initial_dependencies, *propagated])
+        if global_values_equal(global_strings, next_global_strings):
+            dependencies.extend(propagated)
+            break
+        global_strings = next_global_strings
+    global_string_flow = {
+        "converged": global_converged,
+        "iterations": global_iterations,
+        "variables": len(global_strings),
+        "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
+    }
     warnings = [
         {"opcode": opcode, "shape": shape, "count": count, "locations": locations[(opcode, shape)][:5]}
         for (opcode, shape), count in sorted(unknown.items())
@@ -4361,6 +4464,16 @@ def _analyze_blocks(
         if rank.get(str(dependency["status"]), 3) > rank.get(str(current["status"]), 3):
             current["status"] = dependency["status"]
             current["reason"] = dependency["reason"]
+        if (
+            current["kind"] == "condition"
+            and current["status"] == "untracked"
+            and current["_source_keys"]
+        ):
+            # Some paths enter with an external value while another root event
+            # provides a tracked global value. Replay the tracked predicate;
+            # the external path cannot change because it has no candidate text.
+            current["status"] = "dynamic"
+            current["reason"] = "条件变量同时存在入口值与可定位的全局写入路径"
     dependencies = []
     for current in merged_dependencies.values():
         current["condition_keys"] = sorted(current.pop("_condition_keys"))
@@ -4381,7 +4494,7 @@ def _analyze_blocks(
         )[:_VALUE_LIMIT]
         dependencies.append(current)
     blocking = [item for item in dependencies if item["status"] == "blocking"]
-    return dependencies, blocking, warnings, audit
+    return dependencies, blocking, warnings, audit, global_string_flow
 
 
 def _translation_usage_report(
@@ -4789,7 +4902,7 @@ def analyze_auto_export(
     ]
 
     project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
-    dependencies, blocking, warnings, audit = _analyze_blocks(
+    dependencies, blocking, warnings, audit, global_string_flow = _analyze_blocks(
         project.events, items, database_types, candidate_values
     )
     call_graph, event_summaries = _call_graph_report(list(project.events))
@@ -4964,6 +5077,7 @@ def analyze_auto_export(
             "database": database_counts,
         },
         "databases": database_report,
+        "global_string_flow": global_string_flow,
         "dependencies": dependencies,
         "blocking_issues": blocking,
         "event_summaries": event_summaries,
@@ -5302,6 +5416,13 @@ def analyze_translation_safety(
         scope: frozenset(keys) for scope, keys in scope_sets.items()
     }
 
+    global_string_flow = analysis.get("global_string_flow")
+    global_string_flow_converged = (
+        isinstance(global_string_flow, dict)
+        and global_string_flow.get("converged") is True
+        and complete_ledger
+    )
+
     def protect(keys: Iterable[object], reason: str) -> None:
         for raw_key in keys:
             key = str(raw_key)
@@ -5390,6 +5511,12 @@ def analyze_translation_safety(
         protect(condition_keys, "condition_literal")
         if kind in {"display", "flow"}:
             return
+        if (
+            kind == "state"
+            and dependency.get("resource_role") == "global_string_write"
+            and global_string_flow_converged
+        ):
+            return
         if status == "dynamic" and kind == "condition" and replay_dynamic_condition(dependency):
             return
         if status != "resolved":
@@ -5401,9 +5528,11 @@ def analyze_translation_safety(
                 (
                     key
                     for key in [*source_keys, *right_keys]
-                    if not target_equivalence
-                    or key not in candidates
-                    or not same_event_target(key)
+                    if (
+                        not target_equivalence
+                        or key not in candidates
+                        or not same_event_target(key)
+                    )
                 ),
                 reason,
             )
@@ -5509,6 +5638,12 @@ def analyze_translation_safety(
                 input_hash=str(analysis.get("input_hash", "")),
                 candidate_values=active_candidates,
             )
+            replay_global_flow = replay_report.get("global_string_flow")
+            if not (
+                isinstance(replay_global_flow, dict)
+                and replay_global_flow.get("converged") is True
+            ):
+                protect(active_candidates, "global_string_flow_not_converged")
             replay_signature = _semantic_replay_signature(replay_report)
             previous_candidates = dict(active_candidates)
         replay_changes = _replay_changed_commands(

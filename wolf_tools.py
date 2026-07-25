@@ -1741,15 +1741,32 @@ def write_font_workbook(
 ) -> Path:
     if len(slots) != len(FONT_CODES) or not all(isinstance(value, str) for value in slots):
         raise ValueError("字体工作簿必须提供四个字体槽位")
+    items = read_translation_items(template_path)
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code, []).append(item)
+    font_copy_keys = {
+        item.key
+        for item in items
+        if item.category is ImportCategory.COPY
+        and _copy_source(item, by_code).code.upper() in FONT_CODES
+    }
     workbook = load_workbook(template_path)
     worksheet = workbook.active
     _header_row, headers = _header_map(worksheet)
     found = Counter()
     slot_by_code = dict(zip(FONT_CODES, slots, strict=True))
-    for row_index, values, _ordinal in _iter_data_rows(worksheet):
+    for row_index, values, ordinal in _iter_data_rows(worksheet):
         code = values["code"].upper()
         cell = worksheet.cell(row_index, headers["__target__"])
+        key = stable_key(values["code"], values["flag"], values["original"], ordinal)
         _set_literal_cell(cell, "")
+        if key in font_copy_keys:
+            # COPY-FROM treats an identity translation as empty, so detach only
+            # font-dependent copies before pinning their original text.
+            flag = COPY_FROM_RE.sub("", values["flag"]).strip("\r\n")
+            _set_literal_cell(worksheet.cell(row_index, headers[FLAG_HEADER]), flag)
+            _set_literal_cell(cell, values["original"])
         if code in slot_by_code:
             found[code] += 1
             _set_literal_cell(cell, slot_by_code[code])
@@ -1973,8 +1990,8 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references and logic_safety is not None:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 6:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 6 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 8:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 8 Editor 分析报告，请重新执行导出文本。")
         keep_values = logic_safety.get("keep_original")
         safety_reasons = logic_safety.get("reasons")
         if not isinstance(keep_values, list) or not isinstance(safety_reasons, dict):
@@ -2017,8 +2034,8 @@ def analyze_import_protection(
                 "WOLF 静态安全分析需要保留风险原文，严格模式已阻止导入。"
             )
     elif rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 6:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 6 Editor 分析报告，请重新执行导出文本。")
+        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 8:
+            raise ValueError("WOLF 事件逻辑保护需要 schema 8 Editor 分析报告，请重新执行导出文本。")
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):

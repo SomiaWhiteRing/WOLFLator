@@ -414,6 +414,17 @@ class PipelineTests(unittest.TestCase):
                         "",
                     ]
                 )
+            sheet.append(
+                [
+                    "COMMON-2",
+                    "<Half-Width Characters Only>\nCOPY-FROM-BASICDATA-3",
+                    "Event",
+                    "Message",
+                    "",
+                    "原字体0",
+                    "",
+                ]
+            )
             workbook.save(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["workbook"] = str(workbook_path)
             pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"] = str(items_path)
@@ -424,6 +435,17 @@ class PipelineTests(unittest.TestCase):
             verify_book = Workbook()
             verify_sheet = verify_book.active
             verify_sheet.append(list(sheet.iter_rows(min_row=1, max_row=1, values_only=True))[0])
+            verify_sheet.append(
+                [
+                    "COMMON-2",
+                    "<Half-Width Characters Only>",
+                    "Event",
+                    "Message",
+                    "",
+                    "原字体0",
+                    "",
+                ]
+            )
             for index in range(4):
                 verify_sheet.append(
                     [
@@ -439,15 +461,18 @@ class PipelineTests(unittest.TestCase):
             verify_book.save(verification)
 
             translated = make_game(root / "translated")
-            generated = root / "generated"
+            extra_map = translated / "Data" / "MapData" / "Map0EX.mps"
+            extra_map.parent.mkdir(parents=True)
+            extra_map.write_bytes(b"extra-map")
             runner = mock.Mock()
 
-            def translate(*_args, **_kwargs):
+            def translate(game_root, **_kwargs):
+                generated = Path(game_root) / "Translated1_Chinese (Simplified)"
                 make_game(generated)
                 return generated
 
             runner.translate.side_effect = translate
-            runner.extract.return_value = verification
+            runner.extract.side_effect = [workbook_path, verification]
             runner.console_outputs = []
             temporary = pipeline.version_dir / ".release-ready"
             with mock.patch.object(
@@ -459,6 +484,7 @@ class PipelineTests(unittest.TestCase):
                     translated, temporary, load_font_scheme(manifest_path.parent)
                 )
             self.assertTrue((temporary / BUNDLED_FONT_ID).is_file())
+            self.assertEqual(b"extra-map", (temporary / "Data" / "MapData" / "Map0EX.mps").read_bytes())
             self.assertEqual("4", artifacts["font_warning_count"])
             self.assertTrue(
                 any(
