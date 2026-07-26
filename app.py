@@ -87,8 +87,12 @@ from models import (
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
 from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
-from wolf_editor import EDITOR_DOWNLOAD_URL, inspect_wolf_editor, install_supported_editor
-from wolf_proof import analyze_translation_safety
+from wolf_editor import (
+    EDITOR_DOWNLOAD_URL,
+    analyze_translation_safety,
+    inspect_wolf_editor,
+    install_supported_editor,
+)
 from wolf_tools import (
     analyze_import_protection,
     imported_display_texts,

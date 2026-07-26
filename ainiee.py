@@ -25,7 +25,7 @@ from safe_io import (
     replace_with_retry,
     runtime_lock,
 )
-from process_tools import CancelledError, run_process, sha256_file, verified_vendor_file
+from wolf_tools import CancelledError, run_process, sha256_file, verified_vendor_file
 
 
 AINIEE_VERSION = "V2.7.5"

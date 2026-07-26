@@ -19,8 +19,7 @@ from models import (
     TranslationItem,
 )
 from pipeline import Pipeline, create_project, load_manifest
-from wolf_editor import EditorInfo
-from wolf_semantics import analyze_auto_export
+from wolf_editor import EditorInfo, analyze_auto_export
 from wolf_tools import (
     IMPORT_PROTECTION_SCHEMA,
     OfficialToolDialogError,

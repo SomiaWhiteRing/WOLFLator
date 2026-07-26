@@ -28,8 +28,7 @@ from pipeline import Pipeline, create_project, load_manifest  # noqa: E402
 from safe_io import atomic_write_json, atomic_write_text  # noqa: E402
 from settings import SettingsStore, local_data_dir  # noqa: E402
 from wolf_command_catalog import VERIFIED_EDITOR_SHA256, VERIFIED_EDITOR_VERSION  # noqa: E402
-from wolf_editor import inspect_wolf_editor  # noqa: E402
-from wolf_semantics import analyze_auto_export  # noqa: E402
+from wolf_editor import analyze_auto_export, inspect_wolf_editor  # noqa: E402
 from wolf_tools import (  # noqa: E402
     CancelledError,
     OfficialArtifactMissingError,

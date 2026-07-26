@@ -32,7 +32,13 @@ from safe_io import (
     package_lock,
     replace_with_retry,
 )
-from process_tools import (
+from wolf_command_catalog import (
+    CATALOG_SCHEMA,
+    VERIFIED_EDITOR_VERSION,
+    command_semantics,
+)
+from wolf_tools import (
+    COPY_FROM_RE,
     CancelledError,
     _kill_process_tree,
     _process_startupinfo,
@@ -40,7 +46,6 @@ from process_tools import (
     run_process,
     sha256_file,
 )
-from wolf_semantics import analyze_auto_export
 
 
 EDITOR_DOWNLOAD_URL = "https://silversecond.com/WolfRPGEditor/Download.shtml"
@@ -48,6 +53,15 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
+AUTO_ANALYSIS_SCHEMA = 14
+TRANSLATION_SAFETY_SCHEMA = 3
+_VALUE_LIMIT = 256
+# ponytail: concrete string names are cheap and materially improve dynamic DB
+# selectors; switch to a symbolic string-set domain if a corpus exceeds this cap.
+_STRING_LITERAL_LIMIT = 4096
+# ponytail: global writes are joined for at most 32 rounds; non-convergence
+# remains protected. A summarized call graph can raise this bound if needed.
+_GLOBAL_STRING_FLOW_MAX_ITERATIONS = 32
 
 
 @contextmanager
@@ -101,11 +115,29 @@ def _editor_execution_lock(
         lock.__exit__(None, None, None)
         if diagnostic_log:
             diagnostic_log(f"editor.queue.released lock={lock_path}")
+_CALL_DEPTH_LIMIT = 64
+_CFG_STATE_VISIT_LIMIT = 64
+_CFG_IMPLEMENTED_OPCODES = frozenset(
+    {
+        0, 102, 104, 111, 112, 170, 171, 172, 173, 174, 175, 176, 179,
+        212, 213, 401, 402, 420, 421, 498, 499,
+    }
+)
+_CFG_CONTROL_OPCODES = _CFG_IMPLEMENTED_OPCODES
 _OFFICIAL_EDITOR_HOSTS = {"silversecond.com", "www.silversecond.com"}
 _EDITOR_ARCHIVE_RE = re.compile(
     r"^WolfRPGEditor_(?P<version>\d+(?:\.\d+)+)(?P<mini>mini)?\.zip$",
     re.IGNORECASE,
 )
+_COMMAND_RE = re.compile(
+    r'^\[(?P<opcode>\d+)]\[(?P<int_count>\d+),(?P<string_count>\d+)]'
+    r'<(?P<indent>\d+)>\((?P<ints>.*?)\)(?P<tail>.*)$'
+)
+_WORKBOOK_DB_CODE_RE = re.compile(r"^(?P<database>UDB|CDB|SDB)-(?P<type>\d+)-(?P<data>\d+)-(?P<field>\d+)$", re.IGNORECASE)
+_CSELF_REFERENCE_RE = re.compile(r"\\cself\[(\d+)]", re.IGNORECASE)
+_STRING_REFERENCE_RE = re.compile(r"\\s\[(\d+)]", re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class EditorInfo:
     path: Path
@@ -141,6 +173,163 @@ class LegacyConversionResult:
     before_hash: str
     after_hash: str
     converted_files: int
+
+
+@dataclass(frozen=True)
+class _Command:
+    opcode: int
+    ints: tuple[int, ...]
+    strings: tuple[str, ...]
+    indent: int
+    raw: str
+
+
+# Public IR names are deliberately small value objects. The parser still uses the
+# private aliases below so this upgrade does not duplicate the proven parser.
+AutoCommand = _Command
+
+
+@dataclass(frozen=True)
+class _CommandBlock:
+    source: str
+    event_type: str
+    event_id: int
+    event_name: str
+    page: int
+    commands: tuple[_Command, ...]
+    value_inputs: int = 0
+    string_inputs: int = 0
+    return_target: int = -1
+    map_id: int = -1
+    map_ids: tuple[int, ...] = ()
+
+
+AutoEvent = _CommandBlock
+
+
+@dataclass(frozen=True)
+class AutoLabel:
+    name: str
+    target_command: int
+    scope: str
+
+
+@dataclass(frozen=True)
+class AutoDatabaseCoordinate:
+    database: str
+    type_id: int
+    data_id: int
+    field_id: int
+
+
+@dataclass(frozen=True)
+class AutoEdge:
+    source: str
+    target: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class AutoProject:
+    editor_version: str
+    events: tuple[AutoEvent, ...]
+    databases: tuple[str, ...]
+    edges: tuple[AutoEdge, ...] = ()
+
+
+@dataclass(frozen=True)
+class _DatabaseType:
+    database: str
+    type_id: int
+    name: str
+    field_names: dict[int, str]
+    field_types: dict[int, int]
+    rows: tuple[tuple[str, ...], ...]
+    data_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _NumberValue:
+    values: frozenset[int] | None
+    reason: str = ""
+    tracked: bool = False
+    identity: str = ""
+
+
+@dataclass(frozen=True)
+class _StringValue:
+    source_keys: frozenset[str] = frozenset()
+    cells: frozenset[tuple[str, int, int, int]] = frozenset()
+    trace: tuple[str, ...] = ()
+    unknown: str = ""
+    symbolic_all: bool = False
+    scopes: frozenset[str] = frozenset()
+    literals: frozenset[str] | None = frozenset()
+    database_selectors: frozenset[tuple[str, int, int, str, str, str, int, int]] = frozenset()
+    loop_source_keys: frozenset[str] = frozenset()
+
+    @property
+    def tracked(self) -> bool:
+        return bool(self.source_keys or self.cells or self.symbolic_all or self.scopes)
+
+
+@dataclass
+class _AnalysisState:
+    numbers: dict[int, _NumberValue]
+    strings: dict[int, _StringValue]
+    database_strings: dict[tuple[str, int, int, int], _StringValue]
+    database_numbers: dict[tuple[str, int, int, int], _NumberValue] = field(
+        default_factory=dict
+    )
+    dynamic_database_numbers: dict[tuple[str, int, int, str], _NumberValue] = field(
+        default_factory=dict
+    )
+    dynamic_database_strings: dict[tuple[str, int, int, str], _StringValue] = field(
+        default_factory=dict
+    )
+    unknown_scopes: frozenset[str] = frozenset()
+    unknown_reasons: frozenset[str] = frozenset()
+
+    def copy(self) -> "_AnalysisState":
+        return _AnalysisState(
+            dict(self.numbers),
+            dict(self.strings),
+            dict(self.database_strings),
+            dict(self.database_numbers),
+            dict(self.dynamic_database_numbers),
+            dict(self.dynamic_database_strings),
+            self.unknown_scopes,
+            self.unknown_reasons,
+        )
+
+
+@dataclass
+class _AnalysisAudit:
+    transfers: dict[str, str]
+    cfg: dict[str, str]
+    cfg_edges: set[tuple[str, str]]
+    calls: dict[str, tuple[str, tuple[str, ...]]]
+    data_effects: dict[str, tuple[str, tuple[str, ...]]]
+
+    @classmethod
+    def empty(cls) -> "_AnalysisAudit":
+        return cls({}, {}, set(), {}, {})
+
+
+@dataclass(frozen=True)
+class _CallSummary:
+    fell_through: bool
+    exits: tuple[_AnalysisState, ...]
+    summary_failed: str
+    dependencies: tuple[dict[str, object], ...]
+    blocking: tuple[dict[str, object], ...]
+    unknown: Counter
+    unknown_locations: tuple[tuple[tuple[int, str], tuple[str, ...]], ...]
+
+
+_CallCache = dict[tuple[object, ...], _CallSummary]
+_CallArgumentPool = dict[str, tuple[_StringValue, ...]]
+
 
 class _LinkParser(HTMLParser):
     def __init__(self) -> None:
@@ -933,6 +1122,5805 @@ def _restore_editor_map_paths(auto_dir: Path, maps: list[Path]) -> None:
         restored = auto_dir / relative.parent / f"{relative.name}.Auto.txt"
         restored.parent.mkdir(parents=True, exist_ok=True)
         replace_with_retry(generated, restored)
+
+
+def _read_lines(path: Path) -> Iterator[str]:
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        for line in stream:
+            yield line.rstrip("\r\n")
+
+
+def _parse_command(line: str, location: str) -> _Command:
+    match = _COMMAND_RE.fullmatch(line)
+    if not match:
+        raise ValueError(f"Auto.txt 命令记录损坏：{location}: {line[:120]}")
+    ints_text = match.group("ints")
+    ints = tuple(int(value) for value in ints_text.split(",") if value != "")
+    tail = match.group("tail")
+    if not tail.startswith("("):
+        raise ValueError(f"Auto.txt 字符串参数缺失：{location}")
+    quoted = False
+    closing = -1
+    index = 1
+    while index < len(tail):
+        char = tail[index]
+        if char == '"':
+            if quoted and index + 1 < len(tail) and tail[index + 1] == '"':
+                index += 2
+                continue
+            quoted = not quoted
+        elif char == ")" and not quoted:
+            closing = index
+            break
+        index += 1
+    if closing < 0:
+        raise ValueError(f"Auto.txt 字符串参数未结束：{location}")
+    strings_text = tail[1:closing]
+    try:
+        strings = tuple(next(csv.reader([strings_text], strict=True))) if strings_text else ()
+    except csv.Error as error:
+        raise ValueError(f"Auto.txt 字符串参数损坏：{location}: {error}") from error
+    if len(ints) != int(match.group("int_count")):
+        raise ValueError(f"Auto.txt 整数参数数量不符：{location}")
+    if len(strings) != int(match.group("string_count")):
+        raise ValueError(f"Auto.txt 字符串参数数量不符：{location}")
+    return _Command(
+        int(match.group("opcode")),
+        ints,
+        strings,
+        int(match.group("indent")),
+        line,
+    )
+
+
+def _event_blocks(
+    path: Path, event_type: str, *, source: str | None = None
+) -> tuple[list[_CommandBlock], dict[str, int]]:
+    lines = iter(_read_lines(path))
+    expected_header = (
+        "[COMMON_EVENT_TEXT_OUTPUT]" if event_type == "common" else "[MAPDATA_TEXT_OUTPUT]"
+    )
+    try:
+        header = next(lines)
+    except StopIteration as error:
+        raise ValueError(f"Auto.txt 为空：{path}") from error
+    if header != expected_header:
+        raise ValueError(f"Auto.txt 文件头错误：{path}")
+
+    declared_events: int | None = None
+    current_id = -1
+    current_name = ""
+    current_page = 0
+    expected_commands: int | None = None
+    value_inputs = 0
+    string_inputs = 0
+    return_target = -1
+    blocks: list[_CommandBlock] = []
+    event_ids: set[int] = set()
+    command_count = 0
+    line_number = 1
+    for line in lines:
+        line_number += 1
+        if line.startswith("COMMON_EVENT_NUM=") or line.startswith("EVENT_NUM="):
+            declared_events = int(line.split("=", 1)[1])
+        elif line.startswith("COMMON_ID=") or line.startswith("EVENT_ID="):
+            current_id = int(line.split("=", 1)[1])
+            current_name = ""
+            current_page = 0
+            value_inputs = 0
+            string_inputs = 0
+            return_target = -1
+            event_ids.add(current_id)
+        elif line.startswith("COMMON_NAME=") or line.startswith("EVENT_NAME="):
+            current_name = line.split("=", 1)[1]
+        elif event_type == "common" and line.startswith("VALINPUT_NUM="):
+            value_inputs = int(line.split("=", 1)[1])
+        elif event_type == "common" and line.startswith("STRINPUT_NUM="):
+            string_inputs = int(line.split("=", 1)[1])
+        elif event_type == "common" and line.startswith("RETURN_VAL_TARGET="):
+            return_target = int(line.split("=", 1)[1])
+        elif line.startswith("COMMAND_NUM="):
+            if current_id < 0:
+                raise ValueError(f"COMMAND_NUM 缺少事件上下文：{path}:{line_number}")
+            expected_commands = int(line.split("=", 1)[1])
+        elif line == "WoditorEvCOMMAND_START":
+            if expected_commands is None:
+                raise ValueError(f"命令块缺少 COMMAND_NUM：{path}:{line_number}")
+            commands: list[_Command] = []
+            for raw in lines:
+                line_number += 1
+                if raw == "WoditorEvCOMMAND_END":
+                    break
+                commands.append(_parse_command(raw, f"{path}:{line_number}"))
+            else:
+                raise ValueError(f"命令块未结束：{path}:{line_number}")
+            if len(commands) != expected_commands:
+                raise ValueError(
+                    f"COMMAND_NUM 不符：{path}:{line_number} 声明 {expected_commands}，实际 {len(commands)}"
+                )
+            current_page += 1
+            blocks.append(
+                _CommandBlock(
+                    source or path.as_posix(),
+                    event_type,
+                    current_id,
+                    current_name,
+                    current_page,
+                    tuple(commands),
+                    value_inputs,
+                    string_inputs,
+                    return_target,
+                )
+            )
+            command_count += len(commands)
+            expected_commands = None
+
+    if declared_events is None or len(event_ids) != declared_events:
+        raise ValueError(
+            f"事件数量不符：{path} 声明 {declared_events}，实际 {len(event_ids)}"
+        )
+    return blocks, {
+        "events": len(event_ids),
+        "pages": len(blocks),
+        "commands": command_count,
+    }
+
+
+def _database_index(
+    path: Path, database: str
+) -> tuple[dict[int, _DatabaseType], dict[str, int]]:
+    lines = iter(_read_lines(path))
+    try:
+        if next(lines) != "[DATABASE_TEXT_OUTPUT]":
+            raise ValueError(f"数据库 Auto.txt 文件头错误：{path}")
+    except StopIteration as error:
+        raise ValueError(f"数据库 Auto.txt 为空：{path}") from error
+
+    declared_types: int | None = None
+    current_id: int | None = None
+    current_name = ""
+    item_num: int | None = None
+    data_num: int | None = None
+    field_names: dict[int, str] = {}
+    field_types: dict[int, int] = {}
+    rows: list[tuple[str, ...]] | None = None
+    types: dict[int, _DatabaseType] = {}
+    csv_rows = 0
+
+    def finish_type() -> None:
+        nonlocal csv_rows
+        if current_id is None:
+            return
+        if item_num is None or data_num is None or rows is None:
+            raise ValueError(f"数据库类型 {current_id} 缺少 ITEM_NUM、DATA_NUM 或 CSV：{path}")
+        if item_num and (
+            set(field_names) != set(range(item_num))
+            or set(field_types) != set(range(item_num))
+        ):
+            raise ValueError(f"数据库类型 {current_id} 字段声明不完整：{path}")
+        expected_rows = data_num + (1 if item_num else 0)
+        if len(rows) != expected_rows:
+            raise ValueError(
+                f"数据库类型 {current_id} DATA_NUM 不符：声明 {data_num}，实际 {max(0, len(rows) - (1 if item_num else 0))}"
+            )
+        if any(
+            len(row) not in {item_num + 1, item_num + 2}
+            or (len(row) == item_num + 2 and row[-1] != "")
+            for row in rows
+        ):
+            raise ValueError(f"数据库类型 {current_id} CSV 列数不符：{path}")
+        if item_num:
+            header = rows[0]
+            if tuple(field_names[index] for index in range(item_num)) != header[:item_num]:
+                raise ValueError(f"数据库类型 {current_id} CSV 表头与字段声明不符：{path}")
+            content_rows = rows[1:]
+            stored_names = dict(field_names)
+            stored_types = dict(field_types)
+        else:
+            content_rows = rows
+            stored_names = {}
+            stored_types = {}
+        data_rows = tuple(row[:item_num] for row in content_rows)
+        data_names = tuple(row[item_num] for row in content_rows)
+        types[current_id] = _DatabaseType(
+            database,
+            current_id,
+            current_name,
+            stored_names,
+            stored_types,
+            data_rows,
+            data_names,
+        )
+        csv_rows += len(data_rows)
+
+    for line in lines:
+        if line.startswith("TYPE_NUM="):
+            declared_types = int(line.split("=", 1)[1])
+        elif line.startswith("TYPE_ID="):
+            finish_type()
+            current_id = int(line.split("=", 1)[1])
+            current_name = ""
+            item_num = None
+            data_num = None
+            field_names = {}
+            field_types = {}
+            rows = None
+        elif line.startswith("TYPENAME="):
+            current_name = line.split("=", 1)[1]
+        elif line.startswith("ITEM_NUM="):
+            item_num = int(line.split("=", 1)[1])
+        elif line.startswith("DATA_NUM="):
+            data_num = int(line.split("=", 1)[1])
+        elif line.startswith("DATATYPE_") and "=" in line:
+            key, value = line.split("=", 1)
+            suffix = key.removeprefix("DATATYPE_")
+            if suffix.isdigit():
+                field_types[int(suffix)] = int(value)
+        elif line.startswith("ITEMNAME") and "=" in line:
+            key, value = line.split("=", 1)
+            suffix = key.removeprefix("ITEMNAME")
+            if suffix.isdigit():
+                field_names[int(suffix)] = value
+        elif line == "<<--CSV_START-->>":
+            csv_lines: list[str] = []
+            for csv_line in lines:
+                if csv_line == "<<--CSV_END-->>":
+                    break
+                csv_lines.append(csv_line)
+            else:
+                raise ValueError(f"数据库 CSV 未结束：{path}")
+            try:
+                if item_num == 0 and data_num is not None and not any(csv_lines):
+                    # Editor 3.713 emits padding blank lines for a type with data
+                    # names but no fields. DATA_NUM is the only lossless row count.
+                    rows = [("",) for _index in range(data_num)]
+                else:
+                    rows = [
+                        tuple(row)
+                        for row in csv.reader(
+                            (value + "\n" for value in csv_lines), strict=True
+                        )
+                        if row
+                    ]
+            except csv.Error as error:
+                raise ValueError(f"数据库 CSV 损坏：{path}: {error}") from error
+    finish_type()
+    if declared_types is None or len(types) != declared_types:
+        raise ValueError(f"数据库类型数量不符：{path} 声明 {declared_types}，实际 {len(types)}")
+    return types, {"types": len(types), "csv_rows": csv_rows}
+
+
+def _condition_operator(encoded: int) -> tuple[int, str | None, bool]:
+    operators = {
+        0x00: "equals",
+        0x10: "not_equals",
+        0x20: "contains",
+        0x30: "starts_with",
+        0x40: "ends_with",
+    }
+    flags = (encoded >> 24) & 0xFF
+    return encoded & 0x00FFFFFF, operators.get(flags & 0xF0), (flags & 0x0F) == 1
+
+
+def _limited(values: set[int]) -> frozenset[int] | None:
+    return frozenset(values) if len(values) <= _VALUE_LIMIT else None
+
+
+def _number_argument(
+    raw: int, state: _AnalysisState, *, identity_scope: str = ""
+) -> _NumberValue:
+    if raw < 1_000_000:
+        return _NumberValue(frozenset({raw}))
+    return state.numbers.get(
+        raw,
+        _NumberValue(
+            None,
+            f"变量 {raw} 的数值来源未知",
+            identity=(
+                f"event-input:{identity_scope}:{raw}"
+                if identity_scope
+                else f"event-input:{raw}"
+            ),
+        ),
+    )
+
+
+def _number_offset_identity(value: _NumberValue, offset: int) -> str:
+    if not value.identity:
+        return ""
+    if offset == 0:
+        return value.identity
+    return f"add:{value.identity}:{offset}"
+
+
+def _loop_identity(left: _NumberValue | None, right: _NumberValue | None) -> str:
+    if left is None or right is None or not left.identity or not right.identity:
+        return ""
+    prefix = f"add:{left.identity}:"
+    if not right.identity.startswith(prefix):
+        return ""
+    try:
+        step = int(right.identity[len(prefix):])
+    except ValueError:
+        return ""
+    if step == 0:
+        return ""
+    return left.identity if left.identity.startswith("loop:") else f"loop:{left.identity}:{step}"
+
+
+def _calculate_numbers(left: _NumberValue, right: _NumberValue, operator: int) -> _NumberValue:
+    tracked = left.tracked or right.tracked
+    identity = ""
+    if operator == 0:
+        if right.values is not None and len(right.values) == 1:
+            identity = _number_offset_identity(left, next(iter(right.values)))
+        elif left.values is not None and len(left.values) == 1:
+            identity = _number_offset_identity(right, next(iter(left.values)))
+    elif operator == 1 and right.values is not None and len(right.values) == 1:
+        identity = _number_offset_identity(left, -next(iter(right.values)))
+    if left.values is None or right.values is None:
+        return _NumberValue(
+            None, left.reason or right.reason or "数值运算来源未知", tracked, identity
+        )
+    output: set[int] = set()
+    try:
+        for a in left.values:
+            for b in right.values:
+                output.add({0: lambda: a + b, 1: lambda: a - b, 2: lambda: a * b,
+                            3: lambda: a // b, 4: lambda: a % b}[operator]())
+                if len(output) > _VALUE_LIMIT:
+                    return _NumberValue(None, "数值集合超过 256 项", tracked, identity)
+    except (KeyError, ZeroDivisionError):
+        return _NumberValue(None, f"未支持或无效的数值运算 {operator}", tracked)
+    return _NumberValue(frozenset(output), tracked=tracked, identity=identity)
+
+
+def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _NumberValue | None:
+    if left is None and right is None:
+        return None
+    if (
+        left == right
+        and left is not None
+        and (left.values is None or len(left.values) <= _VALUE_LIMIT)
+    ):
+        return left
+    if left is None or right is None:
+        value = left or right
+        assert value is not None
+        return _NumberValue(None, "控制流仅在部分分支赋值", value.tracked)
+    if left.values is None or right.values is None:
+        return _NumberValue(
+            None,
+            left.reason or right.reason,
+            left.tracked or right.tracked,
+            left.identity if left.identity == right.identity else "",
+        )
+    values = _limited(set(left.values) | set(right.values))
+    return _NumberValue(
+        values,
+        "数值集合超过 256 项" if values is None else "",
+        left.tracked or right.tracked,
+        left.identity if left.identity == right.identity else "",
+    )
+
+
+def _number_semantic_key(value: _NumberValue) -> tuple[object, ...]:
+    return value.values, value.tracked, value.identity
+
+
+@lru_cache(maxsize=None)
+def _address_variables_for_block(block: _CommandBlock) -> frozenset[int]:
+    """Find numeric slots that can structurally reach a dynamic DB row selector."""
+    variables: set[int] = set()
+    for command in block.commands:
+        if command.opcode != 250 or len(command.ints) not in {4, 5}:
+            continue
+        if command.ints[1] >= 1_000_000:
+            variables.add(command.ints[1])
+    changed = True
+    while changed:
+        changed = False
+        for command in block.commands:
+            if command.opcode == 121 and len(command.ints) >= 4:
+                destination = command.ints[0] & 0x00FFFFFF
+                if destination not in variables:
+                    continue
+                for raw in command.ints[1:3]:
+                    if raw >= 1_000_000 and raw not in variables:
+                        variables.add(raw)
+                        changed = True
+            elif command.opcode == 250 and len(command.ints) == 5:
+                flags = command.ints[3]
+                if not (flags >> 8 & 0x10):
+                    continue
+                destination = command.ints[4] & 0x00FFFFFF
+                raw = command.ints[1]
+                if destination in variables and raw >= 1_000_000 and raw not in variables:
+                    variables.add(raw)
+                    changed = True
+    return frozenset(variables)
+
+
+def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _StringValue | None:
+    if left is None and right is None:
+        return None
+    if (
+        left == right
+        and left is not None
+        and (left.symbolic_all or len(left.source_keys) + len(left.cells) <= _VALUE_LIMIT)
+        and (left.literals is None or len(left.literals) <= _STRING_LITERAL_LIMIT)
+        and (left.tracked or not left.unknown)
+        and len(left.trace) <= _VALUE_LIMIT
+        and len(left.trace) == len(set(left.trace))
+    ):
+        return left
+    if left is None or right is None:
+        value = left or right
+        assert value is not None
+        return _StringValue(
+            value.source_keys,
+            value.cells,
+            tuple(dict.fromkeys(value.trace + ("控制流部分分支赋值",))),
+            value.unknown,
+            value.symbolic_all,
+            value.scopes,
+            value.literals,
+            value.database_selectors,
+            value.loop_source_keys,
+        )
+    keys = set(left.source_keys) | set(right.source_keys)
+    cells = set(left.cells) | set(right.cells)
+    symbolic_all = left.symbolic_all or right.symbolic_all
+    scopes = left.scopes | right.scopes
+    database_selectors = left.database_selectors | right.database_selectors
+    loop_source_keys = left.loop_source_keys | right.loop_source_keys
+    literals = (
+        None
+        if left.literals is None or right.literals is None
+        else frozenset(set(left.literals) | set(right.literals))
+    )
+    if literals is not None and len(literals) > _STRING_LITERAL_LIMIT:
+        literals = None
+    if len(keys) + len(cells) > _VALUE_LIMIT and not symbolic_all:
+        return _StringValue(
+            trace=(left.trace + right.trace)[-_VALUE_LIMIT:],
+            unknown="字符串来源集合超过 256 项",
+            symbolic_all=True,
+            scopes=scopes or frozenset({"project"}),
+            literals=literals,
+            database_selectors=database_selectors,
+            loop_source_keys=loop_source_keys,
+        )
+    return _StringValue(
+        frozenset(keys),
+        frozenset(cells),
+        tuple(dict.fromkeys(left.trace + right.trace))[-_VALUE_LIMIT:],
+        (left.unknown if left.tracked else "") or (right.unknown if right.tracked else ""),
+        symbolic_all,
+        scopes,
+        literals,
+        database_selectors,
+        loop_source_keys,
+    )
+
+
+def _with_literals(
+    value: _StringValue, literals: frozenset[str] | None
+) -> _StringValue:
+    return _StringValue(
+        value.source_keys,
+        value.cells,
+        value.trace,
+        value.unknown,
+        value.symbolic_all,
+        value.scopes,
+        literals,
+        value.database_selectors,
+        value.loop_source_keys,
+    )
+
+
+def _string_value_status(value: _StringValue) -> tuple[str, str]:
+    if not value.unknown and not value.symbolic_all:
+        return "resolved", ""
+    opaque_prefixes = (
+        "来源经过未支持命令",
+        "来源经过未解释的公共事件调用",
+        "未支持的 122",
+    )
+    if value.unknown.startswith(opaque_prefixes):
+        return "blocking", value.unknown
+    return (
+        "dynamic",
+        value.unknown or "字符串来源已扩大为可定位的运行时符号范围",
+    )
+
+
+def _command_string_roles(
+    command: _Command, semantics: dict[str, object] | None
+) -> list[str]:
+    roles = list(semantics.get("string_roles", [])) if semantics else []
+    if command.opcode == 150 and command.strings:
+        if not roles:
+            roles = ["resource_path"]
+        # Editor 3.713 stores the Picture content kind in the low byte.
+        roles[0] = (
+            "display_text"
+            if command.ints and command.ints[0] & 0xFF == 0x20
+            else "resource_path"
+        )
+    return roles
+
+
+def _concat_literals(
+    left: frozenset[str] | None, right: frozenset[str] | None
+) -> frozenset[str] | None:
+    if left is None or right is None:
+        return None
+    output = {a + b for a in left for b in right}
+    return frozenset(output) if len(output) <= _VALUE_LIMIT else None
+
+
+def _string_variable_for_escape(kind: str, index: int) -> int:
+    if kind.lower() == "cself":
+        return 1_600_000 + index
+    return 3_000_000 + index
+
+
+def _string_reference_value(literal: str, state: _AnalysisState) -> _StringValue | None:
+    value: _StringValue | None = None
+    for kind, pattern in (
+        ("cself", _CSELF_REFERENCE_RE),
+        ("s", _STRING_REFERENCE_RE),
+    ):
+        for reference in pattern.findall(literal):
+            referenced = state.strings.get(_string_variable_for_escape(kind, int(reference)))
+            if referenced is not None:
+                value = _merge_strings(value, referenced)
+    return value
+
+
+def _expand_string_references(
+    literals: frozenset[str] | None, state: _AnalysisState
+) -> frozenset[str] | None:
+    if literals is None:
+        return None
+    concrete = set(literals)
+    changed = True
+    while changed:
+        changed = False
+        for pattern, prefix in (
+            (_CSELF_REFERENCE_RE, "cself"),
+            (_STRING_REFERENCE_RE, "s"),
+        ):
+            for text in tuple(concrete):
+                match = pattern.search(text)
+                if match is None:
+                    continue
+                variable = _string_variable_for_escape(prefix, int(match.group(1)))
+                value = state.strings.get(variable)
+                replacements: frozenset[str] | None = value.literals if value else None
+                if replacements is None and prefix == "cself":
+                    number = state.numbers.get(variable)
+                    if number is not None and number.values is not None:
+                        replacements = frozenset(str(item) for item in number.values)
+                if replacements is None:
+                    return None
+                token = match.group(0)
+                concrete.remove(text)
+                concrete.update(text.replace(token, replacement) for replacement in replacements)
+                if len(concrete) > _VALUE_LIMIT:
+                    return None
+                changed = True
+                break
+            if changed:
+                break
+    return frozenset(concrete)
+
+
+def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
+    if not states:
+        return _AnalysisState({}, {}, {})
+    result = states[0].copy()
+    for state in states[1:]:
+        result.numbers = {
+            key: value
+            for key in set(result.numbers) | set(state.numbers)
+            if (value := _merge_numbers(result.numbers.get(key), state.numbers.get(key))) is not None
+        }
+        result.strings = {
+            key: value
+            for key in set(result.strings) | set(state.strings)
+            if (value := _merge_strings(result.strings.get(key), state.strings.get(key))) is not None
+        }
+        result.database_strings = {
+            key: value
+            for key in set(result.database_strings) | set(state.database_strings)
+            if (
+                value := _merge_strings(
+                    result.database_strings.get(key), state.database_strings.get(key)
+                )
+            ) is not None
+        }
+        result.database_numbers = {
+            key: value
+            for key in set(result.database_numbers) | set(state.database_numbers)
+            if (
+                value := _merge_numbers(
+                    result.database_numbers.get(key), state.database_numbers.get(key)
+                )
+            ) is not None
+        }
+        result.dynamic_database_numbers = {
+            key: value
+            for key in set(result.dynamic_database_numbers) | set(state.dynamic_database_numbers)
+            if (
+                value := _merge_numbers(
+                    result.dynamic_database_numbers.get(key),
+                    state.dynamic_database_numbers.get(key),
+                )
+            ) is not None
+        }
+        result.dynamic_database_strings = {
+            key: value
+            for key in (
+                set(result.dynamic_database_strings)
+                | set(state.dynamic_database_strings)
+            )
+            if (
+                value := _merge_strings(
+                    result.dynamic_database_strings.get(key),
+                    state.dynamic_database_strings.get(key),
+                )
+            ) is not None
+        }
+        result.unknown_scopes = result.unknown_scopes | state.unknown_scopes
+        result.unknown_reasons = result.unknown_reasons | state.unknown_reasons
+    return result
+
+
+def _state_cache_key(state: _AnalysisState) -> tuple[object, ...]:
+    local_numbers = tuple(
+        sorted(
+            (key, *_number_semantic_key(value))
+            for key, value in state.numbers.items()
+            if 1_600_000 <= key < 1_600_100
+        )
+    )
+    local_strings = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.strings.items()
+            if 1_600_000 <= key < 1_600_100
+        )
+    )
+    database = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.database_strings.items()
+        )
+    )
+    database_numbers = tuple(
+        sorted((key, *_number_semantic_key(value)) for key, value in state.database_numbers.items())
+    )
+    dynamic_database_numbers = tuple(
+        sorted(
+            (key, *_number_semantic_key(value))
+            for key, value in state.dynamic_database_numbers.items()
+        )
+    )
+    dynamic_database_strings = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.dynamic_database_strings.items()
+        )
+    )
+    return (
+        local_numbers,
+        local_strings,
+        database,
+        database_numbers,
+        dynamic_database_numbers,
+        dynamic_database_strings,
+    )
+
+
+def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
+    return (
+        value.source_keys,
+        value.cells,
+        _string_value_status(value)[0],
+        value.symbolic_all,
+        value.scopes,
+        value.literals,
+        value.database_selectors,
+    )
+
+
+def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> bool:
+    if left.unknown_scopes != right.unknown_scopes:
+        return False
+    if left.numbers.keys() != right.numbers.keys():
+        return False
+    if any(
+        _number_semantic_key(value) != _number_semantic_key(right.numbers[key])
+        for key, value in left.numbers.items()
+    ):
+        return False
+    if left.strings.keys() != right.strings.keys() or any(
+        _string_semantic_key(value) != _string_semantic_key(right.strings[key])
+        for key, value in left.strings.items()
+    ):
+        return False
+    if left.database_strings.keys() != right.database_strings.keys() or any(
+        _string_semantic_key(value)
+        != _string_semantic_key(right.database_strings[key])
+        for key, value in left.database_strings.items()
+    ):
+        return False
+    if left.database_numbers.keys() != right.database_numbers.keys() or any(
+        _number_semantic_key(value) != _number_semantic_key(right.database_numbers[key])
+        for key, value in left.database_numbers.items()
+    ):
+        return False
+    if left.dynamic_database_numbers.keys() != right.dynamic_database_numbers.keys() or any(
+        _number_semantic_key(value)
+        != _number_semantic_key(right.dynamic_database_numbers[key])
+        for key, value in left.dynamic_database_numbers.items()
+    ):
+        return False
+    return left.dynamic_database_strings.keys() == right.dynamic_database_strings.keys() and not any(
+        _string_semantic_key(value)
+        != _string_semantic_key(right.dynamic_database_strings[key])
+        for key, value in left.dynamic_database_strings.items()
+    )
+
+
+def _block_map_id(block: _CommandBlock) -> int:
+    if block.map_ids:
+        return block.map_ids[0]
+    if block.map_id >= 0:
+        return block.map_id
+    match = re.search(r"Map(\d+)\.mps\.Auto\.txt$", block.source, re.IGNORECASE)
+    return int(match.group(1)) if match else -1
+
+
+def _block_map_ids(block: _CommandBlock) -> tuple[int, ...]:
+    if block.map_ids:
+        return block.map_ids
+    return (_block_map_id(block),)
+
+
+def _event_code(block: _CommandBlock, command_index: int, string_index: int) -> str:
+    if block.event_type == "common":
+        return f"COMMON-{block.event_id}-{command_index - 1}-{string_index}"
+    map_id = _block_map_id(block)
+    return f"MAP-{map_id}-Ev{block.event_id:03d}-Page{block.page}-{command_index - 1}-{string_index}"
+
+
+def _event_codes(
+    block: _CommandBlock, command_index: int, string_index: int
+) -> tuple[str, ...]:
+    if block.event_type == "common":
+        return (_event_code(block, command_index, string_index),)
+    return tuple(
+        f"MAP-{map_id}-Ev{block.event_id:03d}-Page{block.page}-{command_index - 1}-{string_index}"
+        for map_id in _block_map_ids(block)
+    )
+
+
+def _event_name_code(block: _CommandBlock) -> str:
+    if block.event_type == "common":
+        return f"COMMON-{block.event_id}-Name"
+    return f"MAP-{_block_map_id(block)}-Ev{block.event_id:03d}-Name"
+
+
+def _event_name_codes(block: _CommandBlock) -> tuple[str, ...]:
+    if block.event_type == "common":
+        return (_event_name_code(block),)
+    return tuple(
+        f"MAP-{map_id}-Ev{block.event_id:03d}-Name"
+        for map_id in _block_map_ids(block)
+    )
+
+
+def _items_for_event_codes(
+    event_items: dict[str, tuple[TranslationItem, ...]],
+    block: _CommandBlock,
+    command_index: int,
+    string_index: int,
+) -> tuple[TranslationItem, ...]:
+    by_key: dict[str, TranslationItem] = {}
+    for code in _event_codes(block, command_index, string_index):
+        for item in event_items.get(code.upper(), ()):
+            by_key.setdefault(item.key, item)
+    return tuple(by_key.values())
+
+
+def _map_ids_from_databases(
+    databases: dict[str, dict[int, _DatabaseType]],
+) -> dict[str, tuple[int, ...]]:
+    table = databases.get("SDB", {}).get(0)
+    if table is None:
+        return {}
+    result: dict[str, list[int]] = {}
+    for map_id, row in enumerate(table.rows):
+        if not row or not row[0].strip():
+            continue
+        relative = row[0].strip().replace("\\", "/").lstrip("/")
+        if relative.casefold().startswith("data/"):
+            relative = relative[5:]
+        key = f"{relative}.Auto.txt".casefold()
+        result.setdefault(key, []).append(map_id)
+    return {key: tuple(values) for key, values in result.items()}
+
+
+class _BlockAnalyzer:
+    def __init__(
+        self,
+        block: _CommandBlock,
+        databases: dict[str, dict[int, _DatabaseType]],
+        database_keys: dict[tuple[str, int, int, int], frozenset[str]],
+        event_items: dict[str, tuple[TranslationItem, ...]],
+        common_by_id: dict[int, _CommandBlock] | None = None,
+        common_by_name: dict[str, tuple[_CommandBlock, ...]] | None = None,
+        event_scopes: dict[int, frozenset[str]] | None = None,
+        call_stack: tuple[tuple[int, int | None], ...] = (),
+        call_cache: _CallCache | None = None,
+        call_argument_pool: _CallArgumentPool | None = None,
+        candidate_values: dict[str, str] | None = None,
+        audit: _AnalysisAudit | None = None,
+    ) -> None:
+        self.block = block
+        self.databases = databases
+        self.database_keys = database_keys
+        self.event_items = event_items
+        self.common_by_id = common_by_id or {}
+        self.common_by_name = common_by_name or {}
+        self.event_scopes = event_scopes or {}
+        self.call_stack = call_stack
+        self.call_cache = call_cache if call_cache is not None else {}
+        self.call_argument_pool = (
+            call_argument_pool if call_argument_pool is not None else {}
+        )
+        self.candidate_values = candidate_values or {}
+        self.audit = audit if audit is not None else _AnalysisAudit.empty()
+        self.dependencies: list[dict[str, object]] = []
+        self.blocking: list[dict[str, object]] = []
+        self.unknown = Counter()
+        self.unknown_locations: dict[tuple[int, str], list[str]] = {}
+        self._unknown_seen: set[tuple[int, str, str]] = set()
+        self.summary_failed = ""
+        self.output_state = _AnalysisState({}, {}, {})
+        self._address_variables = _address_variables_for_block(block)
+        labels: dict[str, list[int]] = {}
+        for position, command in enumerate(block.commands):
+            if command.opcode == 212 and len(command.strings) == 1:
+                for label in self._candidate_literal_values(command, position, 0):
+                    labels.setdefault(label, []).append(position)
+        self.labels = {name: tuple(positions) for name, positions in labels.items()}
+        self._condition_regions: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {}
+        self._branch_exits: dict[int, int] = {}
+        self._loop_ends: dict[int, int] = {}
+        self._loop_starts: dict[int, int] = {}
+        self._enclosing_loops: dict[int, tuple[int, int]] = {}
+        self._index_control_flow()
+
+    def _command_id(self, index: int) -> str:
+        return f"{self.block.source}:{self.block.event_type}:{self.block.event_id}:{self.block.page}:{index + 1}"
+
+    def _number(self, raw: int, state: _AnalysisState) -> _NumberValue:
+        """Resolve ordinary numbers without widening call summaries by identity."""
+        return _number_argument(raw, state)
+
+    def _address_number(self, raw: int, state: _AnalysisState) -> _NumberValue:
+        """Resolve a number that statically reaches a dynamic database address."""
+        return _number_argument(
+            raw,
+            state,
+            identity_scope=(
+                f"{self.block.source}:{self.block.event_type}:"
+                f"{self.block.event_id}:{self.block.page}"
+            ),
+        )
+
+    def _record_call(
+        self, command_id: str, status: str, targets: Iterable[str]
+    ) -> None:
+        previous = self.audit.calls.get(command_id)
+        merged_targets = set(map(str, targets))
+        if previous is not None:
+            merged_targets.update(previous[1])
+            if previous[0] != "exact":
+                status = "conservative"
+        merged = (status, tuple(sorted(merged_targets)))
+        self.audit.calls[command_id] = merged
+        self.audit.data_effects[command_id] = merged
+
+    def _candidate_literal_values(
+        self, command: _Command, index: int, string_index: int
+    ) -> frozenset[str]:
+        literal = command.strings[string_index] if string_index < len(command.strings) else ""
+        values = {
+            self.candidate_values.get(item.key, literal)
+            for item in _items_for_event_codes(
+                self.event_items, self.block, index + 1, string_index
+            )
+            if item.original == literal
+        }
+        return frozenset(values or {literal})
+
+    def _index_control_flow(self) -> None:
+        commands = self.block.commands
+        for index, command in enumerate(commands):
+            if command.opcode in {102, 111, 112}:
+                closing = self._matching(index, len(commands), 499)
+                if closing is None:
+                    continue
+                markers = tuple(
+                    position
+                    for position in range(index + 1, closing)
+                    if commands[position].indent == command.indent
+                    and commands[position].opcode in {401, 402, 420, 421}
+                )
+                branches: list[tuple[int, int]] = []
+                for offset, marker in enumerate(markers):
+                    branch_end = markers[offset + 1] if offset + 1 < len(markers) else closing
+                    branches.append((marker, branch_end))
+                    if marker + 1 < branch_end:
+                        last = branch_end - 1
+                        self._branch_exits[last] = max(
+                            self._branch_exits.get(last, 0), closing + 1
+                        )
+                self._condition_regions[index] = (closing, tuple(branches))
+            elif command.opcode in {170, 179}:
+                closing = self._matching(index, len(commands), 498)
+                if closing is not None:
+                    self._loop_ends[index] = closing
+                    self._loop_starts[closing] = index
+
+        loops = sorted(
+            self._loop_ends.items(), key=lambda item: (item[1] - item[0], -item[0])
+        )
+        for index in range(len(commands)):
+            enclosing = next(
+                ((start, closing) for start, closing in loops if start < index < closing),
+                None,
+            )
+            if enclosing is not None:
+                self._enclosing_loops[index] = enclosing
+
+    def _dynamic_entry_dispatcher(
+        self, block: _CommandBlock | None = None
+    ) -> int | None:
+        target = block or self.block
+        if target.event_type != "common":
+            return None
+        for index, command in enumerate(target.commands[:-1]):
+            following = target.commands[index + 1]
+            if (
+                command.indent == 0
+                and following.indent == 0
+                and command.opcode == 122
+                and command.ints[:2] == (3_000_001, 0)
+                and command.strings == ("cmd:\\cself[0]",)
+                and following.opcode == 213
+                and following.strings == ("\\s[1]",)
+            ):
+                return index
+        return None
+
+    def _resource_reference(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        semantics: dict[str, object] | None,
+    ) -> None:
+        if not semantics:
+            return
+        roles = _command_string_roles(command, semantics)
+        protected_roles = {
+            "resource_path",
+            "file_path",
+            "label",
+            "label_target",
+        }
+        for string_index, role in enumerate(roles):
+            if role not in protected_roles or string_index >= len(command.strings):
+                continue
+            value = self._literal_string(command, index, string_index, state)
+            if not value.tracked:
+                continue
+            status, reason = _string_value_status(value)
+            code = _event_code(self.block, index + 1, string_index).upper()
+            dependency = {
+                    "kind": "resource",
+                    "auto_file": self.block.source,
+                    "event_type": self.block.event_type,
+                    "event_id": self.block.event_id,
+                    "event_name": self.block.event_name,
+                    "page": self.block.page,
+                    "command": index + 1,
+                    "string_index": string_index,
+                    "condition_code": code,
+                    "condition_keys": [],
+                    "operator": "resource_reference",
+                    "literal": command.strings[string_index],
+                    "right_is_variable": False,
+                    "source_keys": sorted(value.source_keys),
+                    "right_source_keys": [],
+                    "database_cells": [],
+                    "right_database_cells": [],
+                    "trace": list(value.trace),
+                    "right_trace": [],
+                    "unresolved_scopes": sorted(value.scopes),
+                    "status": status,
+                    "reason": reason,
+                    "resource_role": role,
+            }
+            self.dependencies.append(dependency)
+            if dependency["status"] == "blocking":
+                self.blocking.append(dependency)
+
+    def _display_reference(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        semantics: dict[str, object] | None,
+    ) -> None:
+        if not semantics:
+            return
+        roles = _command_string_roles(command, semantics)
+        for string_index, role in enumerate(roles):
+            if role != "display_text" or string_index >= len(command.strings):
+                continue
+            value = self._literal_string(command, index, string_index, state)
+            if not value.tracked:
+                continue
+            status, reason = _string_value_status(value)
+            resource_values = sorted(value.literals or ())
+            self.dependencies.append({
+                "kind": "display",
+                "auto_file": self.block.source,
+                "event_type": self.block.event_type,
+                "event_id": self.block.event_id,
+                "event_name": self.block.event_name,
+                "page": self.block.page,
+                "command": index + 1,
+                "string_index": string_index,
+                "condition_code": _event_code(
+                    self.block, index + 1, string_index
+                ).upper(),
+                "condition_keys": [],
+                "operator": "display",
+                    "literal": (
+                        resource_values[0]
+                        if len(resource_values) == 1
+                        else command.strings[string_index]
+                    ),
+                    "resource_values": resource_values,
+                "right_is_variable": False,
+                "source_keys": sorted(value.source_keys),
+                "right_source_keys": [],
+                "database_cells": [
+                    {
+                        "database": cell[0],
+                        "type": cell[1],
+                        "data": cell[2],
+                        "field": cell[3],
+                    }
+                    for cell in sorted(value.cells)
+                ],
+                "right_database_cells": [],
+                "database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(value.database_selectors)
+                ],
+                "right_database_selectors": [],
+                "target_database_selectors": [],
+                "trace": list(value.trace),
+                "right_trace": [],
+                "unresolved_scopes": sorted(value.scopes),
+                "status": status,
+                "reason": reason,
+            })
+
+    def _value_boundary_reference(
+        self,
+        command: _Command,
+        index: int,
+        value: _StringValue,
+        role: str,
+        scopes: frozenset[str] = frozenset(),
+        global_string_variable: int | None = None,
+        target_database_cells: Iterable[tuple[str, int, int, int]] = (),
+        target_database_selectors: Iterable[
+            tuple[str, int, int, str, str, str, int, int]
+        ] = (),
+        resource_path_values: frozenset[str] | None = None,
+    ) -> None:
+        if not value.tracked and role not in {
+            "file_path_runtime_read",
+            "file_path_runtime_write",
+            "file_content_runtime_write",
+        }:
+            return
+        source_keys = value.source_keys
+        if role == "file_content_runtime_write":
+            source_keys = source_keys | value.loop_source_keys
+        status, reason = _string_value_status(value)
+        dependency = {
+            "kind": (
+                "flow"
+                if role == "common_event_return"
+                else "state"
+                if role == "global_string_write"
+                else "resource"
+            ),
+            "auto_file": self.block.source,
+            "event_type": self.block.event_type,
+            "event_id": self.block.event_id,
+            "event_name": self.block.event_name,
+            "page": self.block.page,
+            "command": index + 1,
+            "string_index": -1,
+            "condition_code": "",
+            "condition_keys": [],
+            "operator": "value_boundary",
+            "literal": "",
+            "right_is_variable": False,
+            "source_keys": sorted(source_keys),
+            "right_source_keys": [],
+            "database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(value.cells)
+            ],
+            "right_database_cells": [],
+            "target_database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(target_database_cells)
+            ],
+            "database_selectors": [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(value.database_selectors)
+            ],
+            "right_database_selectors": [],
+            "target_database_selectors": [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(target_database_selectors)
+            ],
+            "trace": list(value.trace),
+            "right_trace": [],
+            "unresolved_scopes": sorted(value.scopes | scopes),
+            "status": status,
+            "reason": reason,
+            "resource_role": role,
+            "global_string_variable": global_string_variable,
+            "source_values": (
+                sorted(value.literals) if value.literals is not None else None
+            ),
+            "resource_path_values": (
+                sorted(resource_path_values)
+                if resource_path_values is not None
+                else None
+            ),
+        }
+        self.dependencies.append(dependency)
+        if dependency["status"] == "blocking":
+            self.blocking.append(dependency)
+
+    def _location(self, index: int) -> str:
+        return (
+            f"{self.block.source} event={self.block.event_id} page={self.block.page} "
+            f"command={index + 1}"
+        )
+
+    def _current_scope(self) -> frozenset[str]:
+        if self.block.event_type == "common":
+            return frozenset({f"common:{self.block.event_id}"})
+        match = re.search(
+            r"Map(\d+)\.mps\.Auto\.txt$", self.block.source, re.IGNORECASE
+        )
+        map_id = int(match.group(1)) if match else 0
+        return frozenset(
+            {f"map:{map_id}:{self.block.event_id}:{self.block.page}"}
+        )
+
+    def _record_unknown(self, command: _Command, index: int, shape: str | None = None) -> None:
+        description = shape or f"ints={len(command.ints)},strings={len(command.strings)}"
+        location = self._location(index)
+        seen_key = (command.opcode, description, location)
+        if seen_key in self._unknown_seen:
+            return
+        self._unknown_seen.add(seen_key)
+        key = (command.opcode, description)
+        self.unknown[key] += 1
+        self.unknown_locations.setdefault(key, []).append(location)
+
+    def _blocking_scope_dependency(
+        self,
+        command: _Command,
+        index: int,
+        kind: str,
+        reason: str,
+        scopes: frozenset[str],
+        values: Iterable[_StringValue] = (),
+        *,
+        status: str = "blocking",
+        call_target_kind: str | None = None,
+    ) -> None:
+        values = tuple(values)
+        source_keys = sorted({key for value in values for key in value.source_keys})
+        cells = sorted({cell for value in values for cell in value.cells})
+        scopes = scopes | frozenset(
+            scope for value in values for scope in value.scopes
+        )
+        dependency = {
+            "kind": kind,
+            "auto_file": self.block.source,
+            "event_type": self.block.event_type,
+            "event_id": self.block.event_id,
+            "event_name": self.block.event_name,
+            "page": self.block.page,
+            "command": index + 1,
+            "string_index": -1,
+            "condition_code": "",
+            "condition_keys": [],
+            "operator": "opaque_effect" if kind == "opaque" else "event_call",
+            "literal": command.strings[0] if command.strings else "",
+            "right_is_variable": False,
+            "source_keys": source_keys,
+            "right_source_keys": [],
+            "database_cells": [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in cells
+            ],
+            "right_database_cells": [],
+            "trace": [self._location(index)],
+            "right_trace": [],
+            "unresolved_scopes": sorted(scopes),
+            "unresolved_reasons": [reason],
+            "status": status,
+            "reason": reason,
+        }
+        if call_target_kind is not None:
+            dependency["call_target_kind"] = call_target_kind
+        self.dependencies.append(dependency)
+        if status == "blocking":
+            self.blocking.append(dependency)
+
+    def _type_ids(self, database: str, command: _Command, flags: int, state: _AnalysisState) -> set[int] | None:
+        types = self.databases.get(database, {})
+        if flags & 0x01:
+            name = command.strings[1] if len(command.strings) > 1 else ""
+            return {type_id for type_id, item in types.items() if item.name == name}
+        value = self._number(command.ints[0], state)
+        if value.values is None:
+            return None
+        selected = set(value.values)
+        if any(type_id < 0 for type_id in selected):
+            return None
+        return selected & set(types)
+
+    def _selector(
+        self, raw: int, state: _AnalysisState, *, unknown_means_all: bool
+    ) -> set[int] | None:
+        value = self._number(raw, state)
+        if value.values is None:
+            return set() if unknown_means_all else None
+        return set(value.values)
+
+    def _dynamic_database_selectors(
+        self,
+        database: str,
+        type_ids: Iterable[int],
+        field_ids: Iterable[int],
+        data_raw: int,
+        state: _AnalysisState,
+    ) -> frozenset[tuple[str, int, int, str, str, str, int, int]]:
+        """Return a canonical selector only when its numeric source is exact."""
+        value = self._address_number(data_raw, state)
+        if not value.identity:
+            return frozenset()
+        return frozenset(
+            (
+                database,
+                type_id,
+                field_id,
+                value.identity,
+                "",
+                "address-expression",
+                -1,
+                -1,
+            )
+            for type_id in type_ids
+            for field_id in field_ids
+        )
+
+    def _database(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        if len(command.ints) not in {4, 5}:
+            self._record_unknown(command, index, "invalid-250")
+            return
+        flags = command.ints[3]
+        byte1 = (flags >> 8) & 0xFF
+        byte2 = (flags >> 16) & 0xFF
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+        if database is None:
+            self._record_unknown(command, index, f"250-flags-{flags:08x}")
+            return
+        write_value = (
+            state.strings.get(command.ints[4] & 0x00FFFFFF)
+            if len(command.ints) == 5
+            else None
+        )
+        is_read = len(command.ints) == 5 and (
+            bool(byte1 & 0x10)
+            or (not any(command.strings) and write_value is None)
+        )
+        if not is_read:
+            write_type_ids = self._type_ids(database, command, byte2, state)
+            write_field_ids = (
+                {
+                    field_id
+                    for type_id in write_type_ids or ()
+                    for field_id, name in self.databases[database][type_id].field_names.items()
+                    if name == (command.strings[3] if len(command.strings) > 3 else "")
+                }
+                if byte2 & 0x04
+                else self._selector(command.ints[2], state, unknown_means_all=False) or set()
+            )
+            string_write = any(
+                self.databases[database][type_id].field_types.get(field_id, 0) >= 2000
+                for type_id in write_type_ids or ()
+                for field_id in write_field_ids
+            )
+            if string_write or write_value is not None:
+                self._write_database_string(
+                    command, index, state, database, byte2, write_value
+                )
+            elif write_type_ids and write_field_ids:
+                self._write_database_number(command, state, database, byte2)
+            else:
+                scopes = frozenset(
+                    f"database:{database}:{type_id}:*:*"
+                    for type_id in (write_type_ids or self.databases.get(database, {}))
+                ) or frozenset({f"database:{database}:*:*:*"})
+                # Numeric DB writes cannot carry translated strings, but their
+                # affected range is still part of the side-effect ledger.
+                if not write_type_ids:
+                    self.audit.data_effects[self._command_id(index)] = (
+                        "conservative",
+                        tuple(sorted(scopes)),
+                    )
+            return
+        # In the 3.713 Auto form, byte1 bit 0x10 marks a database read. The
+        # otherwise identical five-integer form writes its final string slot.
+        destination = command.ints[4] & 0x00FFFFFF
+        selected_type_ids = self._type_ids(database, command, byte2, state)
+        if selected_type_ids == set():
+            state.strings[destination] = _StringValue(literals=frozenset())
+            return
+        type_ids = (
+            set(self.databases.get(database, {}))
+            if selected_type_ids is None
+            else selected_type_ids
+        )
+
+        data_raw, field_raw = command.ints[1], command.ints[2]
+        if data_raw == -3 and field_raw == -3:
+            state.numbers[destination] = _NumberValue(
+                _limited(type_ids),
+                "数据库类型名称无法唯一解析" if len(type_ids) > _VALUE_LIMIT else "",
+                True,
+            )
+            return
+        if data_raw == -3 and field_raw != -3:
+            names = {command.strings[3]} if byte2 & 0x04 and len(command.strings) > 3 else set()
+            fields = {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database].get(type_id, _DatabaseType(database, type_id, "", {}, {}, (), ())).field_names.items()
+                if name in names
+            }
+            state.numbers[destination] = _NumberValue(
+                _limited(fields),
+                "数据库字段名称无法唯一解析" if not fields or len(fields) > _VALUE_LIMIT else "",
+                True,
+            )
+            return
+
+        if field_raw == -3:
+            if byte2 & 0x02:
+                data_name = command.strings[2] if len(command.strings) > 2 else ""
+                data_ids = {
+                    data_id
+                    for type_id in type_ids
+                    for data_id, name in enumerate(
+                        self.databases[database][type_id].data_names
+                    )
+                    if name == data_name
+                }
+                state.numbers[destination] = _NumberValue(
+                    _limited(data_ids),
+                    "数据库数据名称无法唯一解析" if len(data_ids) > _VALUE_LIMIT else "",
+                    True,
+                )
+                return
+            selected = self._selector(data_raw, state, unknown_means_all=True)
+            data_ids = selected if selected else {
+                data_id
+                for type_id in type_ids
+                for data_id in range(len(self.databases[database][type_id].rows))
+            }
+            keys: set[str] = set()
+            cells: set[tuple[str, int, int, int]] = set()
+            names: set[str] = set()
+            for type_id in type_ids:
+                db_type = self.databases[database].get(type_id)
+                if db_type is None:
+                    continue
+                for data_id in data_ids:
+                    if not 0 <= data_id < len(db_type.data_names):
+                        continue
+                    names.add(db_type.data_names[data_id])
+                    coordinate = (database, type_id, data_id, 0)
+                    coordinate_keys = self.database_keys.get(coordinate, ())
+                    if coordinate_keys:
+                        keys.update(coordinate_keys)
+                        cells.add(coordinate)
+                        names.discard(db_type.data_names[data_id])
+                        names.update(
+                            self.candidate_values.get(
+                                key, db_type.data_names[data_id]
+                            )
+                            for key in coordinate_keys
+                        )
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:0" for type_id in type_ids
+            )
+            symbolic = not selected or len(keys) + len(cells) > _VALUE_LIMIT
+            state.strings[destination] = _StringValue(
+                frozenset() if symbolic else frozenset(keys),
+                frozenset() if symbolic else frozenset(cells),
+                (f"{self._location(index)} opcode=250 {database} data-name",),
+                unknown=("数据库数据名来源集合超过 256 项" if symbolic else ""),
+                symbolic_all=symbolic,
+                scopes=scopes if symbolic else frozenset(),
+                literals=(
+                    frozenset(names)
+                    if len(names) <= _STRING_LITERAL_LIMIT
+                    else None
+                ),
+            )
+            return
+
+        data_all = False
+        if byte2 & 0x02:
+            data_name = command.strings[2] if len(command.strings) > 2 else ""
+            data_ids = {
+                data_id
+                for type_id in type_ids
+                for data_id, name in enumerate(self.databases[database][type_id].data_names)
+                if name == data_name
+            }
+        else:
+            selected = self._selector(data_raw, state, unknown_means_all=True)
+            data_all = not selected
+            data_ids = selected if selected else {
+                data_id
+                for type_id in type_ids
+                for data_id in range(len(self.databases[database][type_id].rows))
+            }
+        if byte2 & 0x04:
+            field_name = command.strings[3] if len(command.strings) > 3 else ""
+            field_ids = {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database][type_id].field_names.items()
+                if name == field_name
+            }
+        else:
+            selected = self._selector(field_raw, state, unknown_means_all=False)
+            field_ids = selected or set()
+        if not field_ids:
+            state.strings[destination] = _StringValue(
+                trace=(self._location(index),),
+                unknown="数据库字段选择器无法解析",
+                symbolic_all=True,
+                scopes=frozenset(
+                    f"database:{database}:{type_id}:*:*" for type_id in type_ids
+                ),
+                literals=None,
+            )
+            return
+
+        cells: set[tuple[str, int, int, int]] = set()
+        keys: set[str] = set()
+        string_values: set[str] = set()
+        numeric_values: set[int] = set()
+        numeric_coordinates: set[tuple[str, int, int, int]] = set()
+        string_field = False
+        for type_id in type_ids:
+            db_type = self.databases[database].get(type_id)
+            if db_type is None:
+                continue
+            for data_id in data_ids:
+                if not 0 <= data_id < len(db_type.rows):
+                    continue
+                for field_id in field_ids:
+                    if field_id not in db_type.field_types:
+                        continue
+                    coordinate = (database, type_id, data_id, field_id)
+                    if db_type.field_types[field_id] >= 2000:
+                        string_field = True
+                        coordinate_keys = self.database_keys.get(coordinate, ())
+                        runtime_value = state.database_strings.get(coordinate)
+                        if runtime_value is not None:
+                            keys.update(runtime_value.source_keys)
+                            cells.add(coordinate)
+                            cells.update(runtime_value.cells)
+                            if runtime_value.literals is not None:
+                                string_values.update(runtime_value.literals)
+                        elif coordinate_keys:
+                            cells.add(coordinate)
+                            keys.update(coordinate_keys)
+                            original_value = db_type.rows[data_id][field_id]
+                            string_values.update(
+                                self.candidate_values.get(key, original_value)
+                                for key in coordinate_keys
+                            )
+                        else:
+                            # Keep the field identity even when its current
+                            # value is not a workbook item: a runtime writer
+                            # may feed this exact storage slot to a display.
+                            cells.add(coordinate)
+                            string_values.add(db_type.rows[data_id][field_id])
+                    else:
+                        numeric_coordinates.add(coordinate)
+                        try:
+                            numeric_values.add(int(db_type.rows[data_id][field_id]))
+                        except ValueError:
+                            pass
+        trace = (
+            f"{self._location(index)} opcode=250 {database} types={sorted(type_ids)} "
+            f"data={'all' if not data_ids else sorted(data_ids)[:8]} fields={sorted(field_ids)}",
+        )
+        if string_field:
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for type_id in type_ids
+                for field_id in field_ids
+            )
+            database_selectors = (
+                self._dynamic_database_selectors(
+                    database, type_ids, field_ids, data_raw, state
+                )
+                if data_all
+                else frozenset()
+            )
+            selector_identity = (
+                self._address_number(data_raw, state).identity if data_all else ""
+            )
+            runtime_value: _StringValue | None = None
+            if selector_identity:
+                for type_id in type_ids:
+                    for field_id in field_ids:
+                        stored = state.dynamic_database_strings.get(
+                            (database, type_id, field_id, selector_identity)
+                        )
+                        if stored is not None:
+                            runtime_value = _merge_strings(runtime_value, stored) or stored
+            if runtime_value is not None:
+                # A matching dynamic write overwrites the selected row. Do not
+                # union unrelated static rows merely because the row number is
+                # unknown to the static analyzer.
+                state.strings[destination] = _StringValue(
+                    runtime_value.source_keys,
+                    runtime_value.cells,
+                    tuple(dict.fromkeys((*runtime_value.trace, *trace))),
+                    runtime_value.unknown,
+                    runtime_value.symbolic_all,
+                    runtime_value.scopes,
+                    runtime_value.literals,
+                    runtime_value.database_selectors | database_selectors,
+                    runtime_value.loop_source_keys,
+                )
+                return
+            if len(keys) + len(cells) > _VALUE_LIMIT:
+                state.strings[destination] = _StringValue(
+                    trace=trace,
+                    unknown="数据库字符串来源集合超过 256 项",
+                    symbolic_all=True,
+                    scopes=scopes,
+                    literals=None,
+                    database_selectors=database_selectors,
+                )
+            else:
+                state.strings[destination] = _StringValue(
+                    frozenset(keys),
+                    frozenset(cells),
+                    trace,
+                    symbolic_all=data_all,
+                    scopes=scopes if data_all else frozenset(),
+                    literals=(
+                        frozenset(string_values)
+                        if len(string_values) <= _STRING_LITERAL_LIMIT
+                        else None
+                    ),
+                    database_selectors=database_selectors,
+                )
+        elif numeric_values:
+            values = _limited(numeric_values)
+            selector_identity = (
+                self._address_number(data_raw, state).identity if data_all else ""
+            )
+            runtime_values = [
+                state.dynamic_database_numbers[(database, type_id, field_id, selector_identity)]
+                for type_id in type_ids
+                for field_id in field_ids
+                if selector_identity
+                and (database, type_id, field_id, selector_identity)
+                in state.dynamic_database_numbers
+            ]
+            if not data_all:
+                runtime_values.extend(
+                    state.database_numbers[coordinate]
+                    for coordinate in numeric_coordinates
+                    if coordinate in state.database_numbers
+                )
+            if runtime_values:
+                state.numbers[destination] = _merge_states(
+                    [
+                        _AnalysisState({destination: value}, {}, {})
+                        for value in runtime_values
+                    ]
+                ).numbers[destination]
+            else:
+                identity = (
+                    f"database-read:{database}:{next(iter(type_ids))}:"
+                    f"{next(iter(field_ids))}:{selector_identity}"
+                    if destination in self._address_variables
+                    and data_all
+                    and selector_identity
+                    and len(type_ids) == len(field_ids) == 1
+                    else ""
+                )
+                state.numbers[destination] = _NumberValue(
+                    values,
+                    "数据库数值集合超过 256 项" if values is None else "",
+                    True,
+                    identity,
+                )
+
+    def _write_database_number(
+        self,
+        command: _Command,
+        state: _AnalysisState,
+        database: str,
+        selector_flags: int,
+    ) -> None:
+        type_ids = self._type_ids(database, command, selector_flags, state)
+        if not type_ids or len(command.ints) < 5:
+            return
+        data_ids = (
+            {
+                data_id
+                for type_id in type_ids
+                for data_id, name in enumerate(self.databases[database][type_id].data_names)
+                if name == (command.strings[2] if len(command.strings) > 2 else "")
+            }
+            if selector_flags & 0x02
+            else self._selector(command.ints[1], state, unknown_means_all=False) or set()
+        )
+        field_ids = (
+            {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database][type_id].field_names.items()
+                if name == (command.strings[3] if len(command.strings) > 3 else "")
+            }
+            if selector_flags & 0x04
+            else self._selector(command.ints[2], state, unknown_means_all=False) or set()
+        )
+        value = self._number(command.ints[4], state)
+        if not value.identity:
+            # ponytail: Literal numeric writes cannot preserve a dynamic address
+            # relationship, so retaining them only multiplies call summaries.
+            return
+        for type_id in type_ids:
+            for field_id in field_ids:
+                if data_ids:
+                    for data_id in data_ids:
+                        state.database_numbers[(database, type_id, data_id, field_id)] = value
+                    continue
+                selector_identity = self._address_number(command.ints[1], state).identity
+                if selector_identity:
+                    state.dynamic_database_numbers[
+                        (database, type_id, field_id, selector_identity)
+                    ] = value
+
+    def _write_database_string(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        database: str,
+        selector_flags: int,
+        value: _StringValue | None = None,
+    ) -> None:
+        type_ids = self._type_ids(database, command, selector_flags, state)
+        if not type_ids:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "数据库写入类型无法解析",
+                frozenset({f"database:{database}:*:*:*"}),
+            )
+            return
+        if selector_flags & 0x02:
+            data_name = command.strings[2] if len(command.strings) > 2 else ""
+            data_ids = {
+                data_id
+                for type_id in type_ids
+                for data_id, name in enumerate(self.databases[database][type_id].data_names)
+                if name == data_name
+            }
+        else:
+            data_ids = self._selector(command.ints[1], state, unknown_means_all=False) or set()
+        if selector_flags & 0x04:
+            field_name = command.strings[3] if len(command.strings) > 3 else ""
+            field_ids = {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database][type_id].field_names.items()
+                if name == field_name
+            }
+        else:
+            field_ids = self._selector(command.ints[2], state, unknown_means_all=False) or set()
+        coordinates = {
+            (database, type_id, data_id, field_id)
+            for type_id in type_ids
+            for data_id in data_ids
+            for field_id in field_ids
+        }
+        database_selectors = (
+            self._dynamic_database_selectors(
+                database, type_ids, field_ids, command.ints[1], state
+            )
+            if not data_ids
+            else frozenset()
+        )
+        if len(coordinates) > _VALUE_LIMIT:
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for type_id in type_ids
+                for field_id in field_ids
+            ) or frozenset({f"database:{database}:*:*:*"})
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "数据库写入坐标超过静态展开上限",
+                scopes,
+            )
+            return
+        if value is None:
+            value = self._literal_string(command, index, 0, state)
+        for coordinate in coordinates:
+            state.database_strings[coordinate] = value
+        for selector in database_selectors:
+            state.dynamic_database_strings[selector[:4]] = value
+        field_scopes = frozenset(
+            f"database:{database}:{type_id}:*:{field_id}"
+            for type_id in type_ids
+            for field_id in field_ids
+        )
+        self._value_boundary_reference(
+            command,
+            index,
+            value,
+            "database_string_write",
+            field_scopes
+            if not coordinates
+            else frozenset(
+                f"database:{item[0]}:{item[1]}:{item[2]}:{item[3]}"
+                for item in coordinates
+            ),
+            target_database_cells=coordinates,
+            target_database_selectors=database_selectors,
+        )
+
+    def _set_runtime_value(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        *,
+        string_result: bool | None,
+    ) -> None:
+        if not command.ints:
+            self._record_unknown(command, index, "missing-destination")
+            return
+        destination = command.ints[0] & 0x00FFFFFF
+        if string_result is not False:
+            state.strings[destination] = _StringValue(
+                trace=(self._location(index),),
+                unknown=f"字符串由运行时命令 opcode={command.opcode} 取得",
+                literals=None,
+            )
+        if string_result is not True:
+            state.numbers[destination] = _NumberValue(
+                None, f"数值由运行时命令 opcode={command.opcode} 取得"
+            )
+
+    def _download(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        if len(command.ints) != 3 or len(command.strings) != 3:
+            self._record_unknown(command, index, "invalid-260")
+            return
+        destination = command.ints[1]
+        if destination >= 1_000_000:
+            state.strings[destination & 0x00FFFFFF] = _StringValue(
+                trace=(f"{self._location(index)} opcode=260 network response",),
+                unknown="下载响应是运行时字符串",
+                scopes=frozenset({"external:network"}),
+                literals=None,
+            )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            ("resource:network", "string"),
+        )
+
+    def _set_number(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        if len(command.ints) < 4:
+            self._record_unknown(command, index, "invalid-121")
+            return
+        if len(command.ints) == 7:
+            # ponytail: Editor's variable-target form can address any numeric
+            # slot selected at runtime. Invalidating known numbers is the exact
+            # safe abstraction; a decoded numeric address domain can narrow it.
+            tracked = any(value.tracked for value in state.numbers.values())
+            state.numbers = {
+                variable: _NumberValue(
+                    None,
+                    "121 动态代入目标使当前数值变为运行时值",
+                    value.tracked or tracked,
+                )
+                for variable, value in state.numbers.items()
+            }
+            self.audit.data_effects[self._command_id(index)] = (
+                "conservative",
+                ("number:*",),
+            )
+            return
+        destination, left_raw, right_raw, flags = command.ints[:4]
+        byte0 = flags & 0xFF
+        byte1 = (flags >> 8) & 0xFF
+        resolver = (
+            self._address_number
+            if destination in self._address_variables
+            else self._number
+        )
+        left = resolver(left_raw, state)
+        right = resolver(right_raw, state)
+        if byte0:
+            state.numbers[destination] = _NumberValue(
+                None,
+                f"121 运行时数值模式 flags={flags}",
+                left.tracked or right.tracked,
+            )
+            return
+        value = _calculate_numbers(
+            left,
+            right,
+            (byte1 >> 4) & 0x0F,
+        )
+        if (
+            destination in self._address_variables
+            and not value.identity
+            and value.values is not None
+            and len(value.values) == 1
+        ):
+            value = replace(value, identity=f"const:{next(iter(value.values))}")
+        assignment = byte1 & 0x0F
+        if assignment == 0:
+            state.numbers[destination] = value
+        elif assignment in {1, 2}:
+            current = state.numbers.get(destination, _NumberValue(None, "复合赋值前值未知"))
+            state.numbers[destination] = _calculate_numbers(current, value, assignment - 1)
+        else:
+            state.numbers[destination] = _NumberValue(
+                None,
+                f"121 运行时赋值模式 {assignment}",
+                value.tracked,
+            )
+
+    def _literal_string(
+        self,
+        command: _Command,
+        index: int,
+        string_index: int,
+        state: _AnalysisState,
+    ) -> _StringValue:
+        literal = command.strings[string_index] if string_index < len(command.strings) else ""
+        keys = frozenset(
+            item.key
+            for item in _items_for_event_codes(
+                self.event_items, self.block, index + 1, string_index
+            )
+            if item.original == literal
+        )
+        if self.block.event_type == "common":
+            source_scope = f"common:{self.block.event_id}"
+        else:
+            map_ids = ",".join(map(str, _block_map_ids(self.block)))
+            source_scope = f"map:{map_ids}:{self.block.event_id}:{self.block.page}"
+        candidate_literals = self._candidate_literal_values(
+            command, index, string_index
+        )
+        value = _StringValue(
+            keys,
+            trace=(f"{self._location(index)} opcode={command.opcode} literal",),
+            scopes=frozenset({source_scope}) if keys else frozenset(),
+            literals=candidate_literals,
+        )
+        referenced = _string_reference_value(literal, state)
+        if referenced is not None:
+            value = _merge_strings(value, referenced) or value
+        concrete_values: set[str] = set()
+        concrete_known = True
+        for candidate_literal in candidate_literals:
+            expanded = _expand_string_references(
+                frozenset({candidate_literal}), state
+            )
+            if expanded is None:
+                concrete_known = False
+                break
+            concrete_values.update(expanded)
+        concrete = frozenset(concrete_values) if concrete_known else None
+        value = _with_literals(value, concrete)
+        return value
+
+    def _set_string(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        if len(command.ints) < 2:
+            self._record_unknown(command, index, "invalid-122")
+            return
+        destination, flags = command.ints[:2]
+        source_raw = command.ints[2] if len(command.ints) > 2 else 0
+        source_kind = flags & 0x0F
+        assignment = (flags >> 8) & 0x0F
+        if source_kind == 1 and len(command.ints) < 3:
+            self._record_unknown(command, index, "invalid-122-variable-source")
+            return
+        if source_kind == 0:
+            value = self._literal_string(command, index, 0, state)
+        elif source_kind == 1:
+            value = state.strings.get(
+                source_raw & 0x00FFFFFF,
+                _StringValue(
+                    unknown=f"字符串变量 {source_raw & 0x00FFFFFF} 来源未知",
+                    literals=None,
+                ),
+            )
+        elif source_kind == 2:
+            pointer = self._number(source_raw, state)
+            pointed_values: list[_StringValue] = []
+            if pointer.values is not None:
+                for raw in pointer.values:
+                    pointed = state.strings.get(raw & 0x00FFFFFF)
+                    if pointed is not None:
+                        pointed_values.append(pointed)
+            if pointed_values:
+                value = None
+                for pointed in pointed_values:
+                    value = _merge_strings(value, pointed)
+                value = value or _StringValue(literals=None)
+            else:
+                # ponytail: WOLF can load the source string variable through a
+                # numeric variable. If that pointer is dynamic we keep the value
+                # dynamic, not opaque; later safety replay will preserve anything
+                # whose logic depends on it.
+                value = _StringValue(
+                    trace=(f"{self._location(index)} opcode=122 dynamic source pointer",),
+                    scopes=frozenset(),
+                    literals=None,
+                )
+        elif source_kind == 3:
+            value = _StringValue(
+                trace=(f"{self._location(index)} opcode=122 runtime string input",),
+                literals=None,
+            )
+        else:
+            current = state.strings.get(destination)
+            state.strings[destination] = _StringValue(
+                current.source_keys if current else frozenset(),
+                current.cells if current else frozenset(),
+                current.trace if current else (),
+                f"未支持的 122 来源模式 {source_kind}",
+                current.symbolic_all if current else False,
+                current.scopes if current else frozenset(),
+                current.literals if current else None,
+                current.database_selectors if current else frozenset(),
+                current.loop_source_keys if current else frozenset(),
+            )
+            return
+        current = state.strings.get(destination)
+        literal_operands: _StringValue | None = None
+        for string_index in range(len(command.strings)):
+            literal_operands = _merge_strings(
+                literal_operands,
+                self._literal_string(command, index, string_index, state),
+            )
+        extended_string_operation = bool(flags & 0x00040000)
+
+        def derived(*values: _StringValue | None, note: str) -> _StringValue:
+            merged: _StringValue | None = None
+            for item in values:
+                if item is not None:
+                    merged = _merge_strings(merged, item)
+            merged = merged or _StringValue(literals=None)
+            return _StringValue(
+                merged.source_keys,
+                merged.cells,
+                tuple(dict.fromkeys(merged.trace + (f"{self._location(index)} opcode=122 {note}",))),
+                merged.unknown,
+                merged.symbolic_all,
+                merged.scopes,
+                None,
+                merged.database_selectors,
+                merged.loop_source_keys,
+            )
+
+        if extended_string_operation and assignment in {3, 4, 5}:
+            traced = derived(current, value, literal_operands, note=f"extended-op={assignment}")
+            state.strings[destination] = traced
+            if assignment == 3 and source_kind == 1:
+                state.strings[source_raw & 0x00FFFFFF] = traced
+        elif assignment == 0:
+            state.strings[destination] = value
+        elif assignment == 1:
+            merged = _merge_strings(current, value) or value
+            state.strings[destination] = _with_literals(
+                merged,
+                _concat_literals(
+                    current.literals if current else frozenset({""}), value.literals
+                ),
+            )
+        elif assignment in {2, 3, 4, 10, 11}:
+            # ponytail: Auto protection tracks provenance, not WOLF's concrete string values.
+            traced = derived(current if assignment in {10, 11} else None, value, note=f"op={assignment}")
+            state.strings[destination] = traced
+            if assignment in {3, 4} and source_kind == 1:
+                state.strings[source_raw & 0x00FFFFFF] = traced
+        elif assignment in {5, 7, 8}:
+            self._value_boundary_reference(command, index, value, "file_path_runtime_read")
+            state.strings[destination] = derived(value, note=f"op={assignment} runtime-read")
+        elif assignment == 6:
+            content = derived(current, note="op=6 file-content")
+            self._value_boundary_reference(
+                command,
+                index,
+                value,
+                "file_path_runtime_write",
+            )
+            self._value_boundary_reference(
+                command,
+                index,
+                content,
+                "file_content_runtime_write",
+                resource_path_values=value.literals,
+            )
+            if current is not None:
+                state.strings[destination] = current
+        elif assignment == 9 and source_kind == 0:
+            literal_keys = {
+                item.key
+                for string_index, literal in enumerate(command.strings)
+                for item in _items_for_event_codes(
+                    self.event_items, self.block, index + 1, string_index
+                )
+                if item.original == literal
+            }
+            replacement = _StringValue(
+                frozenset(literal_keys),
+                trace=(f"{self._location(index)} opcode=122 op=9",),
+                literals=frozenset(command.strings),
+            )
+            state.strings[destination] = derived(current, replacement, note="op=9")
+        else:
+            state.strings[destination] = _StringValue(
+                value.source_keys, value.cells, value.trace,
+                f"未支持的 122 赋值运算 {assignment}", value.symbolic_all,
+                value.scopes,
+                None,
+                value.database_selectors,
+                value.loop_source_keys,
+            )
+        result = state.strings.get(destination)
+        if result is None:
+            return
+        writes_global = not 1_600_000 <= destination < 1_600_100
+        if assignment in {3, 4} and source_kind == 1:
+            source = source_raw & 0x00FFFFFF
+            writes_global = writes_global or not 1_600_000 <= source < 1_600_100
+        global_destinations = {destination}
+        if assignment in {3, 4} and source_kind == 1:
+            global_destinations.add(source_raw & 0x00FFFFFF)
+        if writes_global:
+            for global_destination in sorted(global_destinations):
+                if not 1_600_000 <= global_destination < 1_600_100:
+                    self._value_boundary_reference(
+                        command,
+                        index,
+                        result,
+                        "global_string_write",
+                        global_string_variable=global_destination,
+                    )
+        if (
+            self.block.event_type == "common"
+            and self.block.return_target >= 5
+            and destination == 1_600_000 + self.block.return_target
+        ):
+            self._value_boundary_reference(
+                command, index, result, "common_event_return"
+            )
+
+    def _condition(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        if not command.ints:
+            self._record_unknown(command, index, "invalid-112")
+            return
+        # Editor 3.713 uses both a bare count and 0x10 | count.
+        count = command.ints[0] & 0x0F
+        if count < 0 or len(command.ints) < count + 1 or len(command.strings) < count:
+            self._record_unknown(command, index, "invalid-112-count")
+            return
+        for condition_index in range(count):
+            variable, operator, right_is_variable = _condition_operator(command.ints[condition_index + 1])
+            condition_code = _event_code(self.block, index + 1, condition_index).upper()
+            condition_literal = self._literal_string(
+                command, index, condition_index, state
+            )
+            literal_values = condition_literal.literals
+            condition_keys = sorted(
+                item.key
+                for item in _items_for_event_codes(
+                    self.event_items, self.block, index + 1, condition_index
+                )
+                if item.original == command.strings[condition_index]
+            )
+            value = state.strings.get(variable)
+            literal = (
+                next(iter(literal_values))
+                if literal_values is not None and len(literal_values) == 1
+                else command.strings[condition_index]
+            )
+            right_value: _StringValue | None = None
+            if right_is_variable:
+                right_index = count + 1 + condition_index
+                right_variable = command.ints[right_index] & 0x00FFFFFF if right_index < len(command.ints) else -1
+                right_value = state.strings.get(right_variable)
+            if state.unknown_scopes:
+                opaque = any(
+                    marker in item
+                    for item in state.unknown_reasons
+                    for marker in ("未校准", "未支持", "不透明")
+                )
+                status = "blocking" if opaque else "dynamic"
+                reason = (
+                    "条件执行前经过可能读写字符串的不透明命令"
+                    if opaque
+                    else "条件执行前存在已保守定位的动态副作用"
+                )
+            elif operator is None:
+                status = "blocking" if value and value.tracked else "untracked"
+                reason = "未支持的字符串比较编码"
+            elif right_is_variable and (
+                value is None or right_value is None or not value.tracked or not right_value.tracked
+            ):
+                status = "untracked"
+                reason = "字符串变量比较的一侧来源未知"
+            elif right_is_variable and (value.unknown or right_value.unknown):
+                left_status, left_reason = _string_value_status(value)
+                right_status, right_reason = _string_value_status(right_value)
+                status = "blocking" if "blocking" in {left_status, right_status} else "dynamic"
+                reason = left_reason or right_reason
+            elif right_is_variable and (
+                value.literals is None or right_value.literals is None
+            ):
+                status = "dynamic"
+                reason = "字符串变量比较的具体值为运行时动态值"
+            elif value is None or not value.tracked:
+                status = "untracked"
+                reason = f"条件变量 {variable} 从事件入口进入"
+            elif value.unknown or value.symbolic_all:
+                status, reason = _string_value_status(value)
+            elif value.literals is None:
+                status = "dynamic"
+                reason = "条件字符串的具体值为运行时动态值"
+            else:
+                status = "resolved"
+                reason = ""
+            dependency = {
+                "kind": "condition",
+                "auto_file": self.block.source,
+                "event_type": self.block.event_type,
+                "event_id": self.block.event_id,
+                "event_name": self.block.event_name,
+                "page": self.block.page,
+                "command": index + 1,
+                "string_index": condition_index,
+                "condition_code": condition_code,
+                "condition_keys": condition_keys,
+                "operator": operator or "unknown",
+                "literal": literal,
+                "right_is_variable": right_is_variable,
+                "source_keys": sorted(value.source_keys) if value else [],
+                "right_source_keys": sorted(right_value.source_keys) if right_value else [],
+                "database_cells": [
+                    {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                    for cell in sorted(value.cells if value else ())
+                ],
+                "right_database_cells": [
+                    {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                    for cell in sorted(right_value.cells if right_value else ())
+                ],
+                "database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(value.database_selectors if value else ())
+                ],
+                "right_database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(
+                        right_value.database_selectors if right_value else ()
+                    )
+                ],
+                "target_database_selectors": [],
+                "trace": list(value.trace if value else ()),
+                "right_trace": list(right_value.trace if right_value else ()),
+                "left_values": sorted(value.literals) if value and value.literals is not None else [],
+                "right_values": (
+                    sorted(right_value.literals)
+                    if right_value and right_value.literals is not None
+                    else sorted(literal_values or ())
+                ),
+                "source_scopes": sorted(value.scopes if value else ()),
+                "right_source_scopes": sorted(
+                    right_value.scopes if right_value else ()
+                ),
+                "unresolved_scopes": sorted(
+                    state.unknown_scopes
+                    |
+                    (value.scopes if value else frozenset())
+                    | (right_value.scopes if right_value else frozenset())
+                ),
+                "unresolved_reasons": sorted(state.unknown_reasons),
+                "status": status,
+                "reason": reason,
+            }
+            self.dependencies.append(dependency)
+            if status == "blocking":
+                self.blocking.append(dependency)
+
+    def _matching(self, start: int, end: int, opcode: int) -> int | None:
+        indent = self.block.commands[start].indent
+        for index in range(start + 1, end):
+            command = self.block.commands[index]
+            if command.opcode == opcode and command.indent == indent:
+                return index
+        return None
+
+    def _numeric_condition_truth(
+        self, command: _Command, state: _AnalysisState
+    ) -> bool | None:
+        # Editor 3.713 pretty output confirms flag 2 means numeric equality.
+        if len(command.ints) != 4 or command.ints[0] != 1 or command.ints[3] != 2:
+            return None
+        left = self._number(command.ints[1], state)
+        right = self._number(command.ints[2], state)
+        if left.values is None or right.values is None:
+            return None
+        if left.values.isdisjoint(right.values):
+            return False
+        if len(left.values) == len(right.values) == 1:
+            return True
+        return None
+
+    def _taint_unknown(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        *,
+        strings: bool = True,
+    ) -> None:
+        affected = {value & 0x00FFFFFF for value in command.ints if value >= 1_000_000}
+        if strings:
+            for variable in affected & set(state.strings):
+                current = state.strings[variable]
+                state.strings[variable] = _StringValue(
+                    current.source_keys,
+                    current.cells,
+                    current.trace + (self._location(index),),
+                    f"来源经过未支持命令 opcode={command.opcode}",
+                    current.symbolic_all,
+                    current.scopes,
+                    None,
+                    current.database_selectors,
+                    current.loop_source_keys,
+                )
+        if strings:
+            scopes = frozenset({"project"})
+            state.unknown_scopes = state.unknown_scopes | scopes
+            state.unknown_reasons = state.unknown_reasons | frozenset({
+                f"{self._location(index)} opcode={command.opcode} 参数形状不透明"
+            })
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "opaque",
+                f"未校准或不透明命令 opcode={command.opcode}",
+                scopes,
+            )
+        for variable in affected & set(state.numbers):
+            current = state.numbers[variable]
+            state.numbers[variable] = _NumberValue(
+                None, f"数值经过未支持命令 opcode={command.opcode}", current.tracked
+            )
+
+    def _apply_conservative_scopes(
+        self,
+        state: _AnalysisState,
+        scopes: frozenset[str],
+        reason: str,
+    ) -> None:
+        if not scopes:
+            scopes = frozenset({"project"})
+        state.unknown_scopes = state.unknown_scopes | scopes
+        state.unknown_reasons = state.unknown_reasons | frozenset({reason})
+        affects_globals = "project" in scopes or any(
+            scope.startswith("common:") for scope in scopes
+        )
+        if affects_globals:
+            for variable, current in tuple(state.strings.items()):
+                if 1_600_000 <= variable < 1_600_100:
+                    continue
+                state.strings[variable] = _StringValue(
+                    current.source_keys,
+                    current.cells,
+                    current.trace,
+                    reason,
+                    True,
+                    current.scopes | scopes,
+                    None,
+                    current.database_selectors,
+                    current.loop_source_keys,
+                )
+            for variable, current in tuple(state.numbers.items()):
+                if 1_600_000 <= variable < 1_600_100:
+                    continue
+                state.numbers[variable] = _NumberValue(
+                    None, reason, current.tracked
+                )
+
+    def _unknown_call(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        reason: str,
+        scopes: frozenset[str] | None = None,
+        *,
+        status: str = "blocking",
+        taint_state: bool = True,
+        call_target_kind: str | None = None,
+    ) -> None:
+        if scopes is None:
+            scopes = frozenset({"project"})
+        input_values = tuple(
+            state.strings[raw & 0x00FFFFFF]
+            for raw in command.ints[2:-1]
+            if raw >= 1_000_000 and (raw & 0x00FFFFFF) in state.strings
+        )
+        literal_start = 1 if command.opcode == 300 else 0
+        input_values += tuple(
+            self._literal_string(command, index, string_index, state)
+            for string_index in range(literal_start, len(command.strings))
+        )
+        self._blocking_scope_dependency(
+            command,
+            index,
+            "call",
+            reason,
+            scopes,
+            input_values,
+            status=status,
+            call_target_kind=call_target_kind,
+        )
+        if taint_state:
+            self._apply_conservative_scopes(
+                state,
+                scopes,
+                f"{self._location(index)} opcode={command.opcode}: {reason}",
+            )
+        if len(command.ints) < 2 or not command.ints[1] & 0x01000000:
+            return
+        destination = command.ints[-1] & 0x00FFFFFF
+        value: _StringValue | None = None
+        for raw in command.ints[2:-1]:
+            source = state.strings.get(raw & 0x00FFFFFF) if raw >= 1_000_000 else None
+            if source is not None:
+                value = _merge_strings(value, source)
+        value = value or _StringValue()
+        state.strings[destination] = _StringValue(
+            value.source_keys,
+            value.cells,
+            tuple(dict.fromkeys(value.trace + (self._location(index),))),
+            (
+                f"来源经过未解释的公共事件调用 opcode={command.opcode}: {reason}"
+                if status == "blocking"
+                else f"公共事件返回值为运行时动态值 opcode={command.opcode}: {reason}"
+            ),
+            "project" in scopes,
+            value.scopes | scopes,
+            None,
+        )
+        numeric_inputs = [
+            state.numbers[raw & 0x00FFFFFF]
+            for raw in command.ints[2:-1]
+            if raw >= 1_000_000 and (raw & 0x00FFFFFF) in state.numbers
+        ]
+        state.numbers[destination] = _NumberValue(
+            None,
+            f"数值来自未解释的公共事件调用 opcode={command.opcode}",
+            any(item.tracked for item in numeric_inputs),
+        )
+
+    def _call_target(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> tuple[_CommandBlock, int | None] | None:
+        if len(command.ints) < 2:
+            return None
+        if command.opcode == 300:
+            if not command.strings:
+                return None
+            target_value = self._literal_string(command, index, 0, state)
+            target_names = target_value.literals
+            if target_names is None:
+                referenced = _string_reference_value(command.strings[0], state)
+                if referenced is not None:
+                    target_names = referenced.literals
+            matches = {
+                max(group, key=lambda block: block.event_id).event_id:
+                max(group, key=lambda block: block.event_id)
+                for name in (target_names or ())
+                if (group := self.common_by_name.get(name, ()))
+            }
+            target = next(iter(matches.values())) if len(matches) == 1 else None
+        else:
+            reference = command.ints[0]
+            if 599_000 <= reference < 601_000 and self.block.event_type == "common":
+                target_id = self.block.event_id + reference - 600_100
+            elif 500_000 <= reference < 600_000:
+                target_id = reference - 500_000
+            else:
+                return None
+            target = self.common_by_id.get(target_id)
+        if target is None:
+            return None
+        choice_value = (
+            self._number(command.ints[2], state)
+            if len(command.ints) >= 3
+            else _NumberValue(frozenset({0}))
+        )
+        choice = (
+            next(iter(choice_value.values))
+            if choice_value.values is not None and len(choice_value.values) == 1
+            else None
+        )
+        return target, choice
+
+    def _call_event(self, command: _Command, index: int, state: _AnalysisState) -> None:
+        command_id = self._command_id(index)
+        has_return = len(command.ints) >= 2 and bool(command.ints[1] & 0x01000000)
+        resolved = self._call_target(command, index, state)
+        if resolved is None:
+            if command.opcode == 300 and command.strings:
+                names = self._literal_string(command, index, 0, state).literals
+                if names is not None and not any(
+                    self.common_by_name.get(name) for name in names
+                ):
+                    # The official manual specifies that an invalid name does
+                    # nothing. Old projects commonly retain optional calls.
+                    self._record_call(command_id, "exact", ("noop",))
+                    return
+                value = self._literal_string(command, index, 0, state)
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
+                    frozenset({"common:*"}),
+                    (value,),
+                    status="dynamic",
+                    call_target_kind="event_name",
+                )
+            elif command.opcode == 210 and command.ints and command.ints[0] < 0:
+                self._record_call(command_id, "exact", ("noop",))
+                return
+            else:
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件目标为运行时动态值，已保守保护全部公共事件范围",
+                    frozenset({"common:*"}),
+                    status="dynamic",
+                    call_target_kind="numeric_id",
+                )
+            self._record_call(command_id, "conservative", ("common:*",))
+            self._set_unknown_target_return(command, state)
+            return
+        target, choice = resolved
+        # Every common event is also analyzed independently. At a call site we
+        # only need the callee's own text and actual argument provenance; DB and
+        # global writes are covered by their value-boundary dependencies.
+        target_scopes = frozenset({f"common:{target.event_id}"})
+        self._record_call(command_id, "exact", (f"common:{target.event_id}",))
+        if command.opcode == 300 and command.strings:
+            target_value = self._literal_string(command, index, 0, state)
+            if target_value.tracked:
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "call",
+                    "公共事件名称已精确解析",
+                    frozenset(),
+                    (target_value,),
+                    status="resolved",
+                )
+        target_has_dispatcher = any(
+            command.indent == 0
+            and following.indent == 0
+            and command.opcode == 122
+            and command.ints[:2] == (3_000_001, 0)
+            and command.strings == ("cmd:\\cself[0]",)
+            and following.opcode == 213
+            and following.strings == ("\\s[1]",)
+            for command, following in zip(target.commands, target.commands[1:])
+        )
+        target_has_entry_labels = any(
+            item.opcode == 212
+            and item.indent == 0
+            and len(item.strings) == 1
+            and item.strings[0].startswith("cmd:")
+            for item in target.commands
+        )
+        if choice is None and (target_has_dispatcher or target_has_entry_labels):
+            self._record_call(command_id, "conservative", target_scopes)
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "调用入口为运行时动态值，已保守保护目标事件范围",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
+            return
+        call_key = (target.event_id, choice)
+        if len(self.call_stack) >= _CALL_DEPTH_LIMIT:
+            # ponytail: recursive value summaries widen to the precomputed call
+            # closure; parameterized SCC summaries can recover more coverage.
+            self._unknown_call(
+                command,
+                index,
+                state,
+                "递归调用摘要扩大为可达范围",
+                self.event_scopes.get(target.event_id, target_scopes),
+                status="dynamic",
+                taint_state=False,
+            )
+            self._record_call(
+                command_id,
+                "conservative",
+                self.event_scopes.get(target.event_id, target_scopes),
+            )
+            return
+        if call_key in self.call_stack:
+            self._unknown_call(
+                command,
+                index,
+                state,
+                "递归调用摘要扩大为可达范围",
+                self.event_scopes.get(target.event_id, target_scopes),
+                status="dynamic",
+                taint_state=False,
+            )
+            self._record_call(
+                command_id,
+                "conservative",
+                self.event_scopes.get(target.event_id, target_scopes),
+            )
+            return
+        if has_return and target.return_target < 0:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "调用声明返回值但目标事件没有返回槽，已按运行时动态值处理",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
+            return
+
+        flags = command.ints[1]
+        numeric_slots = flags & 0x0F
+        string_count = (flags >> 4) & 0x0F
+        # ponytail: The call record is authoritative for this entry point. Common
+        # events may expose fewer inputs than old call sites still carry. WOLF stores
+        # zero-input calls as two integers and otherwise counts all numeric slots.
+        string_start = 2 + numeric_slots
+        string_end = string_start + string_count
+        expected_ints = string_end + int(has_return)
+        if len(command.ints) != expected_ints:
+            self._unknown_call(command, index, state, "实参数量与 Auto 头部不符", target_scopes)
+            return
+        string_offset = 1
+        string_arguments = command.ints[string_start:string_end]
+        if any(raw < 1_000_000 for raw in string_arguments) and len(command.strings) < string_offset + string_count:
+            self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
+            return
+
+        callee_state = _AnalysisState(
+            {},
+            {},
+            dict(state.database_strings),
+            dict(state.database_numbers),
+            dict(state.dynamic_database_numbers),
+            dict(state.dynamic_database_strings),
+        )
+        for offset, raw in enumerate(command.ints[2:string_start]):
+            resolver = (
+                self._address_number
+                if 1_600_000 + offset in _address_variables_for_block(target)
+                else self._number
+            )
+            callee_state.numbers[1_600_000 + offset] = resolver(raw, state)
+        for offset, raw in enumerate(string_arguments):
+            destination = 1_600_005 + offset
+            if raw >= 1_000_000:
+                callee_state.strings[destination] = state.strings.get(
+                    raw & 0x00FFFFFF,
+                    _StringValue(
+                        unknown=f"字符串实参 {raw & 0x00FFFFFF} 来源未知",
+                        literals=None,
+                    ),
+                )
+            else:
+                pooled = self.call_argument_pool.get(command_id, ())
+                callee_state.strings[destination] = (
+                    pooled[offset]
+                    if offset < len(pooled)
+                    else self._literal_string(
+                        command,
+                        index,
+                        string_offset + offset,
+                        state,
+                    )
+                )
+
+        carries_persistent_state = (
+            any(value.tracked for value in callee_state.strings.values())
+            or any(value.identity for value in callee_state.numbers.values())
+        )
+        if not has_return and not carries_persistent_state:
+            # ponytail: every public event is analyzed once on its own. Re-enter
+            # only calls carrying translated provenance or an address expression;
+            # root fixed-point propagation covers persistent DB state without
+            # multiplying every unrelated call site.
+            return
+
+        dispatcher = self._dynamic_entry_dispatcher(target)
+        if dispatcher is not None:
+            start, end = dispatcher, len(target.commands)
+        else:
+            entry_labels = [
+                position
+                for position, item in enumerate(target.commands)
+                if item.opcode == 212
+                and item.indent == 0
+                and len(item.strings) == 1
+                and item.strings[0].startswith("cmd:")
+            ]
+            if entry_labels:
+                label = next(
+                    (
+                        position
+                        for position in entry_labels
+                        if target.commands[position].strings == (f"cmd:{choice}",)
+                    ),
+                    None,
+                )
+                if label is None:
+                    self._unknown_call(
+                        command, index, state, f"缺少 cmd:{choice} 标签", target_scopes
+                    )
+                    return
+                start = label + 1
+                end = next(
+                    (position for position in entry_labels if position > label),
+                    len(target.commands),
+                )
+            else:
+                start, end = 0, len(target.commands)
+        cache_key = (target.event_id, choice, start, end, _state_cache_key(callee_state))
+        cached = self.call_cache.get(cache_key)
+        if cached is None:
+            child = _BlockAnalyzer(
+                target,
+                self.databases,
+                self.database_keys,
+                self.event_items,
+                self.common_by_id,
+                self.common_by_name,
+                self.event_scopes,
+                self.call_stack + (call_key,),
+                self.call_cache,
+                self.call_argument_pool,
+                self.candidate_values,
+                self.audit,
+            )
+            exits: list[_AnalysisState] = []
+            fell_through = child._execute(start, end, callee_state, exits)
+            if fell_through:
+                exits.append(callee_state.copy())
+            cached = _CallSummary(
+                fell_through,
+                tuple(item.copy() for item in exits),
+                child.summary_failed,
+                tuple(child.dependencies),
+                tuple(child.blocking),
+                Counter(child.unknown),
+                tuple(
+                    (key, tuple(values))
+                    for key, values in child.unknown_locations.items()
+                ),
+            )
+            self.call_cache[cache_key] = cached
+        self.dependencies.extend(cached.dependencies)
+        self.blocking.extend(cached.blocking)
+        self.unknown.update(cached.unknown)
+        for key, values in cached.unknown_locations:
+            self.unknown_locations.setdefault(key, []).extend(values)
+        if cached.summary_failed:
+            self._unknown_call(
+                command,
+                index,
+                state,
+                cached.summary_failed or "公共事件摘要没有在 END 返回",
+                target_scopes,
+            )
+            return
+        if not cached.exits:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "call",
+                "目标事件控制流为运行时动态路径，已保守保护事件范围",
+                target_scopes,
+                status="dynamic",
+            )
+            self._set_dynamic_call_return(command, state, target, target_scopes)
+            return
+
+        result = _merge_states(list(cached.exits))
+        state.database_strings = dict(result.database_strings)
+        state.database_numbers = dict(result.database_numbers)
+        state.dynamic_database_numbers = dict(result.dynamic_database_numbers)
+        state.dynamic_database_strings = dict(result.dynamic_database_strings)
+        state.unknown_scopes = state.unknown_scopes | result.unknown_scopes
+        state.unknown_reasons = state.unknown_reasons | result.unknown_reasons
+        # Global variables are shared across public-event frames; CSelf slots are not.
+        for variable, value in result.strings.items():
+            if not 1_600_000 <= variable < 1_600_100:
+                state.strings[variable] = value
+        for variable, value in result.numbers.items():
+            if not 1_600_000 <= variable < 1_600_100:
+                state.numbers[variable] = value
+        if not has_return:
+            return
+        return_variable = 1_600_000 + target.return_target
+        destination = command.ints[-1] & 0x00FFFFFF
+        call_trace = f"{self._location(index)} -> common={target.event_id} cmd={choice}"
+        if target.return_target >= 5:
+            value = result.strings.get(return_variable)
+            if value is None:
+                self._set_dynamic_call_return(command, state, target, target_scopes)
+                return
+            state.strings[destination] = _StringValue(
+                value.source_keys,
+                value.cells,
+                tuple(dict.fromkeys(value.trace + (call_trace,))),
+                value.unknown,
+                value.symbolic_all,
+                value.scopes,
+                value.literals,
+            )
+        else:
+            value = result.numbers.get(return_variable)
+            if value is None:
+                self._set_dynamic_call_return(command, state, target, target_scopes)
+                return
+            state.numbers[destination] = value
+
+    @staticmethod
+    def _set_unknown_target_return(
+        command: _Command, state: _AnalysisState
+    ) -> None:
+        if len(command.ints) < 3 or not command.ints[1] & 0x01000000:
+            return
+        destination = command.ints[-1] & 0x00FFFFFF
+        state.strings[destination] = _StringValue(
+            unknown="公共事件目标为运行时动态值",
+            scopes=frozenset({"common:*"}),
+            literals=None,
+        )
+        state.numbers[destination] = _NumberValue(
+            None, "公共事件目标为运行时动态值"
+        )
+
+    def _set_dynamic_call_return(
+        self,
+        command: _Command,
+        state: _AnalysisState,
+        target: _CommandBlock,
+        scopes: frozenset[str],
+    ) -> None:
+        if len(command.ints) < 3 or not command.ints[1] & 0x01000000:
+            return
+        destination = command.ints[-1] & 0x00FFFFFF
+        if target.return_target >= 5:
+            state.strings[destination] = _StringValue(
+                unknown="公共事件返回值为运行时动态值",
+                scopes=scopes,
+                literals=None,
+            )
+        else:
+            state.numbers[destination] = _NumberValue(
+                None, "公共事件返回值为运行时动态值"
+            )
+
+    def _reserve_event(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        command_id = self._command_id(index)
+        if not command.ints:
+            self._record_call(command_id, "conservative", ("common:*",))
+            self._unknown_call(
+                command, index, state, "预约公共事件目标缺失", frozenset({"common:*"})
+            )
+            return
+        reference = command.ints[0]
+        if reference >= 1_000_000:
+            self._record_call(command_id, "conservative", ("common:*",))
+            self._unknown_call(
+                command,
+                index,
+                state,
+                "预约公共事件目标为运行时动态值",
+                frozenset({"common:*"}),
+                status="dynamic",
+                call_target_kind="numeric_id",
+            )
+            return
+        target_id = (
+            reference - 500_000
+            if 500_000 <= reference < 600_000
+            else reference
+        )
+        target = self.common_by_id.get(target_id)
+        if target is None:
+            self._record_call(command_id, "exact", ("noop",))
+            return
+        self._record_call(command_id, "exact", (f"common:{target.event_id}",))
+        # The target is fixed. Its delayed effects are analyzed in the target
+        # event; attaching their broad scope here would taint unrelated text.
+
+    def _import_database(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        selector = command.ints[0] if command.ints else -1
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(selector)
+        scopes = (
+            frozenset({f"database:{database}:*:*:*"})
+            if database
+            else frozenset(
+                {
+                    "database:UDB:*:*:*",
+                    "database:CDB:*:*:*",
+                    "database:SDB:*:*:*",
+                }
+            )
+        )
+        self._blocking_scope_dependency(
+            command,
+            index,
+            "database",
+            "CSV 数据库操作可能在运行时改写数据库字符串",
+            scopes,
+            status="dynamic",
+        )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative", tuple(sorted(scopes))
+        )
+
+    def _transform_database(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        flags = command.ints[3] if len(command.ints) > 3 else 0
+        selector_flags = (flags >> 16) & 0xFF
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get((flags >> 8) & 0x0F)
+        if database is None:
+            scopes = frozenset(
+                {
+                    "database:CDB:*:*:*",
+                    "database:SDB:*:*:*",
+                    "database:UDB:*:*:*",
+                }
+            )
+        else:
+            type_ids = self._type_ids(database, command, selector_flags, state)
+            scopes = frozenset(
+                f"database:{database}:{type_id}:*:*"
+                for type_id in (type_ids or self.databases.get(database, {}))
+            ) or frozenset({f"database:{database}:*:*:*"})
+        values = tuple(
+            self._literal_string(command, index, string_index, state)
+            for string_index, text in enumerate(command.strings)
+            if text
+        )
+        self._blocking_scope_dependency(
+            command,
+            index,
+            "database",
+            "数据库数据操作会重排或改写可定位的数据库范围",
+            scopes,
+            values,
+            status="dynamic",
+        )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            tuple(sorted(scopes)),
+        )
+
+    def _xy_array(
+        self, command: _Command, index: int, state: _AnalysisState
+    ) -> None:
+        selector = (
+            self._literal_string(command, index, 1, state)
+            if len(command.strings) > 1 and command.strings[1]
+            else _StringValue(literals=frozenset())
+        )
+        scopes = frozenset({"array:*"})
+        if selector.tracked:
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "database",
+                "XY 数值数组名称来自可翻译字符串",
+                scopes,
+                (selector,),
+                status="dynamic",
+            )
+        if len(command.ints) > 4:
+            destination = command.ints[4] & 0x00FFFFFF
+            state.numbers[destination] = _NumberValue(
+                None, "XY 数值数组操作结果为运行时动态值", selector.tracked
+            )
+        self.audit.data_effects[self._command_id(index)] = (
+            "conservative",
+            tuple(sorted(scopes)),
+        )
+
+    def _transfer_command(
+        self,
+        index: int,
+        state: _AnalysisState,
+        exits: list[_AnalysisState] | None = None,
+    ) -> bool:
+        end = index + 1
+        while index < end:
+            command = self.block.commands[index]
+            command_id = self._command_id(index)
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            if semantics is None:
+                self.audit.transfers[command_id] = "opaque"
+                self.audit.data_effects[command_id] = ("opaque", ("project",))
+                self._record_unknown(command, index)
+                self._taint_unknown(command, index, state)
+                index += 1
+                continue
+            shape_key = (
+                command.opcode,
+                f"ints={len(command.ints)},strings={len(command.strings)}",
+            )
+            unknown_before = self.unknown[shape_key]
+            self.audit.transfers[command_id] = str(semantics["transfer"])
+            self._display_reference(command, index, state, semantics)
+            self._resource_reference(command, index, state, semantics)
+            if command.opcode == 121:
+                self._set_number(command, index, state)
+            elif command.opcode == 122:
+                self._set_string(command, index, state)
+            elif command.opcode == 123:
+                self._set_runtime_value(command, index, state, string_result=False)
+            elif command.opcode == 124:
+                # Editor 3.713 exposes both numeric and string-valued queries.
+                # Keeping both abstract destinations is conservative and avoids
+                # guessing an uncalibrated runtime category's result type.
+                self._set_runtime_value(command, index, state, string_result=None)
+            elif command.opcode == 250:
+                self._database(command, index, state)
+            elif command.opcode == 251:
+                self._import_database(command, index, state)
+            elif command.opcode == 252:
+                self._transform_database(command, index, state)
+            elif command.opcode in {255, 257}:
+                self._xy_array(command, index, state)
+            elif command.opcode == 260:
+                self._download(command, index, state)
+            elif command.opcode == 221:
+                self._set_runtime_value(
+                    command,
+                    index,
+                    state,
+                    string_result=None,
+                )
+            elif command.opcode == 112:
+                self._condition(command, index, state)
+            elif command.opcode == 111:
+                pass
+            elif command.opcode in {210, 300}:
+                self._call_event(command, index, state)
+            elif command.opcode == 211:
+                self._reserve_event(command, index, state)
+            elif command.opcode not in {0, 401, 420, 421, 498, 499}:
+                effect = str(semantics["effect"]) if semantics else None
+                if effect in {"no_write", "control_flow"}:
+                    pass
+                elif effect == "numeric_write":
+                    self._set_runtime_value(command, index, state, string_result=False)
+                elif effect == "event_call":
+                    self._unknown_call(
+                        command,
+                        index,
+                        state,
+                        "未内联的公共事件调用",
+                        frozenset(
+                            {
+                                "common:*",
+                                "database:UDB:*:*:*",
+                                "database:CDB:*:*:*",
+                                "database:SDB:*:*:*",
+                            }
+                        ),
+                    )
+                else:
+                    if any(command.strings) or any(
+                        value >= 1_000_000 for value in command.ints
+                    ):
+                        self._record_unknown(command, index)
+                    self._taint_unknown(command, index, state)
+            if self.unknown[shape_key] > unknown_before:
+                self.audit.transfers[command_id] = "opaque"
+                self.audit.data_effects[command_id] = ("opaque", ("project",))
+            elif semantics.get("data_effects") and command_id not in self.audit.data_effects:
+                call = self.audit.calls.get(command_id)
+                if call is not None:
+                    self.audit.data_effects[command_id] = call
+                else:
+                    self.audit.data_effects[command_id] = (
+                        "exact",
+                        tuple(map(str, semantics["data_effects"])),
+                    )
+            index += 1
+        return True
+
+    def _cfg_failure(
+        self,
+        command: _Command,
+        index: int,
+        state: _AnalysisState,
+        reason: str,
+    ) -> None:
+        scopes = self._current_scope()
+        state.unknown_scopes = state.unknown_scopes | scopes
+        state.unknown_reasons = state.unknown_reasons | frozenset(
+            {f"{self._location(index)}: {reason}"}
+        )
+        self.summary_failed = reason
+        self._blocking_scope_dependency(
+            command, index, "control_flow", reason, scopes
+        )
+
+    @staticmethod
+    def _bounded_successor(target: int, limit: int) -> tuple[int | None, int]:
+        return (target, limit) if target < limit else (None, limit)
+
+    def _widen_back_edge(
+        self,
+        previous: _AnalysisState,
+        current: _AnalysisState,
+    ) -> _AnalysisState:
+        merged = _merge_states([previous, current])
+        for variable in set(previous.numbers) | set(current.numbers):
+            left = previous.numbers.get(variable)
+            right = current.numbers.get(variable)
+            if left != right:
+                value = merged.numbers.get(variable)
+                merged.numbers[variable] = _NumberValue(
+                    None,
+                    "控制流回边扩大为运行时数值",
+                    bool(value and value.tracked),
+                    _loop_identity(left, right),
+                )
+        scope = self._current_scope()
+        for variable in set(previous.strings) | set(current.strings):
+            left = previous.strings.get(variable)
+            right = current.strings.get(variable)
+            if left is not None and right is not None:
+                unchanged = _string_semantic_key(left) == _string_semantic_key(right)
+            else:
+                unchanged = left is right
+            if unchanged:
+                continue
+            value = merged.strings.get(variable) or _StringValue()
+            database_scopes = frozenset(
+                f"database:{database}:{type_id}:*:{field_id}"
+                for database, type_id, _data_id, field_id in value.cells
+            )
+            merged.strings[variable] = _StringValue(
+                trace=value.trace,
+                unknown="控制流回边扩大为运行时字符串",
+                symbolic_all=True,
+                scopes=value.scopes | database_scopes | scope,
+                literals=None,
+                database_selectors=value.database_selectors,
+                loop_source_keys=value.loop_source_keys | value.source_keys,
+            )
+        previous_coordinates = set(previous.database_strings)
+        current_coordinates = set(current.database_strings)
+        growing_databases = {
+            coordinate[0]
+            for coordinate in previous_coordinates ^ current_coordinates
+        }
+        if growing_databases:
+            merged.database_strings = {
+                coordinate: value
+                for coordinate, value in merged.database_strings.items()
+                if coordinate[0] not in growing_databases
+            }
+            merged.unknown_scopes = merged.unknown_scopes | scope | frozenset(
+                f"database:{database}:*:*:*" for database in growing_databases
+            )
+        for coordinate in set(previous.database_strings) | set(current.database_strings):
+            if coordinate[0] in growing_databases:
+                continue
+            left = previous.database_strings.get(coordinate)
+            right = current.database_strings.get(coordinate)
+            if left is not None and right is not None:
+                unchanged = _string_semantic_key(left) == _string_semantic_key(right)
+            else:
+                unchanged = left is right
+            if unchanged:
+                continue
+            value = merged.database_strings.get(coordinate) or _StringValue()
+            database, type_id, data_id, field_id = coordinate
+            merged.database_strings[coordinate] = _StringValue(
+                trace=value.trace,
+                unknown="控制流回边扩大为运行时数据库字符串",
+                symbolic_all=True,
+                scopes=value.scopes
+                | frozenset(
+                    {f"database:{database}:{type_id}:{data_id}:{field_id}"}
+                ),
+                literals=None,
+            )
+        if (
+            previous.database_numbers != current.database_numbers
+            or previous.dynamic_database_numbers != current.dynamic_database_numbers
+            or previous.dynamic_database_strings != current.dynamic_database_strings
+        ):
+            # ponytail: A loop-changing dynamic store has no bounded address
+            # relation here; discard it rather than reusing a stale selector.
+            merged.database_numbers = {}
+            merged.dynamic_database_numbers = {}
+            merged.dynamic_database_strings = {}
+        return merged
+
+    def _cfg_successors(
+        self,
+        index: int,
+        limit: int,
+        state: _AnalysisState,
+        exits: list[_AnalysisState] | None,
+    ) -> tuple[tuple[int | None, int], ...]:
+        command = self.block.commands[index]
+        if command.opcode in {102, 111, 112}:
+            region = self._condition_regions.get(index)
+            if region is None:
+                return (self._bounded_successor(index + 1, limit),)
+            closing, branches = region
+            if not branches:
+                return (self._bounded_successor(closing + 1, limit),)
+            truth = (
+                self._numeric_condition_truth(command, state)
+                if command.opcode == 111
+                else None
+            )
+            if command.opcode == 102:
+                selected = branches
+            elif truth is True:
+                selected = branches[:1]
+            elif truth is False:
+                selected = tuple(
+                    branch
+                    for branch in branches
+                    if self.block.commands[branch[0]].opcode in {420, 421}
+                )
+            else:
+                selected = branches
+            targets = [
+                branch_start + 1 if branch_start + 1 < branch_end else closing + 1
+                for branch_start, branch_end in selected
+            ]
+            has_else = any(
+                self.block.commands[branch_start].opcode in {420, 421}
+                for branch_start, _branch_end in branches
+            )
+            has_cancel = any(
+                self.block.commands[branch_start].opcode == 421
+                for branch_start, _branch_end in branches
+            )
+            if (
+                command.opcode == 102 and not has_cancel
+                or command.opcode != 102
+                and ((truth is False and not selected) or (truth is None and not has_else))
+            ):
+                targets.append(closing + 1)
+            return tuple(
+                dict.fromkeys(self._bounded_successor(target, limit) for target in targets)
+            )
+
+        if command.opcode in {170, 179}:
+            closing = self._loop_ends.get(index)
+            if closing is None:
+                self._cfg_failure(command, index, state, "循环缺少配对的循环结束")
+                return ()
+            body = self._bounded_successor(index + 1, limit)
+            if command.opcode == 170:
+                return (body,)
+            count = (
+                self._number(command.ints[0], state)
+                if command.ints
+                else _NumberValue(None, "循环次数缺失")
+            )
+            after = self._bounded_successor(closing + 1, limit)
+            if count.values is not None and all(value <= 0 for value in count.values):
+                return (after,)
+            return tuple(dict.fromkeys((body, after)))
+
+        if command.opcode == 498:
+            start = self._loop_starts.get(index)
+            if start is None:
+                self._cfg_failure(command, index, state, "循环结束缺少配对的循环入口")
+                return ()
+            return (self._bounded_successor(start, limit),)
+
+        if command.opcode in {171, 176}:
+            loop = self._enclosing_loops.get(index)
+            if loop is None:
+                scope = self._current_scope()
+                self._blocking_scope_dependency(
+                    command,
+                    index,
+                    "control_flow",
+                    "循环控制由标签跳转进入，已保守终止当前事件路径",
+                    scope,
+                    status="dynamic",
+                )
+                command_id = self._command_id(index)
+                self.audit.cfg[command_id] = "conservative"
+                self.audit.cfg_edges.add((command_id, "CONSERVATIVE:event"))
+                return ()
+            start, closing = loop
+            target = closing + 1 if command.opcode == 171 else start
+            return (self._bounded_successor(target, limit),)
+
+        if command.opcode == 172:
+            if exits is not None:
+                exits.append(state.copy())
+            return ()
+        if command.opcode in {173, 174, 175}:
+            return ()
+
+        if command.opcode == 213:
+            target_value = (
+                self._literal_string(command, index, 0, state)
+                if len(command.strings) == 1
+                else _StringValue(literals=None)
+            )
+            target_literals = target_value.literals
+            if target_literals == frozenset({"END"}):
+                if exits is not None:
+                    exits.append(state.copy())
+                return ()
+            target_names = target_literals
+            targets = tuple(sorted({
+                position
+                for name in (target_names or ())
+                for position in self.labels.get(name, ())
+            }))
+            if len(targets) == 1:
+                target = targets[0] + 1
+                return ((target, len(self.block.commands)),) if target < len(self.block.commands) else ((None, len(self.block.commands)),)
+            target_name = command.strings[0] if len(command.strings) == 1 else ""
+            self._blocking_scope_dependency(
+                command,
+                index,
+                "control_flow",
+                f"标签目标为运行时动态值，已保守保护当前事件范围 {target_name!r}",
+                self._current_scope(),
+                status="dynamic",
+            )
+            return ()
+
+        target = self._branch_exits.get(index, index + 1)
+        return (self._bounded_successor(target, limit),)
+
+    def _execute(
+        self,
+        start: int,
+        end: int,
+        state: _AnalysisState,
+        exits: list[_AnalysisState] | None = None,
+    ) -> bool:
+        if start >= len(self.block.commands):
+            return True
+        initial_limit = min(max(end, start + 1), len(self.block.commands))
+        states: dict[tuple[int, int], _AnalysisState] = {
+            (start, initial_limit): state.copy()
+        }
+        pending: deque[tuple[int, int]] = deque(((start, initial_limit),))
+        visits: Counter[tuple[int, int]] = Counter()
+        processed: dict[tuple[int, int], _AnalysisState] = {}
+        fallthrough: list[_AnalysisState] = []
+        structural = {170, 171, 172, 173, 174, 175, 176, 179, 213}
+
+        while pending:
+            key = pending.popleft()
+            index, limit = key
+            current = states[key].copy()
+            visits[key] += 1
+            if visits[key] > _CFG_STATE_VISIT_LIMIT:
+                previous = processed.get(key)
+                if previous is not None:
+                    # ponytail: widen only the hot join's changing domains. A
+                    # path-sensitive BDD can replace this if coverage ever needs
+                    # exact values across hundreds of incoming branches.
+                    current = self._widen_back_edge(previous, current)
+                    states[key] = current.copy()
+                visits[key] = 0
+            processed[key] = current.copy()
+
+            command = self.block.commands[index]
+            if command.opcode not in structural:
+                self._transfer_command(index, current, exits)
+            else:
+                semantics = command_semantics(
+                    command.opcode, len(command.ints), len(command.strings)
+                )
+                command_id = self._command_id(index)
+                if semantics is None:
+                    self.audit.transfers[command_id] = "opaque"
+                    self.audit.data_effects[command_id] = ("opaque", ("project",))
+                else:
+                    self.audit.transfers[command_id] = str(semantics["transfer"])
+            successors = self._cfg_successors(index, limit, current, exits)
+            if command.opcode in _CFG_CONTROL_OPCODES:
+                command_id = self._command_id(index)
+                terminal = command.opcode in {172, 173, 174, 175} or (
+                    command.opcode == 213 and command.strings == ("END",)
+                )
+                if successors or terminal:
+                    self.audit.cfg[command_id] = "exact"
+                elif self.audit.cfg.get(command_id) == "conservative":
+                    pass
+                elif command.opcode == 213 and self._current_scope():
+                    self.audit.cfg[command_id] = "conservative"
+                else:
+                    self.audit.cfg[command_id] = "opaque"
+                for successor, _successor_limit in successors:
+                    target = "END" if successor is None else self._command_id(successor)
+                    self.audit.cfg_edges.add((command_id, target))
+                if terminal:
+                    self.audit.cfg_edges.add((command_id, "END"))
+            for successor, successor_limit in successors:
+                if successor is None:
+                    fallthrough.append(current.copy())
+                    continue
+                successor_key = (successor, successor_limit)
+                previous = states.get(successor_key)
+                merged = (
+                    current.copy()
+                    if previous is None
+                    else self._widen_back_edge(previous, current)
+                    if successor <= index
+                    else _merge_states([previous, current])
+                )
+                if previous is not None:
+                    if _states_semantically_equal(merged, previous):
+                        states[successor_key] = merged
+                        continue
+                states[successor_key] = merged
+                pending.append(successor_key)
+
+        if not fallthrough:
+            return False
+        result = _merge_states(fallthrough)
+        state.numbers = result.numbers
+        state.strings = result.strings
+        state.database_strings = result.database_strings
+        state.database_numbers = result.database_numbers
+        state.dynamic_database_numbers = result.dynamic_database_numbers
+        state.dynamic_database_strings = result.dynamic_database_strings
+        state.unknown_scopes = result.unknown_scopes
+        state.unknown_reasons = result.unknown_reasons
+        return True
+
+    def run(
+        self, initial_state: _AnalysisState | None = None
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+        initial_state = initial_state.copy() if initial_state is not None else _AnalysisState({}, {}, {})
+        outputs: list[_AnalysisState] = []
+        entry_labels = [
+            (index, int(command.strings[0].removeprefix("cmd:")))
+            for index, command in enumerate(self.block.commands)
+            if self.block.event_type == "common"
+            and command.opcode == 212
+            and command.indent == 0
+            and len(command.strings) == 1
+            and command.strings[0].startswith("cmd:")
+            and command.strings[0].removeprefix("cmd:").isdigit()
+        ]
+        if entry_labels:
+            first = entry_labels[0][0]
+            dispatcher = self._dynamic_entry_dispatcher()
+            if first and dispatcher is None:
+                prefix_state = initial_state.copy()
+                self._execute(0, first, prefix_state)
+                outputs.append(prefix_state)
+            for label_index, (start, choice) in enumerate(entry_labels):
+                end = (
+                    entry_labels[label_index + 1][0]
+                    if label_index + 1 < len(entry_labels)
+                    else len(self.block.commands)
+                )
+                state = initial_state.copy()
+                state.numbers[1_600_000] = _NumberValue(frozenset({choice}))
+                if dispatcher is not None:
+                    self._execute(dispatcher, len(self.block.commands), state)
+                else:
+                    self._execute(start + 1, end, state)
+                outputs.append(state)
+        else:
+            state = initial_state.copy()
+            self._execute(0, len(self.block.commands), state)
+            outputs.append(state)
+        self.output_state = _merge_states(outputs) if outputs else initial_state
+        # Commands excluded by a proven branch still need a syntactic CFG and
+        # semantic ledger entry. They are safe because they are unreachable,
+        # not because the coverage denominator forgot them.
+        for index, command in enumerate(self.block.commands):
+            command_id = self._command_id(index)
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            if semantics is None:
+                continue
+            if command_id not in self.audit.transfers:
+                self.audit.transfers[command_id] = "unreachable"
+                if semantics.get("data_effects"):
+                    self.audit.data_effects[command_id] = (
+                        "exact", ("unreachable",)
+                    )
+            if command.opcode not in _CFG_CONTROL_OPCODES or command_id in self.audit.cfg:
+                continue
+            state = _AnalysisState({}, {}, {})
+            successors = self._cfg_successors(
+                index, len(self.block.commands), state, None
+            )
+            terminal = command.opcode in {172, 173, 174, 175} or (
+                command.opcode == 213 and command.strings == ("END",)
+            )
+            if successors or terminal:
+                self.audit.cfg[command_id] = "exact"
+            elif self.audit.cfg.get(command_id) == "conservative":
+                pass
+            elif command.opcode == 213 and self._current_scope():
+                self.audit.cfg[command_id] = "conservative"
+            else:
+                self.audit.cfg[command_id] = "opaque"
+            for successor, _successor_limit in successors:
+                target = "END" if successor is None else self._command_id(successor)
+                self.audit.cfg_edges.add((command_id, target))
+            if terminal:
+                self.audit.cfg_edges.add((command_id, "END"))
+        warnings = [
+            {"opcode": opcode, "shape": shape, "count": count,
+             "locations": self.unknown_locations[(opcode, shape)][:5]}
+            for (opcode, shape), count in sorted(self.unknown.items())
+        ]
+        return self.dependencies, self.blocking, warnings
+
+
+def _analyze_blocks(
+    blocks: Iterable[_CommandBlock],
+    items: list[TranslationItem],
+    databases: dict[str, dict[int, _DatabaseType]],
+    candidate_values: dict[str, str] | None = None,
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    _AnalysisAudit,
+    dict[str, object],
+]:
+    blocks = list(blocks)
+    database_keys: dict[tuple[str, int, int, int], set[str]] = {}
+    event_items: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        match = _WORKBOOK_DB_CODE_RE.fullmatch(item.code)
+        if match:
+            coordinate = (
+                match.group("database").upper(),
+                int(match.group("type")),
+                int(match.group("data")),
+                int(match.group("field")),
+            )
+            database_keys.setdefault(coordinate, set()).add(item.key)
+        event_items.setdefault(item.code.upper(), []).append(item)
+    frozen_database_keys = {key: frozenset(value) for key, value in database_keys.items()}
+    frozen_event_items = {key: tuple(value) for key, value in event_items.items()}
+    common_groups: dict[int, list[_CommandBlock]] = {}
+    common_names: dict[str, list[_CommandBlock]] = {}
+    for block in blocks:
+        if block.event_type != "common":
+            continue
+        common_groups.setdefault(block.event_id, []).append(block)
+        common_names.setdefault(block.event_name, []).append(block)
+    common_by_id = {
+        event_id: group[0]
+        for event_id, group in common_groups.items()
+        if len(group) == 1
+    }
+    common_by_name = {name: tuple(group) for name, group in common_names.items()}
+    candidate_lookup = candidate_values or {}
+    call_argument_pool: _CallArgumentPool = {}
+    for block in blocks:
+        for index, command in enumerate(block.commands):
+            if command.opcode not in {210, 300} or len(command.ints) < 2:
+                continue
+            flags = command.ints[1]
+            if flags & 0x01000000:
+                continue
+            target: _CommandBlock | None = None
+            if command.opcode == 300 and command.strings:
+                matches = common_by_name.get(command.strings[0], ())
+                target = matches[0] if len(matches) == 1 else None
+            elif command.opcode == 210:
+                reference = command.ints[0]
+                if 599_000 <= reference < 601_000 and block.event_type == "common":
+                    target_id = block.event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                else:
+                    target_id = -1
+                target = common_by_id.get(target_id)
+            numeric_count = flags & 0x0F
+            string_count = (flags >> 4) & 0x0F
+            string_start = 2 + numeric_count
+            string_end = string_start + string_count
+            literal_offset = 1
+            if (
+                target is None
+                or len(command.ints) != string_end
+                or len(command.strings) < literal_offset + string_count
+                or any(raw >= 1_000_000 for raw in command.ints[2:string_end])
+            ):
+                continue
+            values: list[_StringValue] = []
+            for string_index in range(string_count):
+                text = command.strings[literal_offset + string_index]
+                if _CSELF_REFERENCE_RE.search(text) or _STRING_REFERENCE_RE.search(text):
+                    values = []
+                    break
+                keys = frozenset(
+                    item.key
+                    for item in _items_for_event_codes(
+                        frozen_event_items,
+                        block,
+                        index + 1,
+                        literal_offset + string_index,
+                    )
+                    if item.original == text
+                )
+                literals = frozenset(
+                    candidate_lookup.get(key, text) for key in keys
+                ) or frozenset({text})
+                values.append(
+                    _StringValue(
+                        keys,
+                        trace=(
+                            f"{block.source} event={block.event_id} page={block.page} "
+                            f"command={index + 1} call-argument={string_index}",
+                        ),
+                        literals=literals,
+                    )
+                )
+            if len(values) != string_count:
+                continue
+            choice = command.ints[2] if numeric_count else 0
+            command_id = (
+                f"{block.source}:{block.event_type}:{block.event_id}:"
+                f"{block.page}:{index + 1}"
+            )
+            # Keep each call site's provenance separate. A batch-level union can
+            # make unrelated player-facing messages look like condition inputs.
+            call_argument_pool[command_id] = tuple(values)
+    event_scopes = _conservative_event_scopes(blocks, common_by_id, common_by_name)
+    dependencies: list[dict[str, object]] = []
+    unknown = Counter()
+    locations: dict[tuple[int, str], list[str]] = {}
+    call_cache: _CallCache = {}
+    audit = _AnalysisAudit.empty()
+    root_states: list[_AnalysisState] = []
+    for block in blocks:
+        analyzer = _BlockAnalyzer(
+            block,
+            databases,
+            frozen_database_keys,
+            frozen_event_items,
+            common_by_id,
+            common_by_name,
+            event_scopes,
+            call_cache=call_cache,
+            call_argument_pool=call_argument_pool,
+            candidate_values=candidate_values,
+            audit=audit,
+        )
+        block_dependencies, _block_blocking, block_unknown = analyzer.run()
+        dependencies.extend(block_dependencies)
+        root_states.append(analyzer.output_state)
+        for warning in block_unknown:
+            key = (int(warning["opcode"]), str(warning["shape"]))
+            unknown[key] += int(warning["count"])
+            locations.setdefault(key, []).extend(str(value) for value in warning["locations"])
+
+    def persistent_state(states: Iterable[_AnalysisState]) -> _AnalysisState:
+        merged = _merge_states(list(states))
+        merged.numbers = {
+            key: value
+            for key, value in merged.numbers.items()
+            if not 1_600_000 <= key < 1_600_100 and value.identity
+        }
+        merged.strings = {
+            key: value
+            for key, value in merged.strings.items()
+            if not 1_600_000 <= key < 1_600_100
+        }
+        return merged
+
+    # Persistent state may be written by one root event and consumed by another.
+    # ponytail: Root writes are joined without an event-order model; scheduling
+    # analysis can regain approvals if a project needs that precision.
+    global_state = persistent_state(root_states)
+    global_iterations = 0
+    global_converged = True
+    while (
+        global_state.numbers
+        or global_state.strings
+        or global_state.database_strings
+        or global_state.database_numbers
+        or global_state.dynamic_database_numbers
+        or global_state.dynamic_database_strings
+    ):
+        if global_iterations >= _GLOBAL_STRING_FLOW_MAX_ITERATIONS:
+            global_converged = False
+            break
+        propagated: list[dict[str, object]] = []
+        propagated_states: list[_AnalysisState] = []
+        for block in blocks:
+            analyzer = _BlockAnalyzer(
+                block,
+                databases,
+                frozen_database_keys,
+                frozen_event_items,
+                common_by_id,
+                common_by_name,
+                event_scopes,
+                call_cache={},
+                call_argument_pool=call_argument_pool,
+                candidate_values=candidate_values,
+                audit=audit,
+            )
+            block_dependencies, _block_blocking, _block_unknown = analyzer.run(
+                global_state
+            )
+            propagated.extend(block_dependencies)
+            propagated_states.append(analyzer.output_state)
+        global_iterations += 1
+        next_global_state = persistent_state([*root_states, *propagated_states])
+        if _states_semantically_equal(global_state, next_global_state):
+            dependencies.extend(propagated)
+            break
+        global_state = next_global_state
+    global_string_flow = {
+        "converged": global_converged,
+        "iterations": global_iterations,
+        "variables": len(global_state.strings),
+        "numbers": len(global_state.numbers),
+        "database_cells": len(global_state.database_strings),
+        "database_numbers": len(global_state.database_numbers),
+        "dynamic_database_numbers": len(global_state.dynamic_database_numbers),
+        "dynamic_database_strings": len(global_state.dynamic_database_strings),
+        "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
+    }
+    warnings = [
+        {"opcode": opcode, "shape": shape, "count": count, "locations": locations[(opcode, shape)][:5]}
+        for (opcode, shape), count in sorted(unknown.items())
+    ]
+    def report_database_selectors(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, str, str, str, int, int]]:
+        return {
+            (
+                str(item["database"]),
+                int(item["type"]),
+                int(item["field"]),
+                str(item["selector"]),
+                str(item["auto_file"]),
+                str(item["event_type"]),
+                int(item["event_id"]),
+                int(item["page"]),
+            )
+            for item in dependency.get(field, ())
+            if isinstance(item, dict)
+            and all(
+                key in item
+                for key in (
+                    "database", "type", "field", "selector", "auto_file",
+                    "event_type", "event_id", "page",
+                )
+            )
+        }
+
+    merged_dependencies: dict[tuple[object, ...], dict[str, object]] = {}
+    for dependency in dependencies:
+        # ponytail: retain source correlation in the report. Collapsing every
+        # invocation of one callee into a single union makes display arguments
+        # look like each other's logic inputs; a compact provenance table can
+        # replace these per-source records if a project makes reports too large.
+        provenance = (
+            tuple(map(str, dependency.get("condition_keys", ()))),
+            tuple(map(str, dependency.get("source_keys", ()))),
+            tuple(map(str, dependency.get("right_source_keys", ()))),
+            tuple(map(str, dependency.get("left_values", ()))),
+            tuple(map(str, dependency.get("right_values", ()))),
+        )
+        identity = (
+            dependency["auto_file"], dependency["event_type"], dependency["event_id"],
+            dependency["page"], dependency["command"], dependency["string_index"],
+            provenance,
+        )
+        current = merged_dependencies.get(identity)
+        if current is None:
+            current = dict(dependency)
+            current["_condition_keys"] = set(dependency["condition_keys"])
+            current["_source_keys"] = set(dependency["source_keys"])
+            current["_right_source_keys"] = set(
+                dependency.get("right_source_keys", [])
+            )
+            current["_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency["database_cells"]
+            }
+            current["_right_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency.get("right_database_cells", [])
+            }
+            current["_target_database_cells"] = {
+                (cell["database"], cell["type"], cell["data"], cell["field"])
+                for cell in dependency.get("target_database_cells", [])
+            }
+            current["_database_selectors"] = report_database_selectors(
+                dependency, "database_selectors"
+            )
+            current["_right_database_selectors"] = report_database_selectors(
+                dependency, "right_database_selectors"
+            )
+            current["_target_database_selectors"] = report_database_selectors(
+                dependency, "target_database_selectors"
+            )
+            current["_trace"] = dict.fromkeys(dependency["trace"])
+            current["_left_values"] = set(dependency.get("left_values", []))
+            current["_right_values"] = set(dependency.get("right_values", []))
+            current["_source_scopes"] = set(dependency.get("source_scopes", []))
+            current["_right_source_scopes"] = set(
+                dependency.get("right_source_scopes", [])
+            )
+            current["_unresolved_scopes"] = set(
+                dependency.get("unresolved_scopes", [])
+            )
+            current["_unresolved_reasons"] = dict.fromkeys(
+                dependency.get("unresolved_reasons", [])
+            )
+            merged_dependencies[identity] = current
+            continue
+        current["_condition_keys"].update(dependency["condition_keys"])
+        current["_source_keys"].update(dependency["source_keys"])
+        current["_right_source_keys"].update(dependency.get("right_source_keys", []))
+        current["_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency["database_cells"]
+        )
+        current["_right_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency.get("right_database_cells", [])
+        )
+        current["_target_database_cells"].update(
+            (cell["database"], cell["type"], cell["data"], cell["field"])
+            for cell in dependency.get("target_database_cells", [])
+        )
+        current["_database_selectors"].update(
+            report_database_selectors(dependency, "database_selectors")
+        )
+        current["_right_database_selectors"].update(
+            report_database_selectors(dependency, "right_database_selectors")
+        )
+        current["_target_database_selectors"].update(
+            report_database_selectors(dependency, "target_database_selectors")
+        )
+        current["_trace"].update(dict.fromkeys(dependency["trace"]))
+        current["_left_values"].update(dependency.get("left_values", []))
+        current["_right_values"].update(dependency.get("right_values", []))
+        current["_source_scopes"].update(dependency.get("source_scopes", []))
+        current["_right_source_scopes"].update(
+            dependency.get("right_source_scopes", [])
+        )
+        current["_unresolved_scopes"].update(
+            dependency.get("unresolved_scopes", [])
+        )
+        current["_unresolved_reasons"].update(
+            dict.fromkeys(dependency.get("unresolved_reasons", []))
+        )
+        rank = {"resolved": 0, "untracked": 1, "dynamic": 2, "blocking": 3}
+        if rank.get(str(dependency["status"]), 3) > rank.get(str(current["status"]), 3):
+            current["status"] = dependency["status"]
+            current["reason"] = dependency["reason"]
+        if (
+            current["kind"] == "condition"
+            and current["status"] == "untracked"
+            and current["_source_keys"]
+        ):
+            # Some paths enter with an external value while another root event
+            # provides a tracked global value. Replay the tracked predicate;
+            # the external path cannot change because it has no candidate text.
+            current["status"] = "dynamic"
+            current["reason"] = "条件变量同时存在入口值与可定位的全局写入路径"
+    dependencies = []
+    for current in merged_dependencies.values():
+        current["condition_keys"] = sorted(current.pop("_condition_keys"))
+        current["source_keys"] = sorted(current.pop("_source_keys"))
+        current["right_source_keys"] = sorted(current.pop("_right_source_keys"))
+        for field in (
+            "database_cells",
+            "right_database_cells",
+            "target_database_cells",
+        ):
+            current[field] = [
+                {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
+                for cell in sorted(current.pop(f"_{field}"))
+            ]
+        for field in (
+            "database_selectors",
+            "right_database_selectors",
+            "target_database_selectors",
+        ):
+            current[field] = [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(current.pop(f"_{field}"))
+            ]
+        current["trace"] = list(current.pop("_trace"))[:_VALUE_LIMIT]
+        for field in ("left_values", "right_values"):
+            current[field] = sorted(current.pop(f"_{field}"))[:_VALUE_LIMIT]
+        for field in ("source_scopes", "right_source_scopes", "unresolved_scopes"):
+            current[field] = sorted(current.pop(f"_{field}"))
+        current["unresolved_reasons"] = list(
+            current.pop("_unresolved_reasons")
+        )[:_VALUE_LIMIT]
+        dependencies.append(current)
+    blocking = [item for item in dependencies if item["status"] == "blocking"]
+    return dependencies, blocking, warnings, audit, global_string_flow
+
+
+def _translation_usage_report(
+    blocks: Iterable[_CommandBlock],
+    items: list[TranslationItem],
+    dependencies: list[dict[str, object]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code.upper(), []).append(item)
+    usages: dict[str, set[str]] = {}
+    scope_cache: dict[str, frozenset[str]] = {}
+
+    def database_cells(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, int]]:
+        cells: set[tuple[str, int, int, int]] = set()
+        for cell in dependency.get(field, ()):
+            if not isinstance(cell, dict) or not all(
+                name in cell for name in ("database", "type", "data", "field")
+            ):
+                continue
+            cells.add(
+                (
+                    str(cell["database"]),
+                    int(cell["type"]),
+                    int(cell["data"]),
+                    int(cell["field"]),
+                )
+            )
+        return cells
+
+    def database_selectors(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, str, str, str, int, int]]:
+        return {
+            (
+                str(item["database"]),
+                int(item["type"]),
+                int(item["field"]),
+                str(item["selector"]),
+                str(item["auto_file"]),
+                str(item["event_type"]),
+                int(item["event_id"]),
+                int(item["page"]),
+            )
+            for item in dependency.get(field, ())
+            if isinstance(item, dict)
+            and all(
+                name in item
+                for name in (
+                    "database", "type", "field", "selector", "auto_file",
+                    "event_type", "event_id", "page",
+                )
+            )
+        }
+
+    def consumer_reference(dependency: dict[str, object]) -> dict[str, object]:
+        return {
+            field: dependency[field]
+            for field in ("kind", "auto_file", "event_type", "event_id", "page", "command", "trace")
+            if field in dependency
+        }
+
+    display_storage_cells: set[tuple[str, int, int, int]] = set()
+    display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    non_display_cells: set[tuple[str, int, int, int]] = set()
+    non_display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
+    display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
+    non_display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
+    non_display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
+    for dependency in dependencies:
+        kind = str(dependency.get("kind", "condition"))
+        cells = database_cells(dependency, "database_cells")
+        cells.update(database_cells(dependency, "right_database_cells"))
+        selectors = database_selectors(dependency, "database_selectors")
+        selectors.update(database_selectors(dependency, "right_database_selectors"))
+        reference = consumer_reference(dependency)
+        if kind == "display":
+            display_storage_cells.update(cells)
+            display_selectors.update(selectors)
+            for cell in cells:
+                display_cell_consumers.setdefault(cell, []).append(reference)
+            for selector in selectors:
+                display_selector_consumers.setdefault(selector, []).append(reference)
+        elif kind in {"condition", "call", "resource", "database", "control_flow", "opaque"} and not (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            non_display_cells.update(cells)
+            non_display_selectors.update(selectors)
+            for cell in cells:
+                non_display_cell_consumers.setdefault(cell, []).append(reference)
+            for selector in selectors:
+                non_display_selector_consumers.setdefault(selector, []).append(reference)
+    for block in blocks:
+        for index, command in enumerate(block.commands, start=1):
+            semantics = command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            )
+            roles = _command_string_roles(command, semantics)
+            for string_index, text in enumerate(command.strings):
+                role = roles[string_index] if string_index < len(roles) else "unresolved"
+                if role in {
+                    "assignment_literal",
+                    "call_argument",
+                    "database_selector_or_value",
+                }:
+                    continue
+                usage = "display_only" if role == "display_text" else (
+                    "display_only" if role == "comment" else (
+                    "logic" if role == "condition_literal" else (
+                        "event_target" if role == "common_event_name" else (
+                            "resource" if role in {"resource_path", "file_path"} else (
+                                "control_flow" if role in {"label", "label_target"} else "unresolved"
+                            )
+                        )
+                    )
+                    )
+                )
+                matching_items: dict[str, TranslationItem] = {}
+                for code in _event_codes(block, index, string_index):
+                    for item in by_code.get(code.upper(), ()):
+                        matching_items.setdefault(item.key, item)
+                for item in matching_items.values():
+                    if item.original == text:
+                        usages.setdefault(item.key, set()).add(usage)
+    for dependency in dependencies:
+        kind = str(dependency.get("kind", "condition"))
+        usage = {
+            "display": "display_only",
+            "condition": "logic",
+            "call": "event_target",
+            "resource": "resource",
+            "database": "database_selector",
+            "control_flow": "control_flow",
+            "opaque": "unresolved",
+            "flow": "flow",
+            "state": "logic",
+        }.get(kind, "unresolved")
+        if (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            usage = "display_storage"
+            target_cells = database_cells(dependency, "target_database_cells")
+            target_selectors = database_selectors(
+                dependency, "target_database_selectors"
+            )
+            cells_proven = (
+                bool(target_cells)
+                and target_cells <= display_storage_cells
+                and target_cells.isdisjoint(non_display_cells)
+            )
+            selectors_proven = (
+                bool(target_selectors)
+                and target_selectors <= display_selectors
+                and target_selectors.isdisjoint(non_display_selectors)
+            )
+            dependency["display_consumers"] = [
+                consumer
+                for cell in sorted(target_cells)
+                for consumer in display_cell_consumers.get(cell, ())
+            ] + [
+                consumer
+                for selector in sorted(target_selectors)
+                for consumer in display_selector_consumers.get(selector, ())
+            ]
+            dependency["non_display_consumers"] = [
+                consumer
+                for cell in sorted(target_cells)
+                for consumer in non_display_cell_consumers.get(cell, ())
+            ] + [
+                consumer
+                for selector in sorted(target_selectors)
+                for consumer in non_display_selector_consumers.get(selector, ())
+            ]
+            dependency["display_sink_proven"] = cells_proven or selectors_proven
+            if not dependency["display_sink_proven"]:
+                dependency["display_sink_reason"] = (
+                    "动态数据库地址存在非显示读取"
+                    if (
+                        target_cells & non_display_cells
+                        or target_selectors & non_display_selectors
+                    )
+                    else "动态数据库地址没有可证明的显示读取"
+                )
+            if dependency["display_sink_proven"]:
+                for key in dependency.get("source_keys", []):
+                    usages.setdefault(str(key), set()).add("display_only")
+        if usage == "flow":
+            continue
+        for field in ("condition_keys", "source_keys", "right_source_keys"):
+            for key in dependency.get(field, []):
+                usages.setdefault(str(key), set()).add(usage)
+        if dependency.get("status") != "resolved":
+            database_scopes = tuple(
+                scope
+                for scope in map(str, dependency.get("unresolved_scopes", ()))
+                if scope.startswith("database:")
+            )
+            for key in _scope_keys(items, database_scopes, scope_cache):
+                usages.setdefault(key, set()).add(usage)
+    proven_display = sorted(
+        key for key, values in usages.items() if values == {"display_only"}
+    )
+    return ({key: sorted(values) for key, values in sorted(usages.items())}, proven_display)
+
+
+def _command_transfer_complete(command: _Command) -> bool:
+    semantics = command_semantics(
+        command.opcode, len(command.ints), len(command.strings)
+    )
+    if not semantics or semantics.get("semantic_complete") is not True:
+        return False
+    if command.opcode == 121:
+        return len(command.ints) in {4, 5, 7}
+    if command.opcode == 122:
+        if len(command.ints) < 2:
+            return False
+        flags = command.ints[1]
+        source_kind = flags & 0x0F
+        assignment = (flags >> 8) & 0x0F
+        return source_kind in {0, 1, 2, 3} and assignment in set(range(12))
+    if command.opcode == 112:
+        if not command.ints:
+            return False
+        count = command.ints[0] & 0x0F
+        return (
+            len(command.strings) >= count
+            and len(command.ints) >= count + 1
+            and all(
+                _condition_operator(command.ints[index + 1])[1] is not None
+                for index in range(count)
+            )
+        )
+    if command.opcode == 250:
+        if len(command.ints) not in {4, 5}:
+            return False
+        return ((command.ints[3] >> 8) & 0x0F) in {0, 1, 2}
+    return semantics.get("transfer") != "opaque"
+
+
+def _conservative_event_scopes(
+    blocks: list[_CommandBlock],
+    common_by_id: dict[int, _CommandBlock],
+    common_by_name: dict[str, tuple[_CommandBlock, ...]],
+) -> dict[int, frozenset[str]]:
+    direct: dict[int, set[str]] = {}
+    calls: dict[int, set[int]] = {}
+    database_scopes = {"database:UDB:*:*:*", "database:CDB:*:*:*", "database:SDB:*:*:*"}
+    for event_id, block in common_by_id.items():
+        scopes: set[str] = set()
+        targets: set[int] = set()
+        for command in block.commands:
+            semantics = command_semantics(command.opcode, len(command.ints), len(command.strings))
+            if semantics is None:
+                scopes.add("project")
+            if command.opcode == 122 and command.ints:
+                destination = command.ints[0] & 0x00FFFFFF
+                if not 1_600_000 <= destination < 1_600_100:
+                    scopes.add(f"common:{event_id}")
+            if command.opcode == 250 and len(command.ints) >= 4:
+                byte1 = (command.ints[3] >> 8) & 0xFF
+                database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+                if database and byte1 & 0xF0 != 0x10:
+                    scopes.add(f"database:{database}:*:*:*")
+            if command.opcode not in {210, 211, 300} or not command.ints:
+                continue
+            target: _CommandBlock | None = None
+            if command.opcode == 300 and command.strings:
+                matches = common_by_name.get(command.strings[0], ())
+                target = matches[0] if len(matches) == 1 else None
+            elif command.opcode == 211:
+                reference = command.ints[0]
+                target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
+                target = common_by_id.get(target_id)
+            elif command.opcode == 210:
+                if len(command.ints) < 3:
+                    scopes.update(database_scopes | {"common:*"})
+                    continue
+                reference = command.ints[0]
+                if 599_000 <= reference < 601_000:
+                    target_id = event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                else:
+                    target_id = -1
+                target = common_by_id.get(target_id)
+            if target is None:
+                scopes.update(database_scopes | {"common:*"})
+            else:
+                targets.add(target.event_id)
+        direct[event_id] = scopes
+        calls[event_id] = targets
+
+    summaries: dict[int, set[str]] = {}
+    # ponytail: Effects are monotone set unions, so graph reachability is the
+    # exact SCC fixed point and avoids repeatedly interpreting recursive bodies.
+    for event_id in direct:
+        pending = [event_id]
+        visited: set[int] = set()
+        merged: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            merged.update(direct.get(current, set()))
+            pending.extend(calls.get(current, ()))
+            if len(merged) > _VALUE_LIMIT:
+                if "project" in merged:
+                    merged = {"project"}
+                else:
+                    database = {
+                        scope for scope in merged if scope.startswith("database:")
+                    }
+                    merged = database | (
+                        {"common:*"}
+                        if any(scope.startswith("common:") for scope in merged)
+                        else set()
+                    )
+                break
+        summaries[event_id] = merged
+    return {event_id: frozenset(scopes) for event_id, scopes in summaries.items()}
+
+
+def _event_node(block: _CommandBlock) -> str:
+    return f"{block.event_type}:{block.source}:{block.event_id}:{block.page}"
+
+
+def _call_graph_report(blocks: list[_CommandBlock]) -> tuple[dict[str, object], list[dict[str, object]]]:
+    common_by_id = {
+        block.event_id: block for block in blocks if block.event_type == "common"
+    }
+    common_by_name: dict[str, list[_CommandBlock]] = {}
+    for block in common_by_id.values():
+        common_by_name.setdefault(block.event_name, []).append(block)
+    conservative_scopes = _conservative_event_scopes(
+        blocks,
+        common_by_id,
+        {name: tuple(group) for name, group in common_by_name.items()},
+    )
+    edges: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = []
+    adjacency: dict[str, set[str]] = {_event_node(block): set() for block in common_by_id.values()}
+    calibrated = 0
+    command_total = 0
+    for block in blocks:
+        calls: list[dict[str, object]] = []
+        reads = writes = opaque = 0
+        for index, command in enumerate(block.commands, start=1):
+            command_total += 1
+            semantics = command_semantics(command.opcode, len(command.ints), len(command.strings))
+            if semantics:
+                calibrated += 1
+                reads += int(bool(semantics["reads_variables"]))
+                writes += int(bool(semantics["writes_variables"]))
+            else:
+                opaque += 1
+            if command.opcode not in {210, 211, 300}:
+                continue
+            targets: list[_CommandBlock] = []
+            if command.opcode == 300 and command.strings:
+                targets = common_by_name.get(command.strings[0], [])
+            elif command.opcode == 211 and command.ints:
+                reference = command.ints[0]
+                target_id = reference - 500_000 if 500_000 <= reference < 600_000 else reference
+                if target_id in common_by_id:
+                    targets = [common_by_id[target_id]]
+            elif command.ints:
+                reference = command.ints[0]
+                target_id = None
+                if 599_000 <= reference < 601_000 and block.event_type == "common":
+                    target_id = block.event_id + reference - 600_100
+                elif 500_000 <= reference < 600_000:
+                    target_id = reference - 500_000
+                if target_id in common_by_id:
+                    targets = [common_by_id[target_id]]
+            edge = {
+                "source": _event_node(block),
+                "command": index,
+                "opcode": command.opcode,
+                "targets": [_event_node(target) for target in targets],
+                "dynamic": len(targets) != 1,
+                "resolution": (
+                    "exact"
+                    if len(targets) == 1
+                    else "exact_noop"
+                    if command.opcode == 300
+                    and command.strings
+                    and not _CSELF_REFERENCE_RE.search(command.strings[0])
+                    and not _STRING_REFERENCE_RE.search(command.strings[0])
+                    and not targets
+                    else "conservative"
+                ),
+                "conservative_scopes": (
+                    []
+                    if len(targets) == 1
+                    else []
+                    if command.opcode == 300
+                    and command.strings
+                    and not _CSELF_REFERENCE_RE.search(command.strings[0])
+                    and not _STRING_REFERENCE_RE.search(command.strings[0])
+                    and not targets
+                    else ["common:*"]
+                ),
+            }
+            calls.append(edge)
+            edges.append(edge)
+            if block.event_type == "common":
+                adjacency.setdefault(_event_node(block), set()).update(edge["targets"])
+        summaries.append(
+            {
+                "event": _event_node(block),
+                "event_name": block.event_name,
+                "commands": len(block.commands),
+                "variable_reads": reads,
+                "variable_writes": writes,
+                "opaque_commands": opaque,
+                "calls": calls,
+                "conservative_scopes": sorted(
+                    conservative_scopes.get(block.event_id, frozenset())
+                    if block.event_type == "common"
+                    else frozenset()
+                ),
+            }
+        )
+
+    # Tarjan is small and deterministic; it exposes recursion without interpreting WOLF runtime.
+    index = 0
+    stack: list[str] = []
+    indices: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    components: list[list[str]] = []
+
+    def visit(node: str) -> None:
+        nonlocal index
+        indices[node] = low[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+        for target in sorted(adjacency.get(node, ())):
+            if target not in indices:
+                visit(target)
+                low[node] = min(low[node], low[target])
+            elif target in on_stack:
+                low[node] = min(low[node], indices[target])
+        if low[node] == indices[node]:
+            component: list[str] = []
+            while True:
+                target = stack.pop()
+                on_stack.remove(target)
+                component.append(target)
+                if target == node:
+                    break
+            components.append(sorted(component))
+
+    for node in sorted(adjacency):
+        if node not in indices:
+            visit(node)
+    recursive = [
+        component for component in components
+        if len(component) > 1 or any(node in adjacency.get(node, ()) for node in component)
+    ]
+    return (
+        {
+            "nodes": len(adjacency),
+            "edges": edges,
+            "dynamic_edges": sum(bool(edge["dynamic"]) for edge in edges),
+            "recursive_sccs": recursive,
+            "coverage": {
+                "commands": command_total,
+                "calibrated": calibrated,
+                "ratio": (calibrated / command_total) if command_total else 1.0,
+            },
+        },
+        summaries,
+    )
+
+
+def analyze_auto_export(
+    auto_dir: str | Path,
+    items: list[TranslationItem],
+    editor: EditorInfo,
+    *,
+    input_hash: str,
+    candidate_values: dict[str, str] | None = None,
+) -> dict[str, object]:
+    root = Path(auto_dir).resolve()
+    common = root / "BasicData" / "CommonEvent.dat.Auto.txt"
+    if not common.is_file():
+        raise ValueError("Editor 未生成 BasicData/CommonEvent.dat.Auto.txt。")
+    blocks, common_counts = _event_blocks(
+        common, "common", source=common.relative_to(root).as_posix()
+    )
+    map_counts = {"maps": 0, "events": 0, "pages": 0, "commands": 0}
+    for map_path in sorted((root / "MapData").rglob("*.mps.Auto.txt")):
+        map_blocks, counts = _event_blocks(
+            map_path, "map", source=map_path.relative_to(root).as_posix()
+        )
+        blocks.extend(map_blocks)
+        map_counts["maps"] += 1
+        for key in ("events", "pages", "commands"):
+            map_counts[key] += counts[key]
+
+    database_counts: dict[str, dict[str, int]] = {}
+    database_types: dict[str, dict[int, _DatabaseType]] = {}
+    database_report: dict[str, object] = {}
+    for name, code in (("DataBase", "UDB"), ("CDataBase", "CDB"), ("SysDataBase", "SDB")):
+        path = root / "BasicData" / f"{name}.Auto.txt"
+        if not path.is_file():
+            continue
+        index, counts = _database_index(path, code)
+        database_types[code] = index
+        database_report[code] = {
+            str(type_id): {
+                "name": item.name,
+                "fields": {str(key): value for key, value in item.field_names.items()},
+                "field_types": {str(key): value for key, value in item.field_types.items()},
+                "data_count": len(item.rows),
+            }
+            for type_id, item in index.items()
+        }
+        database_counts[name] = counts
+
+    map_ids = _map_ids_from_databases(database_types)
+    blocks = [
+        replace(
+            block,
+            map_id=map_ids[block.source.casefold()][0],
+            map_ids=map_ids[block.source.casefold()],
+        )
+        if block.event_type == "map" and block.source.casefold() in map_ids
+        else block
+        for block in blocks
+    ]
+
+    project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
+    dependencies, blocking, warnings, audit, global_string_flow = _analyze_blocks(
+        project.events, items, database_types, candidate_values
+    )
+    call_graph, event_summaries = _call_graph_report(list(project.events))
+    usage_by_key, proven_display = _translation_usage_report(
+        project.events, items, dependencies
+    )
+    command_records = [
+        (
+            f"{block.source}:{block.event_type}:{block.event_id}:{block.page}:{index + 1}",
+            command,
+        )
+        for block in project.events
+        for index, command in enumerate(block.commands)
+    ]
+    all_commands = [command for _command_id, command in command_records]
+    for command_id, command in command_records:
+        semantics = command_semantics(
+            command.opcode, len(command.ints), len(command.strings)
+        )
+        if semantics is None or command_id in audit.transfers:
+            continue
+        audit.transfers[command_id] = "unreachable"
+        if semantics.get("data_effects"):
+            audit.data_effects[command_id] = ("exact", ("unreachable",))
+    shape_missing = [
+        command
+        for command in all_commands
+        if command_semantics(command.opcode, len(command.ints), len(command.strings))
+        is None
+    ]
+    semantic_missing = [
+        command
+        for command_id, command in command_records
+        if not _command_transfer_complete(command)
+        or audit.transfers.get(command_id) == "opaque"
+    ]
+    control_records = [
+        (command_id, command)
+        for command_id, command in command_records
+        if command.opcode in _CFG_CONTROL_OPCODES
+    ]
+    covered_control_commands = sum(
+        audit.cfg.get(command_id) in {"exact", "conservative"}
+        or command_id not in audit.transfers
+        and command.opcode in _CFG_IMPLEMENTED_OPCODES
+        and _command_transfer_complete(command)
+        for command_id, command in control_records
+    )
+    call_edges = list(call_graph.get("edges", []))
+    resolved_calls = sum(
+        edge.get("resolution") in {"exact", "exact_noop"}
+        for edge in call_edges
+        if isinstance(edge, dict)
+    )
+    conservative_calls = sum(
+        edge.get("resolution") == "conservative"
+        and bool(edge.get("conservative_scopes"))
+        for edge in call_edges
+        if isinstance(edge, dict)
+    )
+    data_effect_records = [
+        (command_id, command, semantics)
+        for command_id, command in command_records
+        if (
+            (semantics := command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            ))
+            and semantics.get("data_effects")
+        )
+    ]
+    covered_data_effects = sum(
+        _command_transfer_complete(command)
+        and audit.data_effects.get(command_id, ("opaque", ()))[0]
+        in {"exact", "conservative"}
+        for command_id, command, _semantics in data_effect_records
+    )
+    opaque_effects = [
+        command_id
+        for command_id, command in command_records
+        if not _command_transfer_complete(command)
+        or audit.transfers.get(command_id) == "opaque"
+        or (
+            (semantics := command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            ))
+            and semantics.get("data_effects")
+            and audit.data_effects.get(command_id, ("opaque", ()))[0] == "opaque"
+        )
+    ]
+    unresolved_scopes = sorted({
+        str(scope)
+        for dependency in dependencies
+        for scope in dependency.get("unresolved_scopes", [])
+    })
+    verified_version = tuple(int(value) for value in VERIFIED_EDITOR_VERSION.split("."))
+    newer_editor = editor.version_tuple > verified_version
+    catalog_warnings = (
+        [
+            f"当前命令表仅验证至 Editor {VERIFIED_EDITOR_VERSION}；"
+            f"{editor.version} 的新参数形状仍按未知命令处理。"
+        ]
+        if newer_editor
+        else []
+    )
+    return {
+        "schema": AUTO_ANALYSIS_SCHEMA,
+        "editor": {
+            "path": str(editor.path),
+            "version": editor.version,
+            "sha256": editor.sha256,
+        },
+        "command_catalog": {
+            "schema": CATALOG_SCHEMA,
+            "verified_through": VERIFIED_EDITOR_VERSION,
+            "newer_editor": newer_editor,
+            "shape_coverage": {
+                "commands": len(all_commands),
+                "covered": len(all_commands) - len(shape_missing),
+                "missing": len(shape_missing),
+                "ratio": (
+                    (len(all_commands) - len(shape_missing)) / len(all_commands)
+                    if all_commands else 1.0
+                ),
+            },
+            "semantic_coverage": {
+                "commands": len(all_commands),
+                "covered": len(all_commands) - len(semantic_missing),
+                "missing": len(semantic_missing),
+                "ratio": (
+                    (len(all_commands) - len(semantic_missing)) / len(all_commands)
+                    if all_commands else 1.0
+                ),
+            },
+            "cfg_coverage": {
+                "control_commands": len(control_records),
+                "covered": covered_control_commands,
+                "missing": len(control_records) - covered_control_commands,
+                "ratio": (
+                    covered_control_commands / len(control_records)
+                    if control_records else 1.0
+                ),
+            },
+            "call_target_coverage": {
+                "calls": len(call_edges),
+                "exact": resolved_calls,
+                "conservative": conservative_calls,
+                "missing": len(call_edges) - resolved_calls - conservative_calls,
+                "ratio": (
+                    (resolved_calls + conservative_calls) / len(call_edges)
+                    if call_edges else 1.0
+                ),
+            },
+            "data_effect_coverage": {
+                "commands": len(data_effect_records),
+                "covered": covered_data_effects,
+                "missing": len(data_effect_records) - covered_data_effects,
+                "ratio": (
+                    covered_data_effects / len(data_effect_records)
+                    if data_effect_records else 1.0
+                ),
+            },
+            "opaque_effects": len(opaque_effects),
+            "opaque_locations": sorted(set(opaque_effects))[:50],
+        },
+        "input_hash": input_hash,
+        "output_hash": hash_directory(root),
+        "counts": {
+            "common_events": common_counts["events"],
+            "common_pages": common_counts["pages"],
+            "common_commands": common_counts["commands"],
+            **{f"map_{key}": value for key, value in map_counts.items()},
+            "database": database_counts,
+        },
+        "databases": database_report,
+        "global_string_flow": global_string_flow,
+        "dependencies": dependencies,
+        "blocking_issues": blocking,
+        "event_summaries": event_summaries,
+        "call_graph": call_graph,
+        "runtime_semantics": {
+            "transfers": dict(sorted(audit.transfers.items())),
+            "cfg": dict(sorted(audit.cfg.items())),
+            "cfg_edges": [list(edge) for edge in sorted(audit.cfg_edges)],
+            "calls": {
+                key: {"status": value[0], "targets_or_scopes": list(value[1])}
+                for key, value in sorted(audit.calls.items())
+            },
+            "data_effects": {
+                key: {"status": value[0], "scopes": list(value[1])}
+                for key, value in sorted(audit.data_effects.items())
+            },
+        },
+        "reachable_scopes": unresolved_scopes,
+        "usage_by_key": usage_by_key,
+        "safe_to_translate": proven_display,
+        "keep_original": sorted(set(usage_by_key) - set(proven_display)),
+        "unresolved_scopes": unresolved_scopes,
+        "unknown_commands": warnings,
+        "warnings": catalog_warnings + [
+            f"未解释的字符串命令 opcode={warning['opcode']} {warning['shape']} ×{warning['count']}"
+            for warning in warnings
+        ],
+    }
+
+
+def _safety_predicate(operator: str, left: str, right: str) -> bool:
+    if operator == "equals":
+        return left == right
+    if operator == "not_equals":
+        return left != right
+    if operator == "contains":
+        return right in left
+    if operator == "starts_with":
+        return left.startswith(right)
+    if operator == "ends_with":
+        return left.endswith(right)
+    raise ValueError(f"Editor 分析报告包含未知字符串比较操作符：{operator}")
+
+
+def _scope_keys(
+    items: list[TranslationItem],
+    scopes: Iterable[object],
+    cache: dict[str, frozenset[str]] | None = None,
+) -> set[str]:
+    selected: set[str] = set()
+    for raw_scope in scopes:
+        scope = str(raw_scope)
+        if cache is not None and scope in cache:
+            selected.update(cache[scope])
+            continue
+        matched: set[str] = set()
+        if scope == "project":
+            matched.update(item.key for item in items)
+        elif scope == "common:*":
+            matched.update(
+                item.key for item in items if item.code.upper().startswith("COMMON-")
+            )
+        elif scope.startswith("common:"):
+            prefix = f"COMMON-{scope.split(':', 1)[1]}-"
+            matched.update(
+                item.key for item in items if item.code.upper().startswith(prefix)
+            )
+        elif scope.startswith("map:"):
+            _, map_id, event_id, page = scope.split(":", 3)
+            prefix = f"MAP-{map_id}-EV{int(event_id):03d}-PAGE{page}-"
+            matched.update(
+                item.key for item in items if item.code.upper().startswith(prefix)
+            )
+        elif scope.startswith("database:"):
+            parts = scope.split(":")
+            if len(parts) != 5:
+                matched.update(item.key for item in items)
+            else:
+                _, database, type_id, data_id, field_id = parts
+                for item in items:
+                    match = _WORKBOOK_DB_CODE_RE.fullmatch(item.code)
+                    if not match:
+                        continue
+                    if (
+                        match.group("database").upper() == database.upper()
+                        and (type_id == "*" or match.group("type") == type_id)
+                        and (data_id == "*" or match.group("data") == data_id)
+                        and (field_id == "*" or match.group("field") == field_id)
+                    ):
+                        matched.add(item.key)
+        else:
+            matched.update(item.key for item in items)
+        if cache is not None:
+            cache[scope] = frozenset(matched)
+        selected.update(matched)
+    return selected
+
+
+def _condition_truth_signature(dependency: dict[str, object]) -> tuple[object, ...]:
+    operator = str(dependency.get("operator", ""))
+    if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
+        return ("opaque", operator)
+    left = tuple(map(str, dependency.get("left_values", ())))
+    right = tuple(map(str, dependency.get("right_values", ())))
+    if not right and not dependency.get("right_is_variable"):
+        right = (str(dependency.get("literal", "")),)
+    if not left or not right:
+        return ("dynamic", operator)
+    return (
+        "values",
+        operator,
+        tuple(
+            sorted(
+                {
+                    _safety_predicate(operator, left_value, right_value)
+                    for left_value in left
+                    for right_value in right
+                }
+            )
+        ),
+    )
+
+
+def _semantic_replay_signature(report: dict[str, object]) -> dict[str, object]:
+    runtime = report.get("runtime_semantics", {})
+    if not isinstance(runtime, dict):
+        raise ValueError("Editor 分析报告缺少运行语义账本。")
+    dependencies = report.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise ValueError("Editor 分析报告缺少依赖记录。")
+    conditions: list[tuple[object, ...]] = []
+    resources: list[tuple[object, ...]] = []
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            raise ValueError("Editor 分析报告包含损坏的依赖记录。")
+        identity = (
+            dependency.get("auto_file"),
+            dependency.get("event_type"),
+            dependency.get("event_id"),
+            dependency.get("page"),
+            dependency.get("command"),
+            dependency.get("string_index"),
+        )
+        kind = str(dependency.get("kind", ""))
+        if kind == "condition":
+            conditions.append((*identity, _condition_truth_signature(dependency)))
+        elif kind == "resource":
+            role = str(dependency.get("resource_role", ""))
+            values = (
+                dependency.get("resource_path_values", ())
+                if role == "file_content_runtime_write"
+                else dependency.get("resource_values", ())
+            )
+            resources.append((*identity, role, tuple(sorted(map(str, values or ())))))
+    return {
+        "cfg_edges": tuple(
+            sorted(tuple(map(str, edge)) for edge in runtime.get("cfg_edges", ()))
+        ),
+        "calls": tuple(
+            sorted(
+                (
+                    str(key),
+                    str(value.get("status", "")),
+                    tuple(map(str, value.get("targets_or_scopes", ()))),
+                )
+                for key, value in dict(runtime.get("calls", {})).items()
+                if isinstance(value, dict)
+            )
+        ),
+        "data_effects": tuple(
+            sorted(
+                (
+                    str(key),
+                    str(value.get("status", "")),
+                    tuple(map(str, value.get("scopes", ()))),
+                )
+                for key, value in dict(runtime.get("data_effects", {})).items()
+                if isinstance(value, dict)
+            )
+        ),
+        "conditions": tuple(sorted(conditions, key=repr)),
+        "resources": tuple(sorted(resources, key=repr)),
+        "opaque_effects": int(
+            dict(report.get("command_catalog", {})).get("opaque_effects", 0)
+        ),
+    }
+
+
+def _replay_changed_commands(
+    original: dict[str, object], candidate: dict[str, object]
+) -> dict[str, set[str]]:
+    def grouped(
+        records: Iterable[tuple[object, ...]], field: str
+    ) -> dict[str, set[tuple[object, ...]]]:
+        result: dict[str, set[tuple[object, ...]]] = {}
+        for record in records:
+            command_id = (
+                str(record[0])
+                if field in {"cfg_edges", "calls", "data_effects"}
+                else ":".join(map(str, record[:5]))
+            )
+            result.setdefault(command_id, set()).add(record)
+        return result
+
+    changed: dict[str, set[str]] = {}
+    for field in ("cfg_edges", "calls", "data_effects", "conditions", "resources"):
+        left = grouped(original.get(field, ()), field)
+        right = grouped(candidate.get(field, ()), field)
+        command_ids = {
+            command_id
+            for command_id in left.keys() | right.keys()
+            if left.get(command_id, set()) != right.get(command_id, set())
+        }
+        if command_ids:
+            changed[field] = command_ids
+    if original.get("opaque_effects") != candidate.get("opaque_effects"):
+        changed["opaque_effects"] = {"project"}
+    return changed
+
+
+def analyze_translation_safety(
+    auto_dir: str | Path,
+    items: list[TranslationItem],
+    candidate_values: dict[str, str],
+    policy: str,
+    *,
+    analysis: dict[str, object],
+) -> dict[str, object]:
+    """Approve only candidate strings whose Auto uses are statically proven safe."""
+    if policy not in {"warn", "block"}:
+        raise ValueError(f"未知 WOLF 逻辑安全策略：{policy}")
+    if analysis.get("schema") != AUTO_ANALYSIS_SCHEMA:
+        raise ValueError(
+            f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} Editor 分析报告，请重新执行导出文本。"
+        )
+    root = Path(auto_dir).resolve()
+    if hash_directory(root) != analysis.get("output_hash"):
+        raise ValueError("Editor Auto 目录已变化，请重新执行导出文本。")
+    usage_by_key = analysis.get("usage_by_key")
+    dependencies = analysis.get("dependencies")
+    if not isinstance(usage_by_key, dict) or not isinstance(dependencies, list):
+        raise ValueError("Editor 分析报告缺少翻译用途或依赖数据。")
+
+    originals = {item.key: item.original for item in items}
+    candidates = {
+        key: value
+        for key, value in candidate_values.items()
+        if key in originals and value and value != originals[key]
+    }
+    event_targets: dict[str, int] = {}
+    summaries = analysis.get("event_summaries", [])
+    if isinstance(summaries, list):
+        for summary in summaries:
+            if not isinstance(summary, dict):
+                continue
+            name = str(summary.get("event_name", ""))
+            node = str(summary.get("event", ""))
+            match = re.search(r":(\d+):\d+$", node)
+            if name and node.startswith("common:") and match:
+                event_targets[name] = max(
+                    event_targets.get(name, -1), int(match.group(1))
+                )
+
+    direct_safe = {
+        key
+        for key in candidates
+        if (uses := set(map(str, usage_by_key.get(key, ()))))
+        and uses <= {"display_only", "display_storage", "logic", "event_target"}
+        and ("display_storage" not in uses or "display_only" in uses)
+        and (
+            "event_target" not in uses
+            or event_targets.get(originals[key]) == event_targets.get(candidates[key])
+        )
+    }
+    catalog = analysis.get("command_catalog", {})
+    coverage_fields = (
+        "semantic_coverage",
+        "cfg_coverage",
+        "call_target_coverage",
+        "data_effect_coverage",
+    )
+    complete_ledger = (
+        isinstance(catalog, dict)
+        and int(catalog.get("opaque_effects", 1)) == 0
+        and all(
+            isinstance(catalog.get(field), dict)
+            and float(catalog[field].get("ratio", 0.0)) == 1.0
+            for field in coverage_fields
+        )
+    )
+    official_display = {
+        item.key
+        for item in items
+        if item.key in candidates
+        and getattr(item.category, "value", str(item.category)) == "display"
+    }
+    safe = set(direct_safe)
+    if complete_ledger:
+        # The official translation workbook defines the display surface. Static
+        # analysis subtracts every observed logic/resource use below; requiring
+        # an Auto read for DB labels would incorrectly reject engine-rendered UI.
+        safe.update(official_display)
+    base_protected = set(candidates) - safe
+    forced: set[str] = set()
+    reasons: dict[str, set[str]] = {}
+
+    def final_value(key: str) -> str:
+        if key in base_protected or key in forced:
+            return originals[key]
+        return candidates.get(key, originals[key])
+
+    def same_event_target(key: str) -> bool:
+        return event_targets.get(originals[key]) == event_targets.get(final_value(key))
+
+    def has_display_evidence(key: str) -> bool:
+        return "display_only" in set(map(str, usage_by_key.get(key, ())))
+
+    scope_sets: dict[str, set[str]] = {"project": set(originals)}
+    for item in items:
+        upper = item.code.upper()
+        common = re.match(r"COMMON-(\d+)-", upper)
+        if common:
+            scope_sets.setdefault("common:*", set()).add(item.key)
+            scope_sets.setdefault(f"common:{common.group(1)}", set()).add(item.key)
+        map_item = re.match(r"MAP-(\d+)-EV(\d+)-PAGE(\d+)-", upper)
+        if map_item:
+            scope_sets.setdefault(
+                f"map:{int(map_item.group(1))}:{int(map_item.group(2))}:{int(map_item.group(3))}",
+                set(),
+            ).add(item.key)
+        database = _WORKBOOK_DB_CODE_RE.fullmatch(item.code)
+        if database:
+            db = database.group("database").upper()
+            type_id = database.group("type")
+            data_id = database.group("data")
+            field_id = database.group("field")
+            for scope in (
+                f"database:{db}:*:*:*",
+                f"database:{db}:{type_id}:*:*",
+                f"database:{db}:{type_id}:{data_id}:*",
+                f"database:{db}:{type_id}:*:{field_id}",
+                f"database:{db}:{type_id}:{data_id}:{field_id}",
+            ):
+                scope_sets.setdefault(scope, set()).add(item.key)
+    scope_cache = {
+        scope: frozenset(keys) for scope, keys in scope_sets.items()
+    }
+
+    global_string_flow = analysis.get("global_string_flow")
+    global_string_flow_converged = (
+        isinstance(global_string_flow, dict)
+        and global_string_flow.get("converged") is True
+        and complete_ledger
+    )
+    def normalized_runtime_file_path(value: object) -> str:
+        return ntpath.normcase(ntpath.normpath(str(value)))
+
+    file_read_paths: set[str] = set()
+    unknown_file_read_path = False
+    for dependency in dependencies:
+        if (
+            dependency.get("kind") != "resource"
+            or dependency.get("resource_role") != "file_path_runtime_read"
+        ):
+            continue
+        values = dependency.get("source_values")
+        if isinstance(values, list) and values:
+            file_read_paths.update(map(normalized_runtime_file_path, values))
+        else:
+            unknown_file_read_path = True
+
+    def protect(keys: Iterable[object], reason: str) -> None:
+        for raw_key in keys:
+            key = str(raw_key)
+            if key in candidates:
+                forced.add(key)
+                reasons.setdefault(key, set()).add(reason)
+
+    def scoped_keys(dependency: dict[str, object], side: str) -> set[str]:
+        field = "source_scopes" if side == "left" else "right_source_scopes"
+        raw_scopes = tuple(map(str, dependency.get(field, ())))
+        if not raw_scopes and dependency.get("right_is_variable"):
+            raw_scopes = tuple(map(str, dependency.get("unresolved_scopes", ())))
+        return _scope_keys(items, raw_scopes, scope_cache)
+
+    def condition_domain(
+        keys: Iterable[str], values: Iterable[object]
+    ) -> list[tuple[str | None, str, str]]:
+        records = {
+            (key, originals[key], final_value(key))
+            for key in keys
+            if key in originals
+        }
+        records.update((None, str(value), str(value)) for value in values)
+        return sorted(records, key=lambda item: (item[0] or "", item[1], item[2]))
+
+    def replay_dynamic_condition(dependency: dict[str, object]) -> bool:
+        operator = str(dependency.get("operator", "unknown"))
+        if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
+            return False
+        left_keys = set(map(str, dependency.get("source_keys", ())))
+        left_keys.update(scoped_keys(dependency, "left"))
+        if not dependency.get("right_is_variable"):
+            literal = str(dependency.get("literal", ""))
+            for key in left_keys & candidates.keys():
+                if _safety_predicate(operator, originals[key], literal) != _safety_predicate(
+                    operator, final_value(key), literal
+                ):
+                    protect((key,), "condition_truth_change")
+            return True
+
+        right_keys = set(map(str, dependency.get("right_source_keys", ())))
+        right_keys.update(scoped_keys(dependency, "right"))
+        left = condition_domain(left_keys, dependency.get("left_values", ()))
+        right = condition_domain(right_keys, dependency.get("right_values", ()))
+        changed_candidates = (left_keys | right_keys) & candidates.keys()
+        if not changed_candidates:
+            return True
+        if not left or not right:
+            protect(changed_candidates, "dynamic_condition_operand_unknown")
+            return True
+        if operator in {"equals", "not_equals"}:
+            right_by_original: dict[str, list[tuple[str | None, str]]] = {}
+            right_by_final: dict[str, list[tuple[str | None, str]]] = {}
+            for key, original, final in right:
+                right_by_original.setdefault(original, []).append((key, final))
+                right_by_final.setdefault(final, []).append((key, original))
+            for left_key, left_original, left_final in left:
+                for right_key, right_final in right_by_original.get(left_original, ()):
+                    if left_final != right_final:
+                        protect((left_key, right_key), "condition_truth_change")
+                for right_key, right_original in right_by_final.get(left_final, ()):
+                    if left_original != right_original:
+                        protect((left_key, right_key), "condition_truth_change")
+            return True
+        if len(left) * len(right) > _VALUE_LIMIT * _VALUE_LIMIT:
+            # ponytail: non-equality cross-products stay bounded; a symbolic
+            # string-relation domain can replace this conservative fallback.
+            protect(changed_candidates, "dynamic_condition_domain_too_large")
+            return True
+        for left_key, left_original, left_final in left:
+            for right_key, right_original, right_final in right:
+                if _safety_predicate(operator, left_original, right_original) != _safety_predicate(
+                    operator, left_final, right_final
+                ):
+                    protect((left_key, right_key), "condition_truth_change")
+        return True
+
+    def evaluate_dependency(dependency: object) -> None:
+        if not isinstance(dependency, dict):
+            raise ValueError("Editor 分析报告包含损坏的依赖记录。")
+        status = str(dependency.get("status", "blocking"))
+        kind = str(dependency.get("kind", "condition"))
+        source_keys = list(map(str, dependency.get("source_keys", ())))
+        right_keys = list(map(str, dependency.get("right_source_keys", ())))
+        condition_keys = list(map(str, dependency.get("condition_keys", ())))
+        protect(condition_keys, "condition_literal")
+        if kind in {"display", "flow"}:
+            return
+        if (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            if not dependency.get("display_sink_proven"):
+                protect(
+                    [*source_keys, *right_keys],
+                    "database_storage_without_display_sink",
+                )
+            elif not global_string_flow_converged:
+                protect(
+                    [*source_keys, *right_keys],
+                    "database_string_flow_not_converged",
+                )
+            return
+        if (
+            kind == "resource"
+            and dependency.get("resource_role") == "file_content_runtime_write"
+        ):
+            path_values = dependency.get("resource_path_values")
+            fixed_unread_path = (
+                isinstance(path_values, list)
+                and len(path_values) == 1
+                and normalized_runtime_file_path(path_values[0]) not in file_read_paths
+                and not unknown_file_read_path
+            )
+            loop_content_only = (
+                status == "dynamic"
+                and str(dependency.get("reason", ""))
+                == "控制流回边扩大为运行时字符串"
+            )
+            if fixed_unread_path and (status == "resolved" or loop_content_only):
+                return
+            protect([*source_keys, *right_keys], "file_content_not_proven_display_only")
+            return
+        if (
+            kind == "state"
+            and dependency.get("resource_role") == "global_string_write"
+            and global_string_flow_converged
+        ):
+            return
+        if status == "dynamic" and kind == "condition" and replay_dynamic_condition(dependency):
+            return
+        if status != "resolved":
+            reason = str(dependency.get("reason", "unresolved"))
+            call_target_kind = str(dependency.get("call_target_kind", ""))
+            target_equivalence = kind == "call" and call_target_kind == "event_name"
+            protect(
+                (
+                    key
+                    for key in [*source_keys, *right_keys]
+                    if (
+                        not target_equivalence
+                        or key not in candidates
+                        or not same_event_target(key)
+                    )
+                ),
+                reason,
+            )
+            raw_scopes = tuple(
+                scope
+                for scope in dependency.get("unresolved_scopes", ())
+                if not (
+                    call_target_kind == "numeric_id" and scope == "common:*"
+                )
+            )
+            if raw_scopes or status == "blocking":
+                scoped = _scope_keys(
+                    items,
+                    raw_scopes or ("project",),
+                    scope_cache,
+                )
+                protect(
+                    (
+                        key
+                        for key in scoped
+                        if not has_display_evidence(key)
+                        and (
+                            not target_equivalence
+                            or key not in candidates
+                            or not same_event_target(key)
+                        )
+                    ),
+                    reason,
+                )
+            return
+        if kind == "call":
+            protect(
+                (
+                    key
+                    for key in [*source_keys, *right_keys]
+                    if key not in candidates or not same_event_target(key)
+                ),
+                "event_target_change",
+            )
+            return
+        if kind != "condition":
+            protect([*source_keys, *right_keys], kind)
+            return
+        operator = str(dependency.get("operator", "unknown"))
+        literal = str(dependency.get("literal", ""))
+        if operator not in {"equals", "not_equals", "contains", "starts_with", "ends_with"}:
+            protect([*source_keys, *right_keys], "unsupported_condition")
+            return
+        if right_keys:
+            for left_key in source_keys:
+                for right_key in right_keys:
+                    if left_key not in candidates and right_key not in candidates:
+                        continue
+                    left_original = originals.get(left_key, "")
+                    right_original = originals.get(right_key, "")
+                    left_final = final_value(left_key) if left_key in originals else left_original
+                    right_final = final_value(right_key) if right_key in originals else right_original
+                    if _safety_predicate(operator, left_original, right_original) != _safety_predicate(
+                        operator, left_final, right_final
+                    ):
+                        protect((left_key, right_key), "condition_truth_change")
+            return
+        for key in source_keys:
+            if key not in candidates:
+                continue
+            original = originals[key]
+            if _safety_predicate(operator, original, literal) != _safety_predicate(
+                operator, final_value(key), literal
+            ):
+                protect((key,), "condition_truth_change")
+            elif set(map(str, usage_by_key.get(key, ()))) <= {"logic"}:
+                safe.add(key)
+
+    for key in base_protected:
+        reasons.setdefault(key, set()).add("not_proven_safe")
+
+    editor_data = analysis.get("editor", {})
+    if not isinstance(editor_data, dict):
+        raise ValueError("Editor 分析报告缺少 Editor 身份。")
+    editor_version = str(editor_data.get("version", ""))
+    editor = EditorInfo(
+        Path(str(editor_data.get("path", "Editor.exe"))),
+        editor_version,
+        tuple(int(value) for value in editor_version.split(".") if value.isdigit()),
+        str(editor_data.get("sha256", "")),
+    )
+    baseline_report = analysis
+    original_signature = _semantic_replay_signature(baseline_report)
+    replay_report = baseline_report
+    replay_signature = original_signature
+    replay_differences: list[str] = []
+    replay_history: list[dict[str, object]] = []
+    previous_candidates: dict[str, str] | None = None
+    iterations = 0
+    while True:
+        protected_before = len(forced)
+        for dependency in dependencies:
+            evaluate_dependency(dependency)
+        active_candidates = {
+            key: final_value(key)
+            for key in candidates
+            if final_value(key) != originals[key]
+        }
+        if active_candidates != previous_candidates:
+            replay_report = analyze_auto_export(
+                root,
+                items,
+                editor,
+                input_hash=str(analysis.get("input_hash", "")),
+                candidate_values=active_candidates,
+            )
+            replay_global_flow = replay_report.get("global_string_flow")
+            if not (
+                isinstance(replay_global_flow, dict)
+                and replay_global_flow.get("converged") is True
+            ):
+                protect(active_candidates, "global_string_flow_not_converged")
+            replay_signature = _semantic_replay_signature(replay_report)
+            previous_candidates = dict(active_candidates)
+        replay_changes = _replay_changed_commands(
+            original_signature, replay_signature
+        )
+        replay_differences = sorted(replay_changes)
+        abstract_differences: list[str] = []
+        if replay_differences:
+            changed_commands = {
+                command_id
+                for command_ids in replay_changes.values()
+                for command_id in command_ids
+                if command_id != "project"
+            }
+            affected: set[str] = set()
+            for dependency in [*dependencies, *replay_report.get("dependencies", ())]:
+                if not isinstance(dependency, dict):
+                    continue
+                dependency_id = ":".join(map(str, (
+                    dependency.get("auto_file", ""),
+                    dependency.get("event_type", ""),
+                    dependency.get("event_id", ""),
+                    dependency.get("page", ""),
+                    dependency.get("command", ""),
+                )))
+                if dependency_id not in changed_commands:
+                    continue
+                dependency_keys: set[str] = set()
+                for field in ("condition_keys", "source_keys", "right_source_keys"):
+                    dependency_keys.update(map(str, dependency.get(field, ())))
+                kind = str(dependency.get("kind", ""))
+                scoped = _scope_keys(
+                    items,
+                    tuple(map(str, dependency.get("unresolved_scopes", ()))),
+                    scope_cache,
+                )
+                if kind == "call":
+                    affected.update(
+                        key
+                        for key in dependency_keys | scoped
+                        if key in active_candidates and not same_event_target(key)
+                    )
+                elif kind != "condition":
+                    active_keys = dependency_keys & active_candidates.keys()
+                    affected.update(active_keys or (scoped & active_candidates.keys()))
+            affected.intersection_update(active_candidates)
+            if not affected:
+                non_condition = set(replay_differences) - {"conditions"}
+                if non_condition:
+                    # A semantic delta without provenance is an analyzer defect,
+                    # not evidence that every unrelated translation is unsafe.
+                    raise RuntimeError(
+                        "WOLF 候选译文重放出现无法定位来源的语义差异："
+                        + ", ".join(sorted(non_condition))
+                    )
+                # Dynamic abstract domains can contain different strings while
+                # every candidate predicate remains equivalent. The explicit
+                # item-wise checks above are the safety property we care about.
+                abstract_differences.append("conditions")
+                replay_differences = []
+            else:
+                protect(affected, "semantic_replay_difference")
+        replay_history.append({
+            "iteration": iterations + 1,
+            "active_candidates": len(active_candidates),
+            "differences": sorted(replay_changes),
+            "abstract_differences": abstract_differences,
+            "changed_commands": {
+                field: sorted(command_ids)[:20]
+                for field, command_ids in sorted(replay_changes.items())
+            },
+        })
+        iterations += 1
+        if len(forced) == protected_before and not replay_differences:
+            break
+        if iterations > len(candidates) + 1:
+            raise RuntimeError("WOLF 候选译文安全保护集合无法收敛。")
+
+    protected = set(base_protected)
+    protected.update(forced)
+    safe.difference_update(protected)
+    safe_display = {
+        key for key in safe
+        if set(map(str, usage_by_key.get(key, ()))) == {"display_only"}
+    }
+    safe_equivalent = {
+        key for key in safe
+        if set(map(str, usage_by_key.get(key, ()))) & {"logic", "event_target"}
+    }
+    safe_contract = safe - safe_display - safe_equivalent
+    unresolved = sorted(
+        {
+            str(scope)
+            for dependency in replay_report.get("dependencies", [])
+            if isinstance(dependency, dict) and dependency.get("status") != "resolved"
+            for scope in dependency.get("unresolved_scopes", ())
+        }
+    )
+    if policy == "block" and protected:
+        first = sorted(protected)[0]
+        raise RuntimeError(
+            "WOLF 静态安全分析无法证明全部候选译文安全，已阻止导入："
+            f"{first}（{', '.join(sorted(reasons.get(first, {'not_proven_safe'})))}）。"
+        )
+    return {
+        "schema": TRANSLATION_SAFETY_SCHEMA,
+        "safe_to_translate": sorted(safe),
+        "approvals": {
+            "direct_display": sorted(safe_display),
+            "official_display_contract": sorted(safe_contract),
+            "semantic_equivalence": sorted(safe_equivalent),
+        },
+        "keep_original": sorted(protected),
+        "unresolved_scopes": unresolved,
+        "replay": {
+            "iterations": iterations,
+            "candidate_changes": len(candidates),
+            "safe_changes": len(safe),
+            "protected_changes": len(protected),
+            "control_flow_equivalent": (
+                original_signature["cfg_edges"] == replay_signature["cfg_edges"]
+                and original_signature["calls"] == replay_signature["calls"]
+            ),
+            "data_effects_equivalent": (
+                original_signature["data_effects"]
+                == replay_signature["data_effects"]
+            ),
+            "condition_results_equivalent": (
+                "conditions" not in replay_differences
+            ),
+            "resource_targets_equivalent": (
+                original_signature["resources"] == replay_signature["resources"]
+            ),
+            "differences": replay_differences,
+            "history": replay_history,
+        },
+        "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
+    }
+
+
+def compare_auto_structure(
+    before_dir: str | Path,
+    after_dir: str | Path,
+    items: list[TranslationItem],
+    approved_keys: set[str],
+) -> dict[str, object]:
+    """Compare Editor round-trips while masking only explicitly approved text slots."""
+    before_root = Path(before_dir).resolve()
+    after_root = Path(after_dir).resolve()
+    by_code: dict[str, list[TranslationItem]] = {}
+    for item in items:
+        by_code.setdefault(item.code.upper(), []).append(item)
+    approved_codes = {
+        code
+        for code, code_items in by_code.items()
+        if any(item.key in approved_keys for item in code_items)
+    }
+    copy_targets: dict[str, set[str]] = {}
+    for code, code_items in by_code.items():
+        for item in code_items:
+            match = COPY_FROM_RE.search(item.flag)
+            if match is None:
+                continue
+            copy_targets.setdefault(match.group(1).upper(), set()).add(code)
+    queue = deque(approved_codes)
+    while queue:
+        for target in copy_targets.get(queue.popleft(), ()):
+            if target not in approved_codes:
+                approved_codes.add(target)
+                queue.append(target)
+
+    def segment_chain(code: str) -> list[TranslationItem]:
+        candidates = by_code.get(code, [])
+        if len(candidates) != 1:
+            return []
+        current = candidates[0]
+        parts = [current]
+        seen_segments = {code}
+        while True:
+            match = re.search(
+                r"(?:^|\r?\n)NEXT=([^\r\n]+)",
+                current.flag,
+                re.IGNORECASE,
+            )
+            if match is None:
+                break
+            next_code = match.group(1).upper()
+            candidates = by_code.get(next_code, [])
+            if len(candidates) != 1 or next_code in seen_segments:
+                return []
+            seen_segments.add(next_code)
+            current = candidates[0]
+            parts.append(current)
+        return parts
+
+    def copy_source(code: str) -> str | None:
+        seen = {code}
+        while True:
+            candidates = by_code.get(code, [])
+            if len(candidates) != 1:
+                return None
+            match = COPY_FROM_RE.search(candidates[0].flag)
+            if match is None:
+                return code
+            code = match.group(1).upper()
+            if code in seen:
+                return None
+            seen.add(code)
+
+    segment_expected: dict[str, str] = {}
+    for code in by_code:
+        if code.startswith("SEGMENT_"):
+            continue
+        target_parts = segment_chain(code)
+        if len(target_parts) <= 1:
+            continue
+        source_code = copy_source(code)
+        parts = segment_chain(source_code) if source_code is not None else []
+        if len(parts) <= 1:
+            continue
+        expected = "".join(
+            part.translation
+            if part.key in approved_keys and part.translation
+            else part.original
+            for part in parts
+        )
+        segment_expected[code] = (
+            expected.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", r"<\n>")
+        )
+        if any(part.key in approved_keys for part in parts + target_parts):
+            approved_codes.add(code)
+    queue = deque(approved_codes)
+    while queue:
+        for target in copy_targets.get(queue.popleft(), ()):
+            if target not in approved_codes:
+                approved_codes.add(target)
+                queue.append(target)
+
+    def event_index(root: Path) -> dict[tuple[str, int, int], _CommandBlock]:
+        result: dict[tuple[str, int, int], _CommandBlock] = {}
+        sdb_path = root / "BasicData" / "SysDataBase.Auto.txt"
+        map_ids = (
+            _map_ids_from_databases({"SDB": _database_index(sdb_path, "SDB")[0]})
+            if sdb_path.is_file()
+            else {}
+        )
+        paths = [root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+        paths.extend(sorted((root / "MapData").rglob("*.mps.Auto.txt")))
+        for path in paths:
+            if not path.is_file():
+                continue
+            event_type = "common" if path.name == "CommonEvent.dat.Auto.txt" else "map"
+            for block in _event_blocks(path, event_type, source=path.relative_to(root).as_posix())[0]:
+                if event_type == "map":
+                    aliases = map_ids.get(block.source.casefold())
+                    if aliases:
+                        block = replace(block, map_id=aliases[0], map_ids=aliases)
+                result[(block.source, block.event_id, block.page)] = block
+        return result
+
+    differences: list[dict[str, object]] = []
+    difference_count = 0
+
+    def add(kind: str, location: str, before: object, after: object) -> None:
+        nonlocal difference_count
+        difference_count += 1
+        if len(differences) < 200:
+            differences.append({"kind": kind, "location": location, "before": before, "after": after})
+
+    before_events = event_index(before_root)
+    after_events = event_index(after_root)
+    before_files = {
+        path.relative_to(before_root).as_posix()
+        for path in (
+            [before_root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+            + sorted((before_root / "MapData").rglob("*.mps.Auto.txt"))
+        )
+        if path.is_file()
+    }
+    after_files = {
+        path.relative_to(after_root).as_posix()
+        for path in (
+            [after_root / "BasicData" / "CommonEvent.dat.Auto.txt"]
+            + sorted((after_root / "MapData").rglob("*.mps.Auto.txt"))
+        )
+        if path.is_file()
+    }
+    if before_files != after_files:
+        add(
+            "auto_file_set",
+            "AutoProject",
+            {
+                "count": len(before_files),
+                "missing_from_after": sorted(before_files - after_files)[:50],
+            },
+            {
+                "count": len(after_files),
+                "added_in_after": sorted(after_files - before_files)[:50],
+            },
+        )
+    if set(before_events) != set(after_events):
+        before_only = sorted(map(str, set(before_events) - set(after_events)))
+        after_only = sorted(map(str, set(after_events) - set(before_events)))
+        add(
+            "event_set",
+            "AutoProject",
+            {
+                "count": len(before_events),
+                "missing_from_after_count": len(before_only),
+                "missing_from_after": before_only[:50],
+            },
+            {
+                "count": len(after_events),
+                "added_in_after_count": len(after_only),
+                "added_in_after": after_only[:50],
+            },
+        )
+    for key in sorted(set(before_events) & set(after_events)):
+        before = before_events[key]
+        after = after_events[key]
+        location = f"{before.source} event={before.event_id} page={before.page}"
+        if before.event_name != after.event_name:
+            if not any(
+                code.upper() in approved_codes for code in _event_name_codes(before)
+            ):
+                add("event_name", location, before.event_name, after.event_name)
+        if len(before.commands) != len(after.commands):
+            add("command_count", location, len(before.commands), len(after.commands))
+            continue
+        for index, (left, right) in enumerate(zip(before.commands, after.commands, strict=True), start=1):
+            command_location = f"{location} command={index}"
+            if (left.opcode, left.ints, left.indent) != (right.opcode, right.ints, right.indent):
+                add(
+                    "command_structure",
+                    command_location,
+                    [left.opcode, list(left.ints), left.indent],
+                    [right.opcode, list(right.ints), right.indent],
+                )
+                continue
+            if len(left.strings) != len(right.strings):
+                add("string_count", command_location, len(left.strings), len(right.strings))
+                continue
+            for string_index, (left_text, right_text) in enumerate(zip(left.strings, right.strings, strict=True)):
+                if left_text == right_text:
+                    continue
+                codes = tuple(
+                    code.upper()
+                    for code in _event_codes(before, index, string_index)
+                )
+                expected_values = {
+                    segment_expected[code]
+                    for code in codes
+                    if code in segment_expected
+                }
+                if expected_values:
+                    if right_text not in expected_values:
+                        add(
+                            "segmented_string",
+                            f"{command_location} string={string_index}",
+                            sorted(expected_values),
+                            right_text,
+                        )
+                    continue
+                if not any(code in approved_codes for code in codes):
+                    add("unapproved_string", f"{command_location} string={string_index}", left_text, right_text)
+
+    database_names = (("DataBase", "UDB"), ("CDataBase", "CDB"), ("SysDataBase", "SDB"))
+    for filename, database in database_names:
+        left_path = before_root / "BasicData" / f"{filename}.Auto.txt"
+        right_path = after_root / "BasicData" / f"{filename}.Auto.txt"
+        if left_path.is_file() != right_path.is_file():
+            add("database_file", filename, left_path.is_file(), right_path.is_file())
+            continue
+        if not left_path.is_file():
+            continue
+        left_types = _database_index(left_path, database)[0]
+        right_types = _database_index(right_path, database)[0]
+        if set(left_types) != set(right_types):
+            add("database_types", database, sorted(left_types), sorted(right_types))
+            continue
+        for type_id in sorted(left_types):
+            left_type = left_types[type_id]
+            right_type = right_types[type_id]
+            type_location = f"{database}[{type_id}]"
+            if left_type.field_types != right_type.field_types:
+                add(
+                    "database_field_types",
+                    type_location,
+                    left_type.field_types,
+                    right_type.field_types,
+                )
+            if len(left_type.rows) != len(right_type.rows):
+                add(
+                    "database_row_count",
+                    type_location,
+                    len(left_type.rows),
+                    len(right_type.rows),
+                )
+            if (
+                left_type.name != right_type.name
+                and f"NAME-T-{database}-{type_id}".upper() not in approved_codes
+            ):
+                add("database_type_name", type_location, left_type.name, right_type.name)
+            for field_id in sorted(set(left_type.field_names) | set(right_type.field_names)):
+                left_name = left_type.field_names.get(field_id)
+                right_name = right_type.field_names.get(field_id)
+                if (
+                    left_name != right_name
+                    and f"NAME-I-{database}-{type_id}-{field_id}".upper()
+                    not in approved_codes
+                ):
+                    add(
+                        "database_field_name",
+                        f"{type_location}[field={field_id}]",
+                        left_name,
+                        right_name,
+                    )
+            if len(left_type.data_names) != len(right_type.data_names):
+                add(
+                    "database_data_name_count",
+                    type_location,
+                    len(left_type.data_names),
+                    len(right_type.data_names),
+                )
+            for data_id, (left_name, right_name) in enumerate(
+                zip(left_type.data_names, right_type.data_names)
+            ):
+                if (
+                    left_name != right_name
+                    and f"NAME-D-{database}-{type_id}-{data_id}".upper()
+                    not in approved_codes
+                ):
+                    add(
+                        "database_data_name",
+                        f"{type_location}[data={data_id}]",
+                        left_name,
+                        right_name,
+                    )
+            for data_id, (left_row, right_row) in enumerate(zip(left_type.rows, right_type.rows)):
+                if len(left_row) != len(right_row):
+                    add("database_width", f"{type_location}[{data_id}]", len(left_row), len(right_row))
+                    continue
+                for field_id, (left_text, right_text) in enumerate(zip(left_row, right_row)):
+                    if left_text == right_text:
+                        continue
+                    code = f"{database}-{type_id}-{data_id}-{field_id}".upper()
+                    if code not in approved_codes:
+                        add("unapproved_database_string", code, left_text, right_text)
+
+    return {
+        "status": "passed" if not differences else "failed",
+        "approved_keys": len(approved_keys),
+        "differences": differences,
+        "difference_count": difference_count,
+        "before_hash": hash_directory(before_root),
+        "after_hash": hash_directory(after_root),
+    }
 
 
 def _validate_outputs(sandbox: Path, auto_dir: Path, maps: list[Path]) -> None:

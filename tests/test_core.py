@@ -84,41 +84,37 @@ from wolf_tools import (
     write_full_workbook,
     write_scoped_workbook,
 )
-from wolf_auto import (
-    _Command,
-    _CommandBlock,
-    _DatabaseType,
-    _database_index,
-    compare_auto_structure,
-)
 from wolf_editor import (
-    EditorRelease,
-    EditorInfo,
-    _copy_editor_sandbox,
-    _editor_execution_lock,
-    _inspect_matching_runtime,
-    _legacy_conversion_action,
-    _restore_editor_map_paths,
-    inspect_wolf_editor,
-    install_supported_editor,
-    latest_editor_release_from_html,
-)
-from wolf_proof import analyze_translation_safety
-from wolf_semantics import (
     AUTO_ANALYSIS_SCHEMA,
     _AnalysisAudit,
     _AnalysisState,
     _BlockAnalyzer,
     _address_variables_for_block,
+    _Command,
+    _CommandBlock,
+    _DatabaseType,
+    EditorRelease,
+    EditorInfo,
     _NumberValue,
     _StringValue,
+    _copy_editor_sandbox,
     _calculate_numbers,
     _loop_identity,
+    _legacy_conversion_action,
+    _database_index,
+    _editor_execution_lock,
+    _inspect_matching_runtime,
     _merge_states,
     _merge_numbers,
     _merge_strings,
+    _restore_editor_map_paths,
     _translation_usage_report,
     analyze_auto_export,
+    analyze_translation_safety,
+    compare_auto_structure,
+    inspect_wolf_editor,
+    install_supported_editor,
+    latest_editor_release_from_html,
 )
 
 
@@ -2414,7 +2410,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "控制流回边扩大为运行时字符串",
             }
             analysis["dependencies"] = [content_write]
-            with mock.patch("wolf_proof.analyze_project", return_value=mock.Mock(report=analysis)):
+            with mock.patch("wolf_editor.analyze_auto_export", return_value=analysis):
                 safety = analyze_translation_safety(
                     root / "Auto", [item], {item.key: item.translation}, "warn", analysis=analysis
                 )
@@ -2436,7 +2432,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "status": "resolved",
                 "reason": "",
             })
-            with mock.patch("wolf_proof.analyze_project", return_value=mock.Mock(report=analysis)):
+            with mock.patch("wolf_editor.analyze_auto_export", return_value=analysis):
                 safety = analyze_translation_safety(
                     root / "Auto", [item], {item.key: item.translation}, "warn", analysis=analysis
                 )
@@ -3525,7 +3521,7 @@ class ProcessTests(unittest.TestCase):
             source = Path(directory) / "official.exe"
             original = b"prefix-MessageBeep\0-suffix"
             source.write_bytes(original)
-            with mock.patch("process_tools._pe_import_name_offset", return_value=7):
+            with mock.patch("wolf_tools._pe_import_name_offset", return_value=7):
                 silent = _silent_official_executable(source)
             self.assertEqual(original, source.read_bytes())
             self.assertEqual(b"prefix-IsWindow\0\0\0\0-suffix", silent)
