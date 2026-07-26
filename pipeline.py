@@ -57,14 +57,14 @@ from safe_io import (
     read_text_with_retry,
     replace_with_retry,
 )
+from wolf_auto import compare_auto_structure
 from wolf_editor import (
-    AUTO_ANALYSIS_SCHEMA,
-    analyze_translation_safety,
-    compare_auto_structure,
     convert_legacy_game,
     export_and_analyze,
     inspect_wolf_editor,
 )
+from wolf_proof import analyze_translation_safety
+from wolf_semantics import AUTO_ANALYSIS_SCHEMA
 from wolf_tools import (
     CancelledError,
     COPY_FROM_RE,
