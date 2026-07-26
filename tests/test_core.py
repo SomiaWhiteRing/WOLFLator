@@ -87,17 +87,24 @@ from wolf_tools import (
 from wolf_editor import (
     AUTO_ANALYSIS_SCHEMA,
     _AnalysisAudit,
+    _AnalysisState,
     _BlockAnalyzer,
+    _address_variables_for_block,
+    _Command,
     _CommandBlock,
+    _DatabaseType,
     EditorRelease,
     EditorInfo,
     _NumberValue,
     _StringValue,
     _copy_editor_sandbox,
+    _calculate_numbers,
+    _loop_identity,
     _legacy_conversion_action,
     _database_index,
     _editor_execution_lock,
     _inspect_matching_runtime,
+    _merge_states,
     _merge_numbers,
     _merge_strings,
     _restore_editor_map_paths,
@@ -1042,7 +1049,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, "schema 11"):
+            with self.assertRaisesRegex(ValueError, f"schema {AUTO_ANALYSIS_SCHEMA}"):
                 analyze_import_protection(
                     items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
                 )
@@ -1069,7 +1076,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": 11,
+                "schema": AUTO_ANALYSIS_SCHEMA,
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -2111,6 +2118,18 @@ class WorkbookAndFontTests(unittest.TestCase):
         self.assertEqual(
             ["display_only", "display_storage"], usage[item.key]
         )
+        transport = {
+            "kind": "state",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "database_cells": display["database_cells"],
+        }
+        usage, _ = _translation_usage_report((), [item], [writer, display, transport])
+        self.assertEqual(
+            ["display_only", "display_storage"], usage[item.key]
+        )
+        self.assertTrue(writer["display_sink_proven"])
         logic = {
             "kind": "condition",
             "source_keys": [item.key],
@@ -2120,8 +2139,9 @@ class WorkbookAndFontTests(unittest.TestCase):
         }
         usage, _ = _translation_usage_report((), [item], [writer, display, logic])
         self.assertEqual(
-            ["display_only", "display_storage", "logic"], usage[item.key]
+            ["display_storage", "logic"], usage[item.key]
         )
+        self.assertFalse(writer["display_sink_proven"])
 
     def test_database_display_sink_requires_exact_cell(self):
         item = TranslationItem(
@@ -2154,6 +2174,270 @@ class WorkbookAndFontTests(unittest.TestCase):
 
         self.assertEqual(["display_storage"], usage[item.key])
         self.assertFalse(writer["display_sink_proven"])
+
+    def test_dynamic_database_sink_requires_same_selector_and_display_only(self):
+        item = TranslationItem(
+            key="display_payload",
+            original="状态提示",
+            translation="状态说明",
+            code="COMMON-1-0-0",
+        )
+        selector = {
+            "database": "CDB",
+            "type": 58,
+            "field": 1,
+            "selector": "event-input:1600022",
+            "auto_file": "CommonEvent.dat.Auto.txt",
+            "event_type": "common",
+            "event_id": 44,
+            "page": 0,
+        }
+        writer = {
+            "kind": "resource",
+            "resource_role": "database_string_write",
+            "source_keys": [item.key],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "command": 3,
+            "target_database_cells": [],
+            "target_database_selectors": [selector],
+        }
+        display = {
+            "kind": "display",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "command": 4,
+            "database_cells": [],
+            "database_selectors": [selector],
+        }
+
+        usage, _ = _translation_usage_report((), [item], [writer, display])
+        self.assertTrue(writer["display_sink_proven"])
+        self.assertEqual(["display_only", "display_storage"], usage[item.key])
+
+        condition = {
+            "kind": "condition",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "command": 5,
+            "database_cells": [],
+            "database_selectors": [selector],
+        }
+        _translation_usage_report((), [item], [writer, display, condition])
+        self.assertFalse(writer["display_sink_proven"])
+
+    def test_dynamic_database_address_terms_cross_events_without_name_rules(self):
+        base = _NumberValue(None, identity="event-input:writer:1600000")
+        offset = _calculate_numbers(base, _NumberValue(frozenset({2})), 0)
+        self.assertEqual("add:event-input:writer:1600000:2", offset.identity)
+        self.assertEqual("", _merge_numbers(offset, base).identity)
+        self.assertEqual(
+            "loop:const:2:1",
+            _loop_identity(
+                _NumberValue(frozenset({2}), identity="const:2"),
+                _NumberValue(frozenset({3}), identity="add:const:2:1"),
+            ),
+        )
+
+        item = TranslationItem(
+            key="dynamic_payload",
+            original="状态提示",
+            translation="状态说明",
+            code="COMMON-44-0-0",
+        )
+        selector = {
+            "database": "CDB",
+            "type": 58,
+            "field": 1,
+            "selector": offset.identity,
+            "auto_file": "",
+            "event_type": "address-expression",
+            "event_id": -1,
+            "page": -1,
+        }
+        writer = {
+            "kind": "resource",
+            "resource_role": "database_string_write",
+            "source_keys": [item.key],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "command": 99,
+            "target_database_cells": [],
+            "target_database_selectors": [selector],
+        }
+        display = {
+            "kind": "display",
+            "source_keys": [],
+            "right_source_keys": [],
+            "condition_keys": [],
+            "command": 1,
+            "database_cells": [],
+            "database_selectors": [selector],
+        }
+        usage, _ = _translation_usage_report((), [item], [writer, display])
+        self.assertTrue(writer["display_sink_proven"])
+        self.assertEqual(["display_only", "display_storage"], usage[item.key])
+
+    def test_dynamic_numeric_database_address_round_trips_only_exact_selector(self):
+        database = _DatabaseType(
+            "CDB", 0, "", {0: "field"}, {0: 0}, (("0",),), ("row",)
+        )
+        block = _CommandBlock("Auto", "common", 1, "", 0, ())
+        analyzer = _BlockAnalyzer(
+            block, {"CDB": {0: database}}, {}, {}, audit=_AnalysisAudit.empty()
+        )
+        state = _AnalysisState(
+            {
+                1_600_000: _NumberValue(None, identity="caller-selector"),
+                1_600_001: _NumberValue(None, identity="callee-selector"),
+            },
+            {},
+            {},
+        )
+        writer = _Command(250, (0, 1_600_000, 0, 0, 1_600_001), ("",) * 4, 0, "")
+        analyzer._write_database_number(writer, state, "CDB", 0)
+        reader = _Command(250, (0, 1_600_000, 0, 0x1000, 1_600_002), ("",) * 4, 0, "")
+        analyzer._database(reader, 0, state)
+        self.assertEqual("callee-selector", state.numbers[1_600_002].identity)
+
+        wrong_reader = _Command(250, (0, 1_600_001, 0, 0x1000, 1_600_003), ("",) * 4, 0, "")
+        analyzer._database(wrong_reader, 1, state)
+        self.assertNotEqual("callee-selector", state.numbers[1_600_003].identity)
+
+    def test_dynamic_database_string_round_trip_survives_persistent_state(self):
+        database = _DatabaseType(
+            "CDB", 0, "", {0: "text"}, {0: 2000}, (("",),), ("row",)
+        )
+        block = _CommandBlock("Auto", "common", 1, "", 0, ())
+        analyzer = _BlockAnalyzer(
+            block, {"CDB": {0: database}}, {}, {}, audit=_AnalysisAudit.empty()
+        )
+        writer_state = _AnalysisState(
+            {1_600_000: _NumberValue(None, identity="shared-selector")},
+            {
+                1_600_001: _StringValue(
+                    source_keys=frozenset({"payload"}),
+                    literals=frozenset({"translated"}),
+                )
+            },
+            {},
+        )
+        writer = _Command(250, (0, 1_600_000, 0, 0, 1_600_001), ("",) * 4, 0, "")
+        analyzer._database(writer, 0, writer_state)
+
+        persistent = _merge_states([writer_state, _AnalysisState({}, {}, {})])
+        reader_state = _AnalysisState(
+            {1_600_000: _NumberValue(None, identity="shared-selector")},
+            {},
+            {},
+            dynamic_database_strings=dict(persistent.dynamic_database_strings),
+        )
+        reader = _Command(250, (0, 1_600_000, 0, 0x1000, 1_600_002), ("",) * 4, 0, "")
+        analyzer._database(reader, 1, reader_state)
+        self.assertEqual(
+            frozenset({"payload"}), reader_state.strings[1_600_002].source_keys
+        )
+
+        reader_state.numbers[1_600_000] = _NumberValue(None, identity="other-selector")
+        analyzer._database(reader, 2, reader_state)
+        self.assertNotIn("payload", reader_state.strings[1_600_002].source_keys)
+
+    def test_dynamic_database_writer_selector_is_an_address_source(self):
+        block = _CommandBlock(
+            "Auto",
+            "common",
+            1,
+            "",
+            0,
+            (_Command(250, (0, 1_600_022, 0, 0), ("",) * 4, 0, ""),),
+        )
+        self.assertEqual(frozenset({1_600_022}), _address_variables_for_block(block))
+
+    def test_translation_safety_allows_unread_loop_file_content_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "[COMMON_EVENT_TEXT_OUTPUT]\nCOMMON_EVENT_NUM=0\n",
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="credit_line",
+                original="制作",
+                translation="制作人员",
+                code="COMMON-1-0-0",
+                category=ImportCategory.DISPLAY,
+            )
+            editor = EditorInfo(
+                root / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            analysis = analyze_auto_export(root / "Auto", [item], editor, input_hash="input")
+            analysis["usage_by_key"] = {item.key: ["display_only"]}
+            analysis["command_catalog"] = {
+                "opaque_effects": 0,
+                **{
+                    field: {"ratio": 1.0}
+                    for field in (
+                        "semantic_coverage",
+                        "cfg_coverage",
+                        "call_target_coverage",
+                        "data_effect_coverage",
+                    )
+                },
+            }
+            analysis["global_string_flow"] = {"converged": True}
+            content_write = {
+                "kind": "resource",
+                "resource_role": "file_content_runtime_write",
+                "auto_file": "CommonEvent.dat.Auto.txt",
+                "event_type": "common",
+                "event_id": 1,
+                "page": 0,
+                "command": 4,
+                "string_index": -1,
+                "condition_keys": [],
+                "source_keys": [item.key],
+                "right_source_keys": [],
+                "resource_values": [item.original],
+                "resource_path_values": ["credit.txt"],
+                "status": "dynamic",
+                "reason": "控制流回边扩大为运行时字符串",
+            }
+            analysis["dependencies"] = [content_write]
+            with mock.patch("wolf_editor.analyze_auto_export", return_value=analysis):
+                safety = analyze_translation_safety(
+                    root / "Auto", [item], {item.key: item.translation}, "warn", analysis=analysis
+                )
+            self.assertEqual([item.key], safety["safe_to_translate"])
+
+            analysis["dependencies"].append({
+                "kind": "resource",
+                "resource_role": "file_path_runtime_read",
+                "auto_file": "CommonEvent.dat.Auto.txt",
+                "event_type": "common",
+                "event_id": 1,
+                "page": 0,
+                "command": 5,
+                "string_index": -1,
+                "condition_keys": [],
+                "source_keys": [],
+                "right_source_keys": [],
+                "source_values": [".\\credit.txt"],
+                "status": "resolved",
+                "reason": "",
+            })
+            with mock.patch("wolf_editor.analyze_auto_export", return_value=analysis):
+                safety = analyze_translation_safety(
+                    root / "Auto", [item], {item.key: item.translation}, "warn", analysis=analysis
+                )
+            self.assertEqual([item.key], safety["keep_original"])
+            self.assertIn("file_content_not_proven_display_only", safety["reasons"][item.key])
 
     def test_translation_safety_protects_cross_event_database_condition(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2243,7 +2527,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 [{"database": "UDB", "type": 0, "data": 0, "field": 1}],
                 writer["target_database_cells"],
             )
-            self.assertTrue(writer["display_sink_proven"])
+            self.assertFalse(writer["display_sink_proven"])
             self.assertEqual([item.key], condition["source_keys"])
             self.assertEqual(
                 ["display_only", "display_storage", "logic"],
@@ -2259,7 +2543,9 @@ class WorkbookAndFontTests(unittest.TestCase):
             )
             self.assertEqual([], safety["safe_to_translate"])
             self.assertEqual([item.key], safety["keep_original"])
-            self.assertIn("condition_truth_change", safety["reasons"][item.key])
+            self.assertIn(
+                "database_storage_without_display_sink", safety["reasons"][item.key]
+            )
 
     def test_translation_safety_allows_global_state_only_without_field_names(self):
         with tempfile.TemporaryDirectory() as directory:

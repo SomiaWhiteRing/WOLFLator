@@ -4,6 +4,7 @@ import csv
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -16,7 +17,8 @@ import urllib.request
 import zipfile
 from collections import Counter, deque
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path, PurePath
 from typing import Callable, Iterable, Iterator
@@ -51,7 +53,7 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 11
+AUTO_ANALYSIS_SCHEMA = 14
 TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
@@ -251,6 +253,7 @@ class _NumberValue:
     values: frozenset[int] | None
     reason: str = ""
     tracked: bool = False
+    identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -262,6 +265,8 @@ class _StringValue:
     symbolic_all: bool = False
     scopes: frozenset[str] = frozenset()
     literals: frozenset[str] | None = frozenset()
+    database_selectors: frozenset[tuple[str, int, int, str, str, str, int, int]] = frozenset()
+    loop_source_keys: frozenset[str] = frozenset()
 
     @property
     def tracked(self) -> bool:
@@ -273,6 +278,15 @@ class _AnalysisState:
     numbers: dict[int, _NumberValue]
     strings: dict[int, _StringValue]
     database_strings: dict[tuple[str, int, int, int], _StringValue]
+    database_numbers: dict[tuple[str, int, int, int], _NumberValue] = field(
+        default_factory=dict
+    )
+    dynamic_database_numbers: dict[tuple[str, int, int, str], _NumberValue] = field(
+        default_factory=dict
+    )
+    dynamic_database_strings: dict[tuple[str, int, int, str], _StringValue] = field(
+        default_factory=dict
+    )
     unknown_scopes: frozenset[str] = frozenset()
     unknown_reasons: frozenset[str] = frozenset()
 
@@ -281,6 +295,9 @@ class _AnalysisState:
             dict(self.numbers),
             dict(self.strings),
             dict(self.database_strings),
+            dict(self.database_numbers),
+            dict(self.dynamic_database_numbers),
+            dict(self.dynamic_database_strings),
             self.unknown_scopes,
             self.unknown_reasons,
         )
@@ -1389,16 +1406,62 @@ def _limited(values: set[int]) -> frozenset[int] | None:
     return frozenset(values) if len(values) <= _VALUE_LIMIT else None
 
 
-def _number_argument(raw: int, state: _AnalysisState) -> _NumberValue:
+def _number_argument(
+    raw: int, state: _AnalysisState, *, identity_scope: str = ""
+) -> _NumberValue:
     if raw < 1_000_000:
         return _NumberValue(frozenset({raw}))
-    return state.numbers.get(raw, _NumberValue(None, f"变量 {raw} 的数值来源未知"))
+    return state.numbers.get(
+        raw,
+        _NumberValue(
+            None,
+            f"变量 {raw} 的数值来源未知",
+            identity=(
+                f"event-input:{identity_scope}:{raw}"
+                if identity_scope
+                else f"event-input:{raw}"
+            ),
+        ),
+    )
+
+
+def _number_offset_identity(value: _NumberValue, offset: int) -> str:
+    if not value.identity:
+        return ""
+    if offset == 0:
+        return value.identity
+    return f"add:{value.identity}:{offset}"
+
+
+def _loop_identity(left: _NumberValue | None, right: _NumberValue | None) -> str:
+    if left is None or right is None or not left.identity or not right.identity:
+        return ""
+    prefix = f"add:{left.identity}:"
+    if not right.identity.startswith(prefix):
+        return ""
+    try:
+        step = int(right.identity[len(prefix):])
+    except ValueError:
+        return ""
+    if step == 0:
+        return ""
+    return left.identity if left.identity.startswith("loop:") else f"loop:{left.identity}:{step}"
 
 
 def _calculate_numbers(left: _NumberValue, right: _NumberValue, operator: int) -> _NumberValue:
     tracked = left.tracked or right.tracked
+    identity = ""
+    if operator == 0:
+        if right.values is not None and len(right.values) == 1:
+            identity = _number_offset_identity(left, next(iter(right.values)))
+        elif left.values is not None and len(left.values) == 1:
+            identity = _number_offset_identity(right, next(iter(left.values)))
+    elif operator == 1 and right.values is not None and len(right.values) == 1:
+        identity = _number_offset_identity(left, -next(iter(right.values)))
     if left.values is None or right.values is None:
-        return _NumberValue(None, left.reason or right.reason or "数值运算来源未知", tracked)
+        return _NumberValue(
+            None, left.reason or right.reason or "数值运算来源未知", tracked, identity
+        )
     output: set[int] = set()
     try:
         for a in left.values:
@@ -1406,10 +1469,10 @@ def _calculate_numbers(left: _NumberValue, right: _NumberValue, operator: int) -
                 output.add({0: lambda: a + b, 1: lambda: a - b, 2: lambda: a * b,
                             3: lambda: a // b, 4: lambda: a % b}[operator]())
                 if len(output) > _VALUE_LIMIT:
-                    return _NumberValue(None, "数值集合超过 256 项", tracked)
+                    return _NumberValue(None, "数值集合超过 256 项", tracked, identity)
     except (KeyError, ZeroDivisionError):
         return _NumberValue(None, f"未支持或无效的数值运算 {operator}", tracked)
-    return _NumberValue(frozenset(output), tracked=tracked)
+    return _NumberValue(frozenset(output), tracked=tracked, identity=identity)
 
 
 def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _NumberValue | None:
@@ -1426,9 +1489,56 @@ def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _Nu
         assert value is not None
         return _NumberValue(None, "控制流仅在部分分支赋值", value.tracked)
     if left.values is None or right.values is None:
-        return _NumberValue(None, left.reason or right.reason, left.tracked or right.tracked)
+        return _NumberValue(
+            None,
+            left.reason or right.reason,
+            left.tracked or right.tracked,
+            left.identity if left.identity == right.identity else "",
+        )
     values = _limited(set(left.values) | set(right.values))
-    return _NumberValue(values, "数值集合超过 256 项" if values is None else "", left.tracked or right.tracked)
+    return _NumberValue(
+        values,
+        "数值集合超过 256 项" if values is None else "",
+        left.tracked or right.tracked,
+        left.identity if left.identity == right.identity else "",
+    )
+
+
+def _number_semantic_key(value: _NumberValue) -> tuple[object, ...]:
+    return value.values, value.tracked, value.identity
+
+
+@lru_cache(maxsize=None)
+def _address_variables_for_block(block: _CommandBlock) -> frozenset[int]:
+    """Find numeric slots that can structurally reach a dynamic DB row selector."""
+    variables: set[int] = set()
+    for command in block.commands:
+        if command.opcode != 250 or len(command.ints) not in {4, 5}:
+            continue
+        if command.ints[1] >= 1_000_000:
+            variables.add(command.ints[1])
+    changed = True
+    while changed:
+        changed = False
+        for command in block.commands:
+            if command.opcode == 121 and len(command.ints) >= 4:
+                destination = command.ints[0] & 0x00FFFFFF
+                if destination not in variables:
+                    continue
+                for raw in command.ints[1:3]:
+                    if raw >= 1_000_000 and raw not in variables:
+                        variables.add(raw)
+                        changed = True
+            elif command.opcode == 250 and len(command.ints) == 5:
+                flags = command.ints[3]
+                if not (flags >> 8 & 0x10):
+                    continue
+                destination = command.ints[4] & 0x00FFFFFF
+                raw = command.ints[1]
+                if destination in variables and raw >= 1_000_000 and raw not in variables:
+                    variables.add(raw)
+                    changed = True
+    return frozenset(variables)
 
 
 def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _StringValue | None:
@@ -1455,11 +1565,15 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             value.symbolic_all,
             value.scopes,
             value.literals,
+            value.database_selectors,
+            value.loop_source_keys,
         )
     keys = set(left.source_keys) | set(right.source_keys)
     cells = set(left.cells) | set(right.cells)
     symbolic_all = left.symbolic_all or right.symbolic_all
     scopes = left.scopes | right.scopes
+    database_selectors = left.database_selectors | right.database_selectors
+    loop_source_keys = left.loop_source_keys | right.loop_source_keys
     literals = (
         None
         if left.literals is None or right.literals is None
@@ -1474,6 +1588,8 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             symbolic_all=True,
             scopes=scopes or frozenset({"project"}),
             literals=literals,
+            database_selectors=database_selectors,
+            loop_source_keys=loop_source_keys,
         )
     return _StringValue(
         frozenset(keys),
@@ -1483,6 +1599,8 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
         symbolic_all,
         scopes,
         literals,
+        database_selectors,
+        loop_source_keys,
     )
 
 
@@ -1497,6 +1615,8 @@ def _with_literals(
         value.symbolic_all,
         value.scopes,
         literals,
+        value.database_selectors,
+        value.loop_source_keys,
     )
 
 
@@ -1622,6 +1742,38 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
                 )
             ) is not None
         }
+        result.database_numbers = {
+            key: value
+            for key in set(result.database_numbers) | set(state.database_numbers)
+            if (
+                value := _merge_numbers(
+                    result.database_numbers.get(key), state.database_numbers.get(key)
+                )
+            ) is not None
+        }
+        result.dynamic_database_numbers = {
+            key: value
+            for key in set(result.dynamic_database_numbers) | set(state.dynamic_database_numbers)
+            if (
+                value := _merge_numbers(
+                    result.dynamic_database_numbers.get(key),
+                    state.dynamic_database_numbers.get(key),
+                )
+            ) is not None
+        }
+        result.dynamic_database_strings = {
+            key: value
+            for key in (
+                set(result.dynamic_database_strings)
+                | set(state.dynamic_database_strings)
+            )
+            if (
+                value := _merge_strings(
+                    result.dynamic_database_strings.get(key),
+                    state.dynamic_database_strings.get(key),
+                )
+            ) is not None
+        }
         result.unknown_scopes = result.unknown_scopes | state.unknown_scopes
         result.unknown_reasons = result.unknown_reasons | state.unknown_reasons
     return result
@@ -1630,7 +1782,7 @@ def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
 def _state_cache_key(state: _AnalysisState) -> tuple[object, ...]:
     local_numbers = tuple(
         sorted(
-            (key, value.values, value.tracked)
+            (key, *_number_semantic_key(value))
             for key, value in state.numbers.items()
             if 1_600_000 <= key < 1_600_100
         )
@@ -1648,7 +1800,29 @@ def _state_cache_key(state: _AnalysisState) -> tuple[object, ...]:
             for key, value in state.database_strings.items()
         )
     )
-    return (local_numbers, local_strings, database)
+    database_numbers = tuple(
+        sorted((key, *_number_semantic_key(value)) for key, value in state.database_numbers.items())
+    )
+    dynamic_database_numbers = tuple(
+        sorted(
+            (key, *_number_semantic_key(value))
+            for key, value in state.dynamic_database_numbers.items()
+        )
+    )
+    dynamic_database_strings = tuple(
+        sorted(
+            (key, _string_semantic_key(value))
+            for key, value in state.dynamic_database_strings.items()
+        )
+    )
+    return (
+        local_numbers,
+        local_strings,
+        database,
+        database_numbers,
+        dynamic_database_numbers,
+        dynamic_database_strings,
+    )
 
 
 def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
@@ -1659,6 +1833,7 @@ def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
         value.symbolic_all,
         value.scopes,
         value.literals,
+        value.database_selectors,
     )
 
 
@@ -1668,8 +1843,7 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
     if left.numbers.keys() != right.numbers.keys():
         return False
     if any(
-        value.values != right.numbers[key].values
-        or value.tracked != right.numbers[key].tracked
+        _number_semantic_key(value) != _number_semantic_key(right.numbers[key])
         for key, value in left.numbers.items()
     ):
         return False
@@ -1678,10 +1852,27 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
         for key, value in left.strings.items()
     ):
         return False
-    return left.database_strings.keys() == right.database_strings.keys() and not any(
+    if left.database_strings.keys() != right.database_strings.keys() or any(
         _string_semantic_key(value)
         != _string_semantic_key(right.database_strings[key])
         for key, value in left.database_strings.items()
+    ):
+        return False
+    if left.database_numbers.keys() != right.database_numbers.keys() or any(
+        _number_semantic_key(value) != _number_semantic_key(right.database_numbers[key])
+        for key, value in left.database_numbers.items()
+    ):
+        return False
+    if left.dynamic_database_numbers.keys() != right.dynamic_database_numbers.keys() or any(
+        _number_semantic_key(value)
+        != _number_semantic_key(right.dynamic_database_numbers[key])
+        for key, value in left.dynamic_database_numbers.items()
+    ):
+        return False
+    return left.dynamic_database_strings.keys() == right.dynamic_database_strings.keys() and not any(
+        _string_semantic_key(value)
+        != _string_semantic_key(right.dynamic_database_strings[key])
+        for key, value in left.dynamic_database_strings.items()
     )
 
 
@@ -1800,6 +1991,8 @@ class _BlockAnalyzer:
         self.unknown_locations: dict[tuple[int, str], list[str]] = {}
         self._unknown_seen: set[tuple[int, str, str]] = set()
         self.summary_failed = ""
+        self.output_state = _AnalysisState({}, {}, {})
+        self._address_variables = _address_variables_for_block(block)
         labels: dict[str, list[int]] = {}
         for position, command in enumerate(block.commands):
             if command.opcode == 212 and len(command.strings) == 1:
@@ -1815,6 +2008,21 @@ class _BlockAnalyzer:
 
     def _command_id(self, index: int) -> str:
         return f"{self.block.source}:{self.block.event_type}:{self.block.event_id}:{self.block.page}:{index + 1}"
+
+    def _number(self, raw: int, state: _AnalysisState) -> _NumberValue:
+        """Resolve ordinary numbers without widening call summaries by identity."""
+        return _number_argument(raw, state)
+
+    def _address_number(self, raw: int, state: _AnalysisState) -> _NumberValue:
+        """Resolve a number that statically reaches a dynamic database address."""
+        return _number_argument(
+            raw,
+            state,
+            identity_scope=(
+                f"{self.block.source}:{self.block.event_type}:"
+                f"{self.block.event_id}:{self.block.page}"
+            ),
+        )
 
     def _record_call(
         self, command_id: str, status: str, targets: Iterable[str]
@@ -2006,6 +2214,21 @@ class _BlockAnalyzer:
                     for cell in sorted(value.cells)
                 ],
                 "right_database_cells": [],
+                "database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(value.database_selectors)
+                ],
+                "right_database_selectors": [],
+                "target_database_selectors": [],
                 "trace": list(value.trace),
                 "right_trace": [],
                 "unresolved_scopes": sorted(value.scopes),
@@ -2022,9 +2245,20 @@ class _BlockAnalyzer:
         scopes: frozenset[str] = frozenset(),
         global_string_variable: int | None = None,
         target_database_cells: Iterable[tuple[str, int, int, int]] = (),
+        target_database_selectors: Iterable[
+            tuple[str, int, int, str, str, str, int, int]
+        ] = (),
+        resource_path_values: frozenset[str] | None = None,
     ) -> None:
-        if not value.tracked:
+        if not value.tracked and role not in {
+            "file_path_runtime_read",
+            "file_path_runtime_write",
+            "file_content_runtime_write",
+        }:
             return
+        source_keys = value.source_keys
+        if role == "file_content_runtime_write":
+            source_keys = source_keys | value.loop_source_keys
         status, reason = _string_value_status(value)
         dependency = {
             "kind": (
@@ -2046,7 +2280,7 @@ class _BlockAnalyzer:
             "operator": "value_boundary",
             "literal": "",
             "right_is_variable": False,
-            "source_keys": sorted(value.source_keys),
+            "source_keys": sorted(source_keys),
             "right_source_keys": [],
             "database_cells": [
                 {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
@@ -2057,6 +2291,33 @@ class _BlockAnalyzer:
                 {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
                 for cell in sorted(target_database_cells)
             ],
+            "database_selectors": [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(value.database_selectors)
+            ],
+            "right_database_selectors": [],
+            "target_database_selectors": [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(target_database_selectors)
+            ],
             "trace": list(value.trace),
             "right_trace": [],
             "unresolved_scopes": sorted(value.scopes | scopes),
@@ -2066,6 +2327,11 @@ class _BlockAnalyzer:
             "global_string_variable": global_string_variable,
             "source_values": (
                 sorted(value.literals) if value.literals is not None else None
+            ),
+            "resource_path_values": (
+                sorted(resource_path_values)
+                if resource_path_values is not None
+                else None
             ),
         }
         self.dependencies.append(dependency)
@@ -2157,7 +2423,7 @@ class _BlockAnalyzer:
         if flags & 0x01:
             name = command.strings[1] if len(command.strings) > 1 else ""
             return {type_id for type_id, item in types.items() if item.name == name}
-        value = _number_argument(command.ints[0], state)
+        value = self._number(command.ints[0], state)
         if value.values is None:
             return None
         selected = set(value.values)
@@ -2168,10 +2434,37 @@ class _BlockAnalyzer:
     def _selector(
         self, raw: int, state: _AnalysisState, *, unknown_means_all: bool
     ) -> set[int] | None:
-        value = _number_argument(raw, state)
+        value = self._number(raw, state)
         if value.values is None:
             return set() if unknown_means_all else None
         return set(value.values)
+
+    def _dynamic_database_selectors(
+        self,
+        database: str,
+        type_ids: Iterable[int],
+        field_ids: Iterable[int],
+        data_raw: int,
+        state: _AnalysisState,
+    ) -> frozenset[tuple[str, int, int, str, str, str, int, int]]:
+        """Return a canonical selector only when its numeric source is exact."""
+        value = self._address_number(data_raw, state)
+        if not value.identity:
+            return frozenset()
+        return frozenset(
+            (
+                database,
+                type_id,
+                field_id,
+                value.identity,
+                "",
+                "address-expression",
+                -1,
+                -1,
+            )
+            for type_id in type_ids
+            for field_id in field_ids
+        )
 
     def _database(self, command: _Command, index: int, state: _AnalysisState) -> None:
         if len(command.ints) not in {4, 5}:
@@ -2194,19 +2487,36 @@ class _BlockAnalyzer:
             or (not any(command.strings) and write_value is None)
         )
         if not is_read:
-            if command.strings or write_value is not None:
+            write_type_ids = self._type_ids(database, command, byte2, state)
+            write_field_ids = (
+                {
+                    field_id
+                    for type_id in write_type_ids or ()
+                    for field_id, name in self.databases[database][type_id].field_names.items()
+                    if name == (command.strings[3] if len(command.strings) > 3 else "")
+                }
+                if byte2 & 0x04
+                else self._selector(command.ints[2], state, unknown_means_all=False) or set()
+            )
+            string_write = any(
+                self.databases[database][type_id].field_types.get(field_id, 0) >= 2000
+                for type_id in write_type_ids or ()
+                for field_id in write_field_ids
+            )
+            if string_write or write_value is not None:
                 self._write_database_string(
                     command, index, state, database, byte2, write_value
                 )
+            elif write_type_ids and write_field_ids:
+                self._write_database_number(command, state, database, byte2)
             else:
-                type_ids = self._type_ids(database, command, byte2, state)
                 scopes = frozenset(
                     f"database:{database}:{type_id}:*:*"
-                    for type_id in (type_ids or self.databases.get(database, {}))
+                    for type_id in (write_type_ids or self.databases.get(database, {}))
                 ) or frozenset({f"database:{database}:*:*:*"})
                 # Numeric DB writes cannot carry translated strings, but their
                 # affected range is still part of the side-effect ledger.
-                if not type_ids:
+                if not write_type_ids:
                     self.audit.data_effects[self._command_id(index)] = (
                         "conservative",
                         tuple(sorted(scopes)),
@@ -2357,6 +2667,7 @@ class _BlockAnalyzer:
         keys: set[str] = set()
         string_values: set[str] = set()
         numeric_values: set[int] = set()
+        numeric_coordinates: set[tuple[str, int, int, int]] = set()
         string_field = False
         for type_id in type_ids:
             db_type = self.databases[database].get(type_id)
@@ -2394,6 +2705,7 @@ class _BlockAnalyzer:
                             cells.add(coordinate)
                             string_values.add(db_type.rows[data_id][field_id])
                     else:
+                        numeric_coordinates.add(coordinate)
                         try:
                             numeric_values.add(int(db_type.rows[data_id][field_id]))
                         except ValueError:
@@ -2408,6 +2720,41 @@ class _BlockAnalyzer:
                 for type_id in type_ids
                 for field_id in field_ids
             )
+            database_selectors = (
+                self._dynamic_database_selectors(
+                    database, type_ids, field_ids, data_raw, state
+                )
+                if data_all
+                else frozenset()
+            )
+            selector_identity = (
+                self._address_number(data_raw, state).identity if data_all else ""
+            )
+            runtime_value: _StringValue | None = None
+            if selector_identity:
+                for type_id in type_ids:
+                    for field_id in field_ids:
+                        stored = state.dynamic_database_strings.get(
+                            (database, type_id, field_id, selector_identity)
+                        )
+                        if stored is not None:
+                            runtime_value = _merge_strings(runtime_value, stored) or stored
+            if runtime_value is not None:
+                # A matching dynamic write overwrites the selected row. Do not
+                # union unrelated static rows merely because the row number is
+                # unknown to the static analyzer.
+                state.strings[destination] = _StringValue(
+                    runtime_value.source_keys,
+                    runtime_value.cells,
+                    tuple(dict.fromkeys((*runtime_value.trace, *trace))),
+                    runtime_value.unknown,
+                    runtime_value.symbolic_all,
+                    runtime_value.scopes,
+                    runtime_value.literals,
+                    runtime_value.database_selectors | database_selectors,
+                    runtime_value.loop_source_keys,
+                )
+                return
             if len(keys) + len(cells) > _VALUE_LIMIT:
                 state.strings[destination] = _StringValue(
                     trace=trace,
@@ -2415,6 +2762,7 @@ class _BlockAnalyzer:
                     symbolic_all=True,
                     scopes=scopes,
                     literals=None,
+                    database_selectors=database_selectors,
                 )
             else:
                 state.strings[destination] = _StringValue(
@@ -2428,12 +2776,97 @@ class _BlockAnalyzer:
                         if len(string_values) <= _STRING_LITERAL_LIMIT
                         else None
                     ),
+                    database_selectors=database_selectors,
                 )
         elif numeric_values:
             values = _limited(numeric_values)
-            state.numbers[destination] = _NumberValue(
-                values, "数据库数值集合超过 256 项" if values is None else "", True
+            selector_identity = (
+                self._address_number(data_raw, state).identity if data_all else ""
             )
+            runtime_values = [
+                state.dynamic_database_numbers[(database, type_id, field_id, selector_identity)]
+                for type_id in type_ids
+                for field_id in field_ids
+                if selector_identity
+                and (database, type_id, field_id, selector_identity)
+                in state.dynamic_database_numbers
+            ]
+            if not data_all:
+                runtime_values.extend(
+                    state.database_numbers[coordinate]
+                    for coordinate in numeric_coordinates
+                    if coordinate in state.database_numbers
+                )
+            if runtime_values:
+                state.numbers[destination] = _merge_states(
+                    [
+                        _AnalysisState({destination: value}, {}, {})
+                        for value in runtime_values
+                    ]
+                ).numbers[destination]
+            else:
+                identity = (
+                    f"database-read:{database}:{next(iter(type_ids))}:"
+                    f"{next(iter(field_ids))}:{selector_identity}"
+                    if destination in self._address_variables
+                    and data_all
+                    and selector_identity
+                    and len(type_ids) == len(field_ids) == 1
+                    else ""
+                )
+                state.numbers[destination] = _NumberValue(
+                    values,
+                    "数据库数值集合超过 256 项" if values is None else "",
+                    True,
+                    identity,
+                )
+
+    def _write_database_number(
+        self,
+        command: _Command,
+        state: _AnalysisState,
+        database: str,
+        selector_flags: int,
+    ) -> None:
+        type_ids = self._type_ids(database, command, selector_flags, state)
+        if not type_ids or len(command.ints) < 5:
+            return
+        data_ids = (
+            {
+                data_id
+                for type_id in type_ids
+                for data_id, name in enumerate(self.databases[database][type_id].data_names)
+                if name == (command.strings[2] if len(command.strings) > 2 else "")
+            }
+            if selector_flags & 0x02
+            else self._selector(command.ints[1], state, unknown_means_all=False) or set()
+        )
+        field_ids = (
+            {
+                field_id
+                for type_id in type_ids
+                for field_id, name in self.databases[database][type_id].field_names.items()
+                if name == (command.strings[3] if len(command.strings) > 3 else "")
+            }
+            if selector_flags & 0x04
+            else self._selector(command.ints[2], state, unknown_means_all=False) or set()
+        )
+        value = self._number(command.ints[4], state)
+        if not value.identity:
+            # ponytail: Literal numeric writes cannot preserve a dynamic address
+            # relationship, so retaining them only multiplies call summaries.
+            return
+        for type_id in type_ids:
+            for field_id in field_ids:
+                if data_ids:
+                    for data_id in data_ids:
+                        state.database_numbers[(database, type_id, data_id, field_id)] = value
+                    continue
+                selector_identity = self._address_number(command.ints[1], state).identity
+                if selector_identity:
+                    state.dynamic_database_numbers[
+                        (database, type_id, field_id, selector_identity)
+                    ] = value
 
     def _write_database_string(
         self,
@@ -2480,6 +2913,13 @@ class _BlockAnalyzer:
             for data_id in data_ids
             for field_id in field_ids
         }
+        database_selectors = (
+            self._dynamic_database_selectors(
+                database, type_ids, field_ids, command.ints[1], state
+            )
+            if not data_ids
+            else frozenset()
+        )
         if len(coordinates) > _VALUE_LIMIT:
             scopes = frozenset(
                 f"database:{database}:{type_id}:*:{field_id}"
@@ -2498,6 +2938,8 @@ class _BlockAnalyzer:
             value = self._literal_string(command, index, 0, state)
         for coordinate in coordinates:
             state.database_strings[coordinate] = value
+        for selector in database_selectors:
+            state.dynamic_database_strings[selector[:4]] = value
         field_scopes = frozenset(
             f"database:{database}:{type_id}:*:{field_id}"
             for type_id in type_ids
@@ -2515,6 +2957,7 @@ class _BlockAnalyzer:
                 for item in coordinates
             ),
             target_database_cells=coordinates,
+            target_database_selectors=database_selectors,
         )
 
     def _set_runtime_value(
@@ -2584,8 +3027,13 @@ class _BlockAnalyzer:
         destination, left_raw, right_raw, flags = command.ints[:4]
         byte0 = flags & 0xFF
         byte1 = (flags >> 8) & 0xFF
-        left = _number_argument(left_raw, state)
-        right = _number_argument(right_raw, state)
+        resolver = (
+            self._address_number
+            if destination in self._address_variables
+            else self._number
+        )
+        left = resolver(left_raw, state)
+        right = resolver(right_raw, state)
         if byte0:
             state.numbers[destination] = _NumberValue(
                 None,
@@ -2598,6 +3046,13 @@ class _BlockAnalyzer:
             right,
             (byte1 >> 4) & 0x0F,
         )
+        if (
+            destination in self._address_variables
+            and not value.identity
+            and value.values is not None
+            and len(value.values) == 1
+        ):
+            value = replace(value, identity=f"const:{next(iter(value.values))}")
         assignment = byte1 & 0x0F
         if assignment == 0:
             state.numbers[destination] = value
@@ -2679,7 +3134,7 @@ class _BlockAnalyzer:
                 ),
             )
         elif source_kind == 2:
-            pointer = _number_argument(source_raw, state)
+            pointer = self._number(source_raw, state)
             pointed_values: list[_StringValue] = []
             if pointer.values is not None:
                 for raw in pointer.values:
@@ -2716,6 +3171,8 @@ class _BlockAnalyzer:
                 current.symbolic_all if current else False,
                 current.scopes if current else frozenset(),
                 current.literals if current else None,
+                current.database_selectors if current else frozenset(),
+                current.loop_source_keys if current else frozenset(),
             )
             return
         current = state.strings.get(destination)
@@ -2741,6 +3198,8 @@ class _BlockAnalyzer:
                 merged.symbolic_all,
                 merged.scopes,
                 None,
+                merged.database_selectors,
+                merged.loop_source_keys,
             )
 
         if extended_string_operation and assignment in {3, 4, 5}:
@@ -2768,11 +3227,19 @@ class _BlockAnalyzer:
             self._value_boundary_reference(command, index, value, "file_path_runtime_read")
             state.strings[destination] = derived(value, note=f"op={assignment} runtime-read")
         elif assignment == 6:
+            content = derived(current, note="op=6 file-content")
             self._value_boundary_reference(
                 command,
                 index,
-                derived(current, value, note="op=6 file-write"),
+                value,
                 "file_path_runtime_write",
+            )
+            self._value_boundary_reference(
+                command,
+                index,
+                content,
+                "file_content_runtime_write",
+                resource_path_values=value.literals,
             )
             if current is not None:
                 state.strings[destination] = current
@@ -2797,6 +3264,8 @@ class _BlockAnalyzer:
                 f"未支持的 122 赋值运算 {assignment}", value.symbolic_all,
                 value.scopes,
                 None,
+                value.database_selectors,
+                value.loop_source_keys,
             )
         result = state.strings.get(destination)
         if result is None:
@@ -2926,6 +3395,35 @@ class _BlockAnalyzer:
                     {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
                     for cell in sorted(right_value.cells if right_value else ())
                 ],
+                "database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(value.database_selectors if value else ())
+                ],
+                "right_database_selectors": [
+                    {
+                        "database": item[0],
+                        "type": item[1],
+                        "field": item[2],
+                        "selector": item[3],
+                        "auto_file": item[4],
+                        "event_type": item[5],
+                        "event_id": item[6],
+                        "page": item[7],
+                    }
+                    for item in sorted(
+                        right_value.database_selectors if right_value else ()
+                    )
+                ],
+                "target_database_selectors": [],
                 "trace": list(value.trace if value else ()),
                 "right_trace": list(right_value.trace if right_value else ()),
                 "left_values": sorted(value.literals) if value and value.literals is not None else [],
@@ -2960,15 +3458,14 @@ class _BlockAnalyzer:
                 return index
         return None
 
-    @staticmethod
     def _numeric_condition_truth(
-        command: _Command, state: _AnalysisState
+        self, command: _Command, state: _AnalysisState
     ) -> bool | None:
         # Editor 3.713 pretty output confirms flag 2 means numeric equality.
         if len(command.ints) != 4 or command.ints[0] != 1 or command.ints[3] != 2:
             return None
-        left = _number_argument(command.ints[1], state)
-        right = _number_argument(command.ints[2], state)
+        left = self._number(command.ints[1], state)
+        right = self._number(command.ints[2], state)
         if left.values is None or right.values is None:
             return None
         if left.values.isdisjoint(right.values):
@@ -2997,6 +3494,8 @@ class _BlockAnalyzer:
                     current.symbolic_all,
                     current.scopes,
                     None,
+                    current.database_selectors,
+                    current.loop_source_keys,
                 )
         if strings:
             scopes = frozenset({"project"})
@@ -3042,6 +3541,8 @@ class _BlockAnalyzer:
                     True,
                     current.scopes | scopes,
                     None,
+                    current.database_selectors,
+                    current.loop_source_keys,
                 )
             for variable, current in tuple(state.numbers.items()):
                 if 1_600_000 <= variable < 1_600_100:
@@ -3156,7 +3657,7 @@ class _BlockAnalyzer:
         if target is None:
             return None
         choice_value = (
-            _number_argument(command.ints[2], state)
+            self._number(command.ints[2], state)
             if len(command.ints) >= 3
             else _NumberValue(frozenset({0}))
         )
@@ -3320,9 +3821,21 @@ class _BlockAnalyzer:
             self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
             return
 
-        callee_state = _AnalysisState({}, {}, dict(state.database_strings))
+        callee_state = _AnalysisState(
+            {},
+            {},
+            dict(state.database_strings),
+            dict(state.database_numbers),
+            dict(state.dynamic_database_numbers),
+            dict(state.dynamic_database_strings),
+        )
         for offset, raw in enumerate(command.ints[2:string_start]):
-            callee_state.numbers[1_600_000 + offset] = _number_argument(raw, state)
+            resolver = (
+                self._address_number
+                if 1_600_000 + offset in _address_variables_for_block(target)
+                else self._number
+            )
+            callee_state.numbers[1_600_000 + offset] = resolver(raw, state)
         for offset, raw in enumerate(string_arguments):
             destination = 1_600_005 + offset
             if raw >= 1_000_000:
@@ -3346,13 +3859,15 @@ class _BlockAnalyzer:
                     )
                 )
 
-        if not has_return and not any(
-            value.tracked for value in callee_state.strings.values()
-        ):
+        carries_persistent_state = (
+            any(value.tracked for value in callee_state.strings.values())
+            or any(value.identity for value in callee_state.numbers.values())
+        )
+        if not has_return and not carries_persistent_state:
             # ponytail: every public event is analyzed once on its own. Re-enter
-            # only calls carrying translated provenance; otherwise the callee's
-            # local effects are already in the project ledger and inlining just
-            # multiplies identical work at every call site.
+            # only calls carrying translated provenance or an address expression;
+            # root fixed-point propagation covers persistent DB state without
+            # multiplying every unrelated call site.
             return
 
         dispatcher = self._dynamic_entry_dispatcher(target)
@@ -3450,6 +3965,9 @@ class _BlockAnalyzer:
 
         result = _merge_states(list(cached.exits))
         state.database_strings = dict(result.database_strings)
+        state.database_numbers = dict(result.database_numbers)
+        state.dynamic_database_numbers = dict(result.dynamic_database_numbers)
+        state.dynamic_database_strings = dict(result.dynamic_database_strings)
         state.unknown_scopes = state.unknown_scopes | result.unknown_scopes
         state.unknown_reasons = state.unknown_reasons | result.unknown_reasons
         # Global variables are shared across public-event frames; CSelf slots are not.
@@ -3796,6 +4314,7 @@ class _BlockAnalyzer:
                     None,
                     "控制流回边扩大为运行时数值",
                     bool(value and value.tracked),
+                    _loop_identity(left, right),
                 )
         scope = self._current_scope()
         for variable in set(previous.strings) | set(current.strings):
@@ -3818,6 +4337,8 @@ class _BlockAnalyzer:
                 symbolic_all=True,
                 scopes=value.scopes | database_scopes | scope,
                 literals=None,
+                database_selectors=value.database_selectors,
+                loop_source_keys=value.loop_source_keys | value.source_keys,
             )
         previous_coordinates = set(previous.database_strings)
         current_coordinates = set(current.database_strings)
@@ -3857,6 +4378,16 @@ class _BlockAnalyzer:
                 ),
                 literals=None,
             )
+        if (
+            previous.database_numbers != current.database_numbers
+            or previous.dynamic_database_numbers != current.dynamic_database_numbers
+            or previous.dynamic_database_strings != current.dynamic_database_strings
+        ):
+            # ponytail: A loop-changing dynamic store has no bounded address
+            # relation here; discard it rather than reusing a stale selector.
+            merged.database_numbers = {}
+            merged.dynamic_database_numbers = {}
+            merged.dynamic_database_strings = {}
         return merged
 
     def _cfg_successors(
@@ -3922,7 +4453,7 @@ class _BlockAnalyzer:
             if command.opcode == 170:
                 return (body,)
             count = (
-                _number_argument(command.ints[0], state)
+                self._number(command.ints[0], state)
                 if command.ints
                 else _NumberValue(None, "循环次数缺失")
             )
@@ -4092,6 +4623,9 @@ class _BlockAnalyzer:
         state.numbers = result.numbers
         state.strings = result.strings
         state.database_strings = result.database_strings
+        state.database_numbers = result.database_numbers
+        state.dynamic_database_numbers = result.dynamic_database_numbers
+        state.dynamic_database_strings = result.dynamic_database_strings
         state.unknown_scopes = result.unknown_scopes
         state.unknown_reasons = result.unknown_reasons
         return True
@@ -4100,6 +4634,7 @@ class _BlockAnalyzer:
         self, initial_state: _AnalysisState | None = None
     ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
         initial_state = initial_state.copy() if initial_state is not None else _AnalysisState({}, {}, {})
+        outputs: list[_AnalysisState] = []
         entry_labels = [
             (index, int(command.strings[0].removeprefix("cmd:")))
             for index, command in enumerate(self.block.commands)
@@ -4114,7 +4649,9 @@ class _BlockAnalyzer:
             first = entry_labels[0][0]
             dispatcher = self._dynamic_entry_dispatcher()
             if first and dispatcher is None:
-                self._execute(0, first, initial_state.copy())
+                prefix_state = initial_state.copy()
+                self._execute(0, first, prefix_state)
+                outputs.append(prefix_state)
             for label_index, (start, choice) in enumerate(entry_labels):
                 end = (
                     entry_labels[label_index + 1][0]
@@ -4127,8 +4664,12 @@ class _BlockAnalyzer:
                     self._execute(dispatcher, len(self.block.commands), state)
                 else:
                     self._execute(start + 1, end, state)
+                outputs.append(state)
         else:
-            self._execute(0, len(self.block.commands), initial_state.copy())
+            state = initial_state.copy()
+            self._execute(0, len(self.block.commands), state)
+            outputs.append(state)
+        self.output_state = _merge_states(outputs) if outputs else initial_state
         # Commands excluded by a proven branch still need a syntactic CFG and
         # semantic ledger entry. They are safe because they are unreachable,
         # not because the coverage denominator forgot them.
@@ -4295,6 +4836,7 @@ def _analyze_blocks(
     locations: dict[tuple[int, str], list[str]] = {}
     call_cache: _CallCache = {}
     audit = _AnalysisAudit.empty()
+    root_states: list[_AnalysisState] = []
     for block in blocks:
         analyzer = _BlockAnalyzer(
             block,
@@ -4311,101 +4853,45 @@ def _analyze_blocks(
         )
         block_dependencies, _block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
+        root_states.append(analyzer.output_state)
         for warning in block_unknown:
             key = (int(warning["opcode"]), str(warning["shape"]))
             unknown[key] += int(warning["count"])
             locations.setdefault(key, []).extend(str(value) for value in warning["locations"])
 
-    def dependency_value(dependency: dict[str, object]) -> _StringValue:
-        status = str(dependency.get("status", "blocking"))
-        source_values = dependency.get("source_values")
-        literals = (
-            frozenset(map(str, source_values))
-            if isinstance(source_values, list)
-            else None
-        )
-        cells = frozenset(
-            (
-                str(cell["database"]),
-                int(cell["type"]),
-                int(cell["data"]),
-                int(cell["field"]),
-            )
-            for cell in dependency.get("database_cells", ())
-            if isinstance(cell, dict)
-            and all(key in cell for key in ("database", "type", "data", "field"))
-        )
-        return _StringValue(
-            frozenset(map(str, dependency.get("source_keys", ()))),
-            cells,
-            tuple(map(str, dependency.get("trace", ()))),
-            str(dependency.get("reason", "")) if status != "resolved" else "",
-            status == "dynamic",
-            frozenset(map(str, dependency.get("unresolved_scopes", ()))),
-            literals,
-        )
+    def persistent_state(states: Iterable[_AnalysisState]) -> _AnalysisState:
+        merged = _merge_states(list(states))
+        merged.numbers = {
+            key: value
+            for key, value in merged.numbers.items()
+            if not 1_600_000 <= key < 1_600_100 and value.identity
+        }
+        merged.strings = {
+            key: value
+            for key, value in merged.strings.items()
+            if not 1_600_000 <= key < 1_600_100
+        }
+        return merged
 
-    def global_writes(records: Iterable[dict[str, object]]) -> dict[int, _StringValue]:
-        values: dict[int, _StringValue] = {}
-        for dependency in records:
-            if (
-                dependency.get("kind") != "state"
-                or dependency.get("resource_role") != "global_string_write"
-            ):
-                continue
-            raw_variable = dependency.get("global_string_variable")
-            if not isinstance(raw_variable, int) or 1_600_000 <= raw_variable < 1_600_100:
-                continue
-            value = dependency_value(dependency)
-            values[raw_variable] = _merge_strings(values.get(raw_variable), value) or value
-        return values
-
-    def database_writes(
-        records: Iterable[dict[str, object]],
-    ) -> dict[tuple[str, int, int, int], _StringValue]:
-        values: dict[tuple[str, int, int, int], _StringValue] = {}
-        for dependency in records:
-            if (
-                dependency.get("kind") != "resource"
-                or dependency.get("resource_role") != "database_string_write"
-            ):
-                continue
-            value = dependency_value(dependency)
-            for cell in dependency.get("target_database_cells", ()):
-                if not isinstance(cell, dict) or not all(
-                    key in cell for key in ("database", "type", "data", "field")
-                ):
-                    continue
-                coordinate = (
-                    str(cell["database"]),
-                    int(cell["type"]),
-                    int(cell["data"]),
-                    int(cell["field"]),
-                )
-                values[coordinate] = _merge_strings(values.get(coordinate), value) or value
-        return values
-
-    def global_values_equal(
-        left: dict[object, _StringValue], right: dict[object, _StringValue]
-    ) -> bool:
-        return left.keys() == right.keys() and all(
-            _string_semantic_key(value) == _string_semantic_key(right[key])
-            for key, value in left.items()
-        )
-
-    # Persistent strings may be written by one root event and consumed by another.
+    # Persistent state may be written by one root event and consumed by another.
     # ponytail: Root writes are joined without an event-order model; scheduling
     # analysis can regain approvals if a project needs that precision.
-    initial_dependencies = list(dependencies)
-    global_strings = global_writes(initial_dependencies)
-    global_database_strings = database_writes(initial_dependencies)
+    global_state = persistent_state(root_states)
     global_iterations = 0
     global_converged = True
-    while global_strings or global_database_strings:
+    while (
+        global_state.numbers
+        or global_state.strings
+        or global_state.database_strings
+        or global_state.database_numbers
+        or global_state.dynamic_database_numbers
+        or global_state.dynamic_database_strings
+    ):
         if global_iterations >= _GLOBAL_STRING_FLOW_MAX_ITERATIONS:
             global_converged = False
             break
         propagated: list[dict[str, object]] = []
+        propagated_states: list[_AnalysisState] = []
         for block in blocks:
             analyzer = _BlockAnalyzer(
                 block,
@@ -4421,33 +4907,56 @@ def _analyze_blocks(
                 audit=audit,
             )
             block_dependencies, _block_blocking, _block_unknown = analyzer.run(
-                _AnalysisState({}, global_strings, global_database_strings)
+                global_state
             )
             propagated.extend(block_dependencies)
+            propagated_states.append(analyzer.output_state)
         global_iterations += 1
-        next_global_strings = global_writes([*initial_dependencies, *propagated])
-        next_global_database_strings = database_writes(
-            [*initial_dependencies, *propagated]
-        )
-        if (
-            global_values_equal(global_strings, next_global_strings)
-            and global_values_equal(global_database_strings, next_global_database_strings)
-        ):
+        next_global_state = persistent_state([*root_states, *propagated_states])
+        if _states_semantically_equal(global_state, next_global_state):
             dependencies.extend(propagated)
             break
-        global_strings = next_global_strings
-        global_database_strings = next_global_database_strings
+        global_state = next_global_state
     global_string_flow = {
         "converged": global_converged,
         "iterations": global_iterations,
-        "variables": len(global_strings),
-        "database_cells": len(global_database_strings),
+        "variables": len(global_state.strings),
+        "numbers": len(global_state.numbers),
+        "database_cells": len(global_state.database_strings),
+        "database_numbers": len(global_state.database_numbers),
+        "dynamic_database_numbers": len(global_state.dynamic_database_numbers),
+        "dynamic_database_strings": len(global_state.dynamic_database_strings),
         "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
     }
     warnings = [
         {"opcode": opcode, "shape": shape, "count": count, "locations": locations[(opcode, shape)][:5]}
         for (opcode, shape), count in sorted(unknown.items())
     ]
+    def report_database_selectors(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, str, str, str, int, int]]:
+        return {
+            (
+                str(item["database"]),
+                int(item["type"]),
+                int(item["field"]),
+                str(item["selector"]),
+                str(item["auto_file"]),
+                str(item["event_type"]),
+                int(item["event_id"]),
+                int(item["page"]),
+            )
+            for item in dependency.get(field, ())
+            if isinstance(item, dict)
+            and all(
+                key in item
+                for key in (
+                    "database", "type", "field", "selector", "auto_file",
+                    "event_type", "event_id", "page",
+                )
+            )
+        }
+
     merged_dependencies: dict[tuple[object, ...], dict[str, object]] = {}
     for dependency in dependencies:
         # ponytail: retain source correlation in the report. Collapsing every
@@ -4486,6 +4995,15 @@ def _analyze_blocks(
                 (cell["database"], cell["type"], cell["data"], cell["field"])
                 for cell in dependency.get("target_database_cells", [])
             }
+            current["_database_selectors"] = report_database_selectors(
+                dependency, "database_selectors"
+            )
+            current["_right_database_selectors"] = report_database_selectors(
+                dependency, "right_database_selectors"
+            )
+            current["_target_database_selectors"] = report_database_selectors(
+                dependency, "target_database_selectors"
+            )
             current["_trace"] = dict.fromkeys(dependency["trace"])
             current["_left_values"] = set(dependency.get("left_values", []))
             current["_right_values"] = set(dependency.get("right_values", []))
@@ -4515,6 +5033,15 @@ def _analyze_blocks(
         current["_target_database_cells"].update(
             (cell["database"], cell["type"], cell["data"], cell["field"])
             for cell in dependency.get("target_database_cells", [])
+        )
+        current["_database_selectors"].update(
+            report_database_selectors(dependency, "database_selectors")
+        )
+        current["_right_database_selectors"].update(
+            report_database_selectors(dependency, "right_database_selectors")
+        )
+        current["_target_database_selectors"].update(
+            report_database_selectors(dependency, "target_database_selectors")
         )
         current["_trace"].update(dict.fromkeys(dependency["trace"]))
         current["_left_values"].update(dependency.get("left_values", []))
@@ -4556,6 +5083,24 @@ def _analyze_blocks(
             current[field] = [
                 {"database": cell[0], "type": cell[1], "data": cell[2], "field": cell[3]}
                 for cell in sorted(current.pop(f"_{field}"))
+            ]
+        for field in (
+            "database_selectors",
+            "right_database_selectors",
+            "target_database_selectors",
+        ):
+            current[field] = [
+                {
+                    "database": item[0],
+                    "type": item[1],
+                    "field": item[2],
+                    "selector": item[3],
+                    "auto_file": item[4],
+                    "event_type": item[5],
+                    "event_id": item[6],
+                    "page": item[7],
+                }
+                for item in sorted(current.pop(f"_{field}"))
             ]
         current["trace"] = list(current.pop("_trace"))[:_VALUE_LIMIT]
         for field in ("left_values", "right_values"):
@@ -4600,11 +5145,70 @@ def _translation_usage_report(
             )
         return cells
 
+    def database_selectors(
+        dependency: dict[str, object], field: str
+    ) -> set[tuple[str, int, int, str, str, str, int, int]]:
+        return {
+            (
+                str(item["database"]),
+                int(item["type"]),
+                int(item["field"]),
+                str(item["selector"]),
+                str(item["auto_file"]),
+                str(item["event_type"]),
+                int(item["event_id"]),
+                int(item["page"]),
+            )
+            for item in dependency.get(field, ())
+            if isinstance(item, dict)
+            and all(
+                name in item
+                for name in (
+                    "database", "type", "field", "selector", "auto_file",
+                    "event_type", "event_id", "page",
+                )
+            )
+        }
+
+    def consumer_reference(dependency: dict[str, object]) -> dict[str, object]:
+        return {
+            field: dependency[field]
+            for field in ("kind", "auto_file", "event_type", "event_id", "page", "command", "trace")
+            if field in dependency
+        }
+
     display_storage_cells: set[tuple[str, int, int, int]] = set()
+    display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    non_display_cells: set[tuple[str, int, int, int]] = set()
+    non_display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
+    display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
+    non_display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
+    non_display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
     for dependency in dependencies:
         kind = str(dependency.get("kind", "condition"))
+        cells = database_cells(dependency, "database_cells")
+        cells.update(database_cells(dependency, "right_database_cells"))
+        selectors = database_selectors(dependency, "database_selectors")
+        selectors.update(database_selectors(dependency, "right_database_selectors"))
+        reference = consumer_reference(dependency)
         if kind == "display":
-            display_storage_cells.update(database_cells(dependency, "database_cells"))
+            display_storage_cells.update(cells)
+            display_selectors.update(selectors)
+            for cell in cells:
+                display_cell_consumers.setdefault(cell, []).append(reference)
+            for selector in selectors:
+                display_selector_consumers.setdefault(selector, []).append(reference)
+        elif kind in {"condition", "call", "resource", "database", "control_flow", "opaque"} and not (
+            kind == "resource"
+            and dependency.get("resource_role") == "database_string_write"
+        ):
+            non_display_cells.update(cells)
+            non_display_selectors.update(selectors)
+            for cell in cells:
+                non_display_cell_consumers.setdefault(cell, []).append(reference)
+            for selector in selectors:
+                non_display_selector_consumers.setdefault(selector, []).append(reference)
     for block in blocks:
         for index, command in enumerate(block.commands, start=1):
             semantics = command_semantics(
@@ -4656,9 +5260,47 @@ def _translation_usage_report(
         ):
             usage = "display_storage"
             target_cells = database_cells(dependency, "target_database_cells")
-            dependency["display_sink_proven"] = (
-                bool(target_cells) and target_cells <= display_storage_cells
+            target_selectors = database_selectors(
+                dependency, "target_database_selectors"
             )
+            cells_proven = (
+                bool(target_cells)
+                and target_cells <= display_storage_cells
+                and target_cells.isdisjoint(non_display_cells)
+            )
+            selectors_proven = (
+                bool(target_selectors)
+                and target_selectors <= display_selectors
+                and target_selectors.isdisjoint(non_display_selectors)
+            )
+            dependency["display_consumers"] = [
+                consumer
+                for cell in sorted(target_cells)
+                for consumer in display_cell_consumers.get(cell, ())
+            ] + [
+                consumer
+                for selector in sorted(target_selectors)
+                for consumer in display_selector_consumers.get(selector, ())
+            ]
+            dependency["non_display_consumers"] = [
+                consumer
+                for cell in sorted(target_cells)
+                for consumer in non_display_cell_consumers.get(cell, ())
+            ] + [
+                consumer
+                for selector in sorted(target_selectors)
+                for consumer in non_display_selector_consumers.get(selector, ())
+            ]
+            dependency["display_sink_proven"] = cells_proven or selectors_proven
+            if not dependency["display_sink_proven"]:
+                dependency["display_sink_reason"] = (
+                    "动态数据库地址存在非显示读取"
+                    if (
+                        target_cells & non_display_cells
+                        or target_selectors & non_display_selectors
+                    )
+                    else "动态数据库地址没有可证明的显示读取"
+                )
             if dependency["display_sink_proven"]:
                 for key in dependency.get("source_keys", []):
                     usages.setdefault(str(key), set()).add("display_only")
@@ -5335,8 +5977,13 @@ def _semantic_replay_signature(report: dict[str, object]) -> dict[str, object]:
         if kind == "condition":
             conditions.append((*identity, _condition_truth_signature(dependency)))
         elif kind == "resource":
-            values = dependency.get("resource_values", ())
-            resources.append((*identity, tuple(sorted(map(str, values)))))
+            role = str(dependency.get("resource_role", ""))
+            values = (
+                dependency.get("resource_path_values", ())
+                if role == "file_content_runtime_write"
+                else dependency.get("resource_values", ())
+            )
+            resources.append((*identity, role, tuple(sorted(map(str, values or ())))))
     return {
         "cfg_edges": tuple(
             sorted(tuple(map(str, edge)) for edge in runtime.get("cfg_edges", ()))
@@ -5537,6 +6184,22 @@ def analyze_translation_safety(
         and global_string_flow.get("converged") is True
         and complete_ledger
     )
+    def normalized_runtime_file_path(value: object) -> str:
+        return ntpath.normcase(ntpath.normpath(str(value)))
+
+    file_read_paths: set[str] = set()
+    unknown_file_read_path = False
+    for dependency in dependencies:
+        if (
+            dependency.get("kind") != "resource"
+            or dependency.get("resource_role") != "file_path_runtime_read"
+        ):
+            continue
+        values = dependency.get("source_values")
+        if isinstance(values, list) and values:
+            file_read_paths.update(map(normalized_runtime_file_path, values))
+        else:
+            unknown_file_read_path = True
 
     def protect(keys: Iterable[object], reason: str) -> None:
         for raw_key in keys:
@@ -5640,6 +6303,26 @@ def analyze_translation_safety(
                     [*source_keys, *right_keys],
                     "database_string_flow_not_converged",
                 )
+            return
+        if (
+            kind == "resource"
+            and dependency.get("resource_role") == "file_content_runtime_write"
+        ):
+            path_values = dependency.get("resource_path_values")
+            fixed_unread_path = (
+                isinstance(path_values, list)
+                and len(path_values) == 1
+                and normalized_runtime_file_path(path_values[0]) not in file_read_paths
+                and not unknown_file_read_path
+            )
+            loop_content_only = (
+                status == "dynamic"
+                and str(dependency.get("reason", ""))
+                == "控制流回边扩大为运行时字符串"
+            )
+            if fixed_unread_path and (status == "resolved" or loop_content_only):
+                return
+            protect([*source_keys, *right_keys], "file_content_not_proven_display_only")
             return
         if (
             kind == "state"
