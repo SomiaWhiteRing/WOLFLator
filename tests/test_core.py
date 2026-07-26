@@ -1651,6 +1651,37 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual(1.0, report["command_catalog"]["cfg_coverage"]["ratio"])
             self.assertFalse(report["blocking_issues"])
 
+    def test_editor_cfg_queues_a_changing_forward_join_once(self):
+        block = _CommandBlock(
+            "Auto",
+            "common",
+            1,
+            "join",
+            1,
+            tuple(_Command(0, (), (), 0, "") for _ in range(4)),
+        )
+        analyzer = _BlockAnalyzer(block, {}, {}, {}, audit=_AnalysisAudit.empty())
+        visits: dict[int, int] = {}
+
+        def transfer(index, state, _exits):
+            visits[index] = visits.get(index, 0) + 1
+            if index in {1, 2}:
+                state.numbers[1_600_000] = _NumberValue(frozenset({index}))
+
+        successors = {
+            0: ((1, 4), (2, 4)),
+            1: ((3, 4),),
+            2: ((3, 4),),
+            3: ((None, 4),),
+        }
+        analyzer._transfer_command = transfer
+        analyzer._cfg_successors = lambda index, _limit, _state, _exits: successors[index]
+        state = _AnalysisState({}, {}, {})
+
+        self.assertTrue(analyzer._execute(0, 4, state))
+        self.assertEqual(1, visits[3])
+        self.assertEqual(frozenset({1, 2}), state.numbers[1_600_000].values)
+
     def test_semantic_ledger_covers_choice_database_and_no_return_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1763,6 +1794,48 @@ class WorkbookAndFontTests(unittest.TestCase):
         )
         self.assertEqual(left.audit.calls, right.audit.calls)
         self.assertEqual(left.audit.data_effects, right.audit.data_effects)
+
+    def test_no_return_numeric_alias_call_uses_public_event_analysis(self):
+        database = _DatabaseType(
+            "CDB", 0, "", {0: "text"}, {0: 2000}, (("",),), ("row",)
+        )
+        callee = _CommandBlock(
+            "Auto",
+            "common",
+            2,
+            "callee",
+            1,
+            (
+                _Command(
+                    250,
+                    (0, 1_600_000, 0, 0x1000, 1_600_001),
+                    ("",) * 4,
+                    0,
+                    "",
+                ),
+            ),
+        )
+        caller = _CommandBlock("Auto", "common", 1, "caller", 1, ())
+        analyzer = _BlockAnalyzer(
+            caller,
+            {"CDB": {0: database}},
+            {},
+            {},
+            {2: callee},
+            audit=_AnalysisAudit.empty(),
+        )
+        call = _Command(210, (500_002, 1, 1_600_000), (), 0, "")
+
+        with mock.patch.object(
+            _BlockAnalyzer,
+            "_execute",
+            side_effect=AssertionError("numeric-only no-return call was expanded"),
+        ):
+            analyzer._call_event(call, 0, _AnalysisState({}, {}, {}))
+
+        self.assertEqual(
+            ("exact", ("common:2",)), analyzer.audit.calls["Auto:common:1:1:1"]
+        )
 
     def test_literal_no_return_calls_keep_per_call_display_provenance(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1876,6 +1876,166 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
     )
 
 
+def _persistent_inputs_for_block(
+    block: _CommandBlock,
+    state: _AnalysisState,
+    databases: dict[str, dict[int, _DatabaseType]],
+) -> _AnalysisState:
+    references: set[int] = set()
+    string_references: set[int] = set()
+    database_reads: list[
+        tuple[str, set[int] | None, set[int] | None, set[int] | None]
+    ] = []
+    all_numbers = False
+    all_strings = False
+    reads_database_state = False
+    reads_unknown_state = False
+    for command in block.commands:
+        for raw in command.ints:
+            if raw >= 1_000_000:
+                references.update((raw, raw & 0x00FFFFFF))
+        string_references.update(
+            _string_variable_for_escape("s", int(reference))
+            for literal in command.strings
+            for reference in _STRING_REFERENCE_RE.findall(literal)
+        )
+        if command.opcode == 121 and len(command.ints) == 7:
+            all_numbers = True
+        if command.opcode == 122 and len(command.ints) >= 2 and command.ints[1] & 0x0F == 2:
+            all_numbers = True
+            all_strings = True
+        if command.opcode == 250 and len(command.ints) == 5:
+            flags = command.ints[3]
+            byte1 = (flags >> 8) & 0xFF
+            byte2 = (flags >> 16) & 0xFF
+            database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+            destination = command.ints[4] & 0x00FFFFFF
+            is_read = bool(byte1 & 0x10) or (
+                not any(command.strings) and destination not in state.strings
+            )
+            if database is not None and is_read:
+                types = databases.get(database, {})
+                type_ids = (
+                    {
+                        type_id
+                        for type_id, item in types.items()
+                        if item.name
+                        == (command.strings[1] if len(command.strings) > 1 else "")
+                    }
+                    if byte2 & 0x01
+                    else (
+                        {command.ints[0]}
+                        if 0 <= command.ints[0] < 1_000_000
+                        else None
+                    )
+                )
+                field_ids = (
+                    {
+                        field_id
+                        for type_id in (type_ids if type_ids is not None else types)
+                        for field_id, name in types.get(
+                            type_id,
+                            _DatabaseType(database, type_id, "", {}, {}, (), ()),
+                        ).field_names.items()
+                        if name
+                        == (command.strings[3] if len(command.strings) > 3 else "")
+                    }
+                    if byte2 & 0x04
+                    else (
+                        {command.ints[2]}
+                        if 0 <= command.ints[2] < 1_000_000
+                        else None
+                    )
+                )
+                data_ids = (
+                    {
+                        data_id
+                        for type_id in (type_ids if type_ids is not None else types)
+                        for data_id, name in enumerate(
+                            types.get(
+                                type_id,
+                                _DatabaseType(database, type_id, "", {}, {}, (), ()),
+                            ).data_names
+                        )
+                        if name
+                        == (command.strings[2] if len(command.strings) > 2 else "")
+                    }
+                    if byte2 & 0x02
+                    else (
+                        {command.ints[1]}
+                        if 0 <= command.ints[1] < 1_000_000
+                        else None
+                    )
+                )
+                database_reads.append((database, type_ids, data_ids, field_ids))
+        if command.opcode in {210, 300} and len(command.ints) >= 2:
+            flags = command.ints[1]
+            if flags & 0x01000000 or (flags >> 4) & 0x0F:
+                reads_database_state = True
+        if command.opcode == 112:
+            reads_unknown_state = True
+        if command_semantics(
+            command.opcode, len(command.ints), len(command.strings)
+        ) is None:
+            all_numbers = all_strings = reads_database_state = reads_unknown_state = True
+
+    def static_database_key(key: tuple[str, int, int, int]) -> bool:
+        return reads_database_state or any(
+            key[0] == database
+            and (type_ids is None or key[1] in type_ids)
+            and (data_ids is None or key[2] in data_ids)
+            and (field_ids is None or key[3] in field_ids)
+            for database, type_ids, data_ids, field_ids in database_reads
+        )
+
+    def dynamic_database_key(key: tuple[str, int, int, str]) -> bool:
+        return reads_database_state or any(
+            key[0] == database
+            and (type_ids is None or key[1] in type_ids)
+            and (field_ids is None or key[2] in field_ids)
+            for database, type_ids, _data_ids, field_ids in database_reads
+        )
+
+    return _AnalysisState(
+        dict(state.numbers)
+        if all_numbers
+        else {key: value for key, value in state.numbers.items() if key in references},
+        dict(state.strings)
+        if all_strings
+        else {
+            key: value
+            for key, value in state.strings.items()
+            if key in references or key in string_references
+        },
+        {key: value for key, value in state.database_strings.items() if static_database_key(key)},
+        {key: value for key, value in state.database_numbers.items() if static_database_key(key)},
+        {
+            key: value
+            for key, value in state.dynamic_database_numbers.items()
+            if dynamic_database_key(key)
+        },
+        {
+            key: value
+            for key, value in state.dynamic_database_strings.items()
+            if dynamic_database_key(key)
+        },
+        state.unknown_scopes if reads_unknown_state else frozenset(),
+        state.unknown_reasons if reads_unknown_state else frozenset(),
+    )
+
+
+def _state_has_values(state: _AnalysisState) -> bool:
+    return bool(
+        state.numbers
+        or state.strings
+        or state.database_strings
+        or state.database_numbers
+        or state.dynamic_database_numbers
+        or state.dynamic_database_strings
+        or state.unknown_scopes
+    )
+
+
 def _block_map_id(block: _CommandBlock) -> int:
     if block.map_ids:
         return block.map_ids[0]
@@ -3859,15 +4019,14 @@ class _BlockAnalyzer:
                     )
                 )
 
-        carries_persistent_state = (
-            any(value.tracked for value in callee_state.strings.values())
-            or any(value.identity for value in callee_state.numbers.values())
+        carries_translation_provenance = any(
+            value.tracked for value in callee_state.strings.values()
         )
-        if not has_return and not carries_persistent_state:
-            # ponytail: every public event is analyzed once on its own. Re-enter
-            # only calls carrying translated provenance or an address expression;
-            # root fixed-point propagation covers persistent DB state without
-            # multiplying every unrelated call site.
+        if not has_return and not carries_translation_provenance:
+            # ponytail: every public event is analyzed once with symbolic numeric
+            # inputs. Skip caller-specific numeric alias precision here; a
+            # demand-driven interprocedural alias summary can recover it without
+            # multiplying large event bodies at every call site.
             return
 
         dispatcher = self._dynamic_entry_dispatcher(target)
@@ -4544,6 +4703,7 @@ class _BlockAnalyzer:
             (start, initial_limit): state.copy()
         }
         pending: deque[tuple[int, int]] = deque(((start, initial_limit),))
+        queued = {(start, initial_limit)}
         visits: Counter[tuple[int, int]] = Counter()
         processed: dict[tuple[int, int], _AnalysisState] = {}
         fallthrough: list[_AnalysisState] = []
@@ -4551,6 +4711,7 @@ class _BlockAnalyzer:
 
         while pending:
             key = pending.popleft()
+            queued.remove(key)
             index, limit = key
             current = states[key].copy()
             visits[key] += 1
@@ -4615,7 +4776,9 @@ class _BlockAnalyzer:
                         states[successor_key] = merged
                         continue
                 states[successor_key] = merged
-                pending.append(successor_key)
+                if successor_key not in queued:
+                    pending.append(successor_key)
+                    queued.add(successor_key)
 
         if not fallthrough:
             return False
@@ -4873,26 +5036,77 @@ def _analyze_blocks(
         }
         return merged
 
+    def accumulate_persistent_state(
+        current: _AnalysisState, update: _AnalysisState
+    ) -> _AnalysisState:
+        merged = current.copy()
+
+        def merge_values(target: dict, source: dict, merge: Callable) -> None:
+            for key, value in source.items():
+                combined = merge(target.get(key), value)
+                if combined is not None:
+                    target[key] = combined
+
+        merge_values(
+            merged.numbers,
+            {
+                key: value
+                for key, value in update.numbers.items()
+                if not 1_600_000 <= key < 1_600_100 and value.identity
+            },
+            _merge_numbers,
+        )
+        merge_values(
+            merged.strings,
+            {
+                key: value
+                for key, value in update.strings.items()
+                if not 1_600_000 <= key < 1_600_100
+            },
+            _merge_strings,
+        )
+        merge_values(merged.database_strings, update.database_strings, _merge_strings)
+        merge_values(merged.database_numbers, update.database_numbers, _merge_numbers)
+        merge_values(
+            merged.dynamic_database_numbers,
+            update.dynamic_database_numbers,
+            _merge_numbers,
+        )
+        merge_values(
+            merged.dynamic_database_strings,
+            update.dynamic_database_strings,
+            _merge_strings,
+        )
+        merged.unknown_scopes |= update.unknown_scopes
+        merged.unknown_reasons |= update.unknown_reasons
+        return merged
+
     # Persistent state may be written by one root event and consumed by another.
     # ponytail: Root writes are joined without an event-order model; scheduling
     # analysis can regain approvals if a project needs that precision.
     global_state = persistent_state(root_states)
     global_iterations = 0
     global_converged = True
-    while (
-        global_state.numbers
-        or global_state.strings
-        or global_state.database_strings
-        or global_state.database_numbers
-        or global_state.dynamic_database_numbers
-        or global_state.dynamic_database_strings
-    ):
+    propagated_by_block: dict[int, list[dict[str, object]]] = {}
+    previous_inputs: dict[int, _AnalysisState] = {}
+    block_evaluations = 0
+    while _state_has_values(global_state):
         if global_iterations >= _GLOBAL_STRING_FLOW_MAX_ITERATIONS:
             global_converged = False
             break
-        propagated: list[dict[str, object]] = []
-        propagated_states: list[_AnalysisState] = []
-        for block in blocks:
+        iteration_start = global_state
+        next_global_state = global_state
+        iteration_call_cache: _CallCache = {}
+        for block_index, block in enumerate(blocks):
+            projected = _persistent_inputs_for_block(
+                block, next_global_state, databases
+            )
+            if not _state_has_values(projected):
+                continue
+            previous = previous_inputs.get(block_index)
+            if previous is not None and _states_semantically_equal(previous, projected):
+                continue
+            previous_inputs[block_index] = projected.copy()
             analyzer = _BlockAnalyzer(
                 block,
                 databases,
@@ -4901,22 +5115,25 @@ def _analyze_blocks(
                 common_by_id,
                 common_by_name,
                 event_scopes,
-                call_cache={},
+                call_cache=iteration_call_cache,
                 call_argument_pool=call_argument_pool,
                 candidate_values=candidate_values,
                 audit=audit,
             )
             block_dependencies, _block_blocking, _block_unknown = analyzer.run(
-                global_state
+                projected
             )
-            propagated.extend(block_dependencies)
-            propagated_states.append(analyzer.output_state)
+            propagated_by_block[block_index] = block_dependencies
+            block_evaluations += 1
+            next_global_state = accumulate_persistent_state(
+                next_global_state, analyzer.output_state
+            )
         global_iterations += 1
-        next_global_state = persistent_state([*root_states, *propagated_states])
-        if _states_semantically_equal(global_state, next_global_state):
-            dependencies.extend(propagated)
-            break
         global_state = next_global_state
+        if _states_semantically_equal(iteration_start, global_state):
+            for block_index in sorted(propagated_by_block):
+                dependencies.extend(propagated_by_block[block_index])
+            break
     global_string_flow = {
         "converged": global_converged,
         "iterations": global_iterations,
@@ -4926,6 +5143,7 @@ def _analyze_blocks(
         "database_numbers": len(global_state.database_numbers),
         "dynamic_database_numbers": len(global_state.dynamic_database_numbers),
         "dynamic_database_strings": len(global_state.dynamic_database_strings),
+        "block_evaluations": block_evaluations,
         "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
     }
     warnings = [
