@@ -59,12 +59,14 @@ from safe_io import (
 )
 from wolf_editor import (
     AUTO_ANALYSIS_SCHEMA,
+    analyze_auto_export,
     analyze_translation_safety,
     compare_auto_structure,
     convert_legacy_game,
     export_and_analyze,
     inspect_wolf_editor,
 )
+from wolf_analysis import load_program_cache, write_program_cache
 from wolf_tools import (
     CancelledError,
     COPY_FROM_RE,
@@ -679,12 +681,49 @@ class Pipeline:
         index = keys.index(self.manifest.active_version)
         return self.manifest.versions[keys[index - 1]] if index > 0 else None
 
-    def _editor_analysis(self) -> dict[str, object] | None:
-        path = self.manifest.version.stage(Stage.EXTRACT).artifacts.get(
-            "editor_analysis", ""
-        )
+    def _editor_analysis(
+        self, items: list | None = None
+    ) -> dict[str, object] | None:
+        artifacts = self.manifest.version.stage(Stage.EXTRACT).artifacts
+        path = artifacts.get("editor_analysis", "")
         if not path or not Path(path).is_file():
             return None
+        program = artifacts.get("editor_program", "")
+        if program:
+            try:
+                return load_program_cache(
+                    program,
+                    items=items,
+                    editor_version=artifacts.get("editor_version") or None,
+                    editor_sha256=artifacts.get("editor_sha256") or None,
+                )
+            except ValueError as exc:
+                if items is None:
+                    raise
+                self.warning(f"Editor 程序缓存失效，正在重新分析 Auto：{exc}")
+                auto_dir = artifacts.get("editor_auto_dir", "")
+                if not auto_dir or not Path(auto_dir).is_dir():
+                    raise RuntimeError("Editor 程序缓存失效且 Auto 目录缺失。") from exc
+                old_report: dict[str, object] = {}
+                try:
+                    loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        old_report = loaded
+                except (OSError, json.JSONDecodeError):
+                    pass
+                editor = inspect_wolf_editor(self.settings.wolf_editor_path)
+                rebuilt = analyze_auto_export(
+                    auto_dir,
+                    items,
+                    editor,
+                    input_hash=str(old_report.get("input_hash", "cache-rebuild")),
+                )
+                atomic_write_json(path, rebuilt, indent=None)
+                write_program_cache(program, path, items)
+                artifacts["editor_version"] = editor.version
+                artifacts["editor_sha256"] = editor.sha256
+                self.save()
+                return rebuilt
         value = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("Editor 分析报告根节点不是对象。")
@@ -697,7 +736,7 @@ class Pipeline:
             self.manifest.import_scope,
             allow_copy_condition_groups=rules.allow_copy_condition_groups,
         )
-        analysis = self._editor_analysis()
+        analysis = self._editor_analysis(items)
         if analysis is None:
             raise RuntimeError("缺少 Editor 分析报告，请重新执行导出文本。")
         return analyze_translation_safety(
@@ -926,6 +965,11 @@ class Pipeline:
             editor_analysis = json.loads(
                 editor_result.analysis_path.read_text(encoding="utf-8")
             )
+            editor_program = write_program_cache(
+                staging / "editor" / "editor-program.json",
+                editor_result.analysis_path,
+                items,
+            )
             call_graph = editor_analysis.get("call_graph", {})
             catalog = editor_analysis.get("command_catalog", {})
             shape_coverage = catalog.get("shape_coverage", {})
@@ -964,6 +1008,7 @@ class Pipeline:
             items_path = final_dir / "items-extracted.json"
             editor_auto = final_dir / "editor" / "editor-auto"
             editor_analysis = final_dir / "editor" / "editor-analysis.json"
+            editor_program = final_dir / "editor" / editor_program.name
             original_fonts = record_original_fonts(
                 self.project_dir,
                 self.manifest.active_version,
@@ -984,6 +1029,7 @@ class Pipeline:
                 "original_fonts": str(original_fonts),
                 "editor_auto_dir": str(editor_auto),
                 "editor_analysis": str(editor_analysis),
+                "editor_program": str(editor_program),
                 "editor_version": editor_result.editor.version,
                 "editor_sha256": editor_result.editor.sha256,
                 "editor_warning_count": str(editor_result.warning_count),
@@ -1221,7 +1267,7 @@ class Pipeline:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
         items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
         rules = self.manifest.import_protection
-        logic_analysis = self._editor_analysis()
+        logic_analysis = self._editor_analysis(items)
         logic_safety = self._translation_safety(items)
         protection = analyze_import_protection(
             items,

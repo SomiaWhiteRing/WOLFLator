@@ -20,6 +20,7 @@ from models import (
 )
 from pipeline import Pipeline, create_project, load_manifest
 from wolf_editor import EditorInfo, analyze_auto_export
+from wolf_analysis import write_program_cache
 from wolf_tools import (
     IMPORT_PROTECTION_SCHEMA,
     OfficialToolDialogError,
@@ -227,6 +228,43 @@ class PipelineTests(unittest.TestCase):
         self._attach_editor_analysis(pipeline)
         (pipeline.project_dir / "glossary.json").write_text("{}", encoding="utf-8")
         return pipeline
+
+    def test_corrupt_editor_program_cache_rebuilds_from_auto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pipeline = self._translation_pipeline(Path(directory))
+            analysis_path = Path(
+                pipeline.manifest.version.stage(Stage.EXTRACT).artifacts[
+                    "editor_analysis"
+                ]
+            )
+            items = load_items(
+                pipeline.manifest.version.stage(Stage.EXTRACT).artifacts["items"]
+            )
+            cache_path = analysis_path.with_name("editor-program.json")
+            write_program_cache(cache_path, analysis_path, items)
+            cache_path.write_text("{}", encoding="utf-8")
+            expected = json.loads(analysis_path.read_text(encoding="utf-8"))
+            editor = EditorInfo(
+                Path("Editor.exe"),
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+
+            with mock.patch("pipeline.inspect_wolf_editor", return_value=editor), mock.patch(
+                "pipeline.analyze_auto_export", return_value=expected
+            ) as analyze, mock.patch.object(pipeline, "save"):
+                pipeline.manifest.version.stage(Stage.EXTRACT).artifacts.update(
+                    {
+                        "editor_program": str(cache_path),
+                        "editor_version": "3.713.2026.718",
+                        "editor_sha256": "a" * 64,
+                    }
+                )
+                self.assertEqual(expected, pipeline._editor_analysis(items))
+
+            analyze.assert_called_once()
+            self.assertEqual(1, json.loads(cache_path.read_text(encoding="utf-8"))["schema"])
 
     def _attach_import_protection(
         self, pipeline: Pipeline, protected_keys: tuple[str, ...] = ()

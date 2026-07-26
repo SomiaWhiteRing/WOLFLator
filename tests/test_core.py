@@ -116,6 +116,12 @@ from wolf_editor import (
     install_supported_editor,
     latest_editor_release_from_html,
 )
+from wolf_analysis import (
+    ANALYSIS_ENGINE,
+    load_program_cache,
+    source_structure_fingerprint,
+    write_program_cache,
+)
 
 
 HEADERS = [
@@ -582,6 +588,58 @@ class WorkbookTests(unittest.TestCase):
 
 
 class WorkbookAndFontTests(unittest.TestCase):
+    def test_editor_program_cache_roundtrip_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "editor-analysis.json"
+            cache_path = root / "editor-program.json"
+            item = TranslationItem(
+                key="key",
+                original="原文",
+                translation="译文",
+                code="COMMON-1-0-0",
+            )
+            report = {
+                "schema": AUTO_ANALYSIS_SCHEMA,
+                "engine": ANALYSIS_ENGINE,
+                "input_hash": "input",
+                "output_hash": "output",
+                "editor": {"version": "3.713", "sha256": "a" * 64},
+            }
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False), encoding="utf-8"
+            )
+
+            write_program_cache(cache_path, report_path, [item])
+            self.assertEqual(
+                report,
+                load_program_cache(
+                    cache_path,
+                    items=[item],
+                    input_hash="input",
+                    editor_version="3.713",
+                    editor_sha256="a" * 64,
+                ),
+            )
+            translated_again = TranslationItem(
+                key="key",
+                original="原文",
+                translation="另一候选",
+                code="COMMON-1-0-0",
+            )
+            self.assertEqual(
+                source_structure_fingerprint([item]),
+                source_structure_fingerprint([translated_again]),
+            )
+            with self.assertRaisesRegex(ValueError, "源结构不匹配"):
+                load_program_cache(
+                    cache_path,
+                    items=[TranslationItem(key="other", original="原文")],
+                )
+            report_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "哈希不匹配"):
+                load_program_cache(cache_path)
+
     def test_analysis_self_merge_keeps_required_widening(self):
         stable = _StringValue(
             source_keys=frozenset({"key"}),
@@ -602,6 +660,13 @@ class WorkbookAndFontTests(unittest.TestCase):
         merged_number = _merge_numbers(oversized_number, oversized_number)
         self.assertIsNone(merged_number.values)
         self.assertTrue(merged_number.tracked)
+
+        relational_number = _merge_numbers(
+            _NumberValue(frozenset({1}), tracked=True, identity="left"),
+            _NumberValue(frozenset({2}), tracked=True, identity="right"),
+        )
+        self.assertEqual(("left", "right"), relational_number.identities)
+        self.assertEqual("", relational_number.identity)
 
     def test_external_filter_view_excludes_only_files_over_the_kb_limit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1676,6 +1741,7 @@ class WorkbookAndFontTests(unittest.TestCase):
         }
         analyzer._transfer_command = transfer
         analyzer._cfg_successors = lambda index, _limit, _state, _exits: successors[index]
+        analyzer._basic_block_starts = frozenset({0, 1, 2, 3})
         state = _AnalysisState({}, {}, {})
 
         self.assertTrue(analyzer._execute(0, 4, state))

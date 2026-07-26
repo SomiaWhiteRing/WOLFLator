@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 
 CATALOG_SCHEMA = 5
 VERIFIED_EDITOR_VERSION = "3.713.2026.718"
@@ -668,6 +670,7 @@ def command_effect(opcode: int, int_count: int, string_count: int) -> str | None
     return item[1]
 
 
+@lru_cache(maxsize=None)
 def command_semantics(
     opcode: int, int_count: int, string_count: int
 ) -> dict[str, object] | None:

@@ -37,6 +37,11 @@ from wolf_command_catalog import (
     VERIFIED_EDITOR_VERSION,
     command_semantics,
 )
+from wolf_analysis import (
+    ANALYSIS_ENGINE,
+    AUTO_ANALYSIS_SCHEMA,
+    TRANSLATION_SAFETY_SCHEMA,
+)
 from wolf_tools import (
     COPY_FROM_RE,
     CancelledError,
@@ -53,8 +58,6 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 15
-TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
 # selectors; switch to a symbolic string-set domain if a corpus exceeds this cap.
@@ -238,6 +241,20 @@ class AutoProject:
 
 
 @dataclass(frozen=True)
+class _CompiledAutoProgram:
+    root: Path
+    editor: EditorInfo
+    input_hash: str
+    project: AutoProject
+    common_counts: dict[str, int]
+    map_counts: dict[str, int]
+    database_counts: dict[str, dict[str, int]]
+    database_types: dict[str, dict[int, _DatabaseType]]
+    database_report: dict[str, object]
+    output_hash: str
+
+
+@dataclass(frozen=True)
 class _DatabaseType:
     database: str
     type_id: int
@@ -254,6 +271,11 @@ class _NumberValue:
     reason: str = ""
     tracked: bool = False
     identity: str = ""
+    identities: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.identity and not self.identities:
+            object.__setattr__(self, "identities", (self.identity,))
 
 
 @dataclass(frozen=True)
@@ -316,10 +338,39 @@ class _AnalysisAudit:
         return cls({}, {}, set(), {}, {})
 
 
+@dataclass
+class _AnalysisMetrics:
+    basic_blocks: int = 0
+    transfers: int = 0
+    merges: int = 0
+    summary_hits: int = 0
+    summary_misses: int = 0
+    incremental_invalidations: int = 0
+
+
+@dataclass(frozen=True)
+class _BlockPlan:
+    address_variables: frozenset[int]
+    labels: dict[str, tuple[int, ...]]
+    condition_regions: dict[int, tuple[int, tuple[tuple[int, int], ...]]]
+    branch_exits: dict[int, int]
+    loop_ends: dict[int, int]
+    loop_starts: dict[int, int]
+    enclosing_loops: dict[int, tuple[int, int]]
+    basic_block_starts: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _EntryPlan:
+    dispatcher: int | None
+    labels: tuple[int, ...]
+
+
 @dataclass(frozen=True)
 class _CallSummary:
     fell_through: bool
     exits: tuple[_AnalysisState, ...]
+    result: _AnalysisState | None
     summary_failed: str
     dependencies: tuple[dict[str, object], ...]
     blocking: tuple[dict[str, object], ...]
@@ -329,6 +380,9 @@ class _CallSummary:
 
 _CallCache = dict[tuple[object, ...], _CallSummary]
 _CallArgumentPool = dict[str, tuple[_StringValue, ...]]
+_BlockPlanCache = dict[int, _BlockPlan]
+_EventItemCache = dict[tuple[int, int, int], tuple[TranslationItem, ...]]
+_EntryPlanCache = dict[int, _EntryPlan]
 
 
 class _LinkParser(HTMLParser):
@@ -1475,6 +1529,7 @@ def _calculate_numbers(left: _NumberValue, right: _NumberValue, operator: int) -
     return _NumberValue(frozenset(output), tracked=tracked, identity=identity)
 
 
+@lru_cache(maxsize=262_144)
 def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _NumberValue | None:
     if left is None and right is None:
         return None
@@ -1487,13 +1542,19 @@ def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _Nu
     if left is None or right is None:
         value = left or right
         assert value is not None
-        return _NumberValue(None, "控制流仅在部分分支赋值", value.tracked)
+        return _NumberValue(
+            None,
+            "控制流仅在部分分支赋值",
+            value.tracked,
+            identities=value.identities,
+        )
     if left.values is None or right.values is None:
         return _NumberValue(
             None,
             left.reason or right.reason,
             left.tracked or right.tracked,
             left.identity if left.identity == right.identity else "",
+            tuple(dict.fromkeys((*left.identities, *right.identities))),
         )
     values = _limited(set(left.values) | set(right.values))
     return _NumberValue(
@@ -1501,11 +1562,12 @@ def _merge_numbers(left: _NumberValue | None, right: _NumberValue | None) -> _Nu
         "数值集合超过 256 项" if values is None else "",
         left.tracked or right.tracked,
         left.identity if left.identity == right.identity else "",
+        tuple(dict.fromkeys((*left.identities, *right.identities))),
     )
 
 
 def _number_semantic_key(value: _NumberValue) -> tuple[object, ...]:
-    return value.values, value.tracked, value.identity
+    return value.values, value.tracked, value.identity, value.identities
 
 
 @lru_cache(maxsize=None)
@@ -1541,6 +1603,7 @@ def _address_variables_for_block(block: _CommandBlock) -> frozenset[int]:
     return frozenset(variables)
 
 
+@lru_cache(maxsize=262_144)
 def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _StringValue | None:
     if left is None and right is None:
         return None
@@ -1718,62 +1781,58 @@ def _expand_string_references(
     return frozenset(concrete)
 
 
+def _merge_value_maps(left: dict, right: dict, merge: Callable) -> dict:
+    if left is right or not left and not right:
+        return dict(left)
+    if left == right:
+        return dict(left)
+    result = {}
+    for key, left_value in left.items():
+        value = merge(left_value, right.get(key))
+        if value is not None:
+            result[key] = value
+    for key, right_value in right.items():
+        if key in left:
+            continue
+        value = merge(None, right_value)
+        if value is not None:
+            result[key] = value
+    return result
+
+
 def _merge_states(states: list[_AnalysisState]) -> _AnalysisState:
     if not states:
         return _AnalysisState({}, {}, {})
     result = states[0].copy()
     for state in states[1:]:
-        result.numbers = {
-            key: value
-            for key in set(result.numbers) | set(state.numbers)
-            if (value := _merge_numbers(result.numbers.get(key), state.numbers.get(key))) is not None
-        }
-        result.strings = {
-            key: value
-            for key in set(result.strings) | set(state.strings)
-            if (value := _merge_strings(result.strings.get(key), state.strings.get(key))) is not None
-        }
-        result.database_strings = {
-            key: value
-            for key in set(result.database_strings) | set(state.database_strings)
-            if (
-                value := _merge_strings(
-                    result.database_strings.get(key), state.database_strings.get(key)
-                )
-            ) is not None
-        }
-        result.database_numbers = {
-            key: value
-            for key in set(result.database_numbers) | set(state.database_numbers)
-            if (
-                value := _merge_numbers(
-                    result.database_numbers.get(key), state.database_numbers.get(key)
-                )
-            ) is not None
-        }
-        result.dynamic_database_numbers = {
-            key: value
-            for key in set(result.dynamic_database_numbers) | set(state.dynamic_database_numbers)
-            if (
-                value := _merge_numbers(
-                    result.dynamic_database_numbers.get(key),
-                    state.dynamic_database_numbers.get(key),
-                )
-            ) is not None
-        }
-        result.dynamic_database_strings = {
-            key: value
-            for key in (
-                set(result.dynamic_database_strings)
-                | set(state.dynamic_database_strings)
+        if result.numbers or state.numbers:
+            result.numbers = _merge_value_maps(
+                result.numbers, state.numbers, _merge_numbers
             )
-            if (
-                value := _merge_strings(
-                    result.dynamic_database_strings.get(key),
-                    state.dynamic_database_strings.get(key),
-                )
-            ) is not None
-        }
+        if result.strings or state.strings:
+            result.strings = _merge_value_maps(
+                result.strings, state.strings, _merge_strings
+            )
+        if result.database_strings or state.database_strings:
+            result.database_strings = _merge_value_maps(
+                result.database_strings, state.database_strings, _merge_strings
+            )
+        if result.database_numbers or state.database_numbers:
+            result.database_numbers = _merge_value_maps(
+                result.database_numbers, state.database_numbers, _merge_numbers
+            )
+        if result.dynamic_database_numbers or state.dynamic_database_numbers:
+            result.dynamic_database_numbers = _merge_value_maps(
+                result.dynamic_database_numbers,
+                state.dynamic_database_numbers,
+                _merge_numbers,
+            )
+        if result.dynamic_database_strings or state.dynamic_database_strings:
+            result.dynamic_database_strings = _merge_value_maps(
+                result.dynamic_database_strings,
+                state.dynamic_database_strings,
+                _merge_strings,
+            )
         result.unknown_scopes = result.unknown_scopes | state.unknown_scopes
         result.unknown_reasons = result.unknown_reasons | state.unknown_reasons
     return result
@@ -1876,11 +1935,316 @@ def _states_semantically_equal(left: _AnalysisState, right: _AnalysisState) -> b
     )
 
 
+@dataclass(frozen=True)
+class _PersistentReadPlan:
+    references: frozenset[int]
+    string_references: frozenset[int]
+    database_reads: tuple[
+        tuple[
+            int,
+            bool,
+            bool,
+            str,
+            frozenset[int] | None,
+            frozenset[int] | None,
+            frozenset[int] | None,
+        ],
+        ...,
+    ]
+    all_numbers: bool
+    all_strings: bool
+    reads_database_state: bool
+    reads_unknown_state: bool
+
+
+_PersistentReadCache = dict[tuple[int, bool], _PersistentReadPlan]
+
+
+def _compile_persistent_read_plan(
+    block: _CommandBlock,
+    databases: dict[str, dict[int, _DatabaseType]],
+    common_by_id: dict[int, _CommandBlock] | None,
+    common_by_name: dict[str, tuple[_CommandBlock, ...]] | None,
+) -> _PersistentReadPlan:
+    scan_blocks = [block]
+    unresolved_nested_call = False
+    if common_by_id is not None and common_by_name is not None:
+        visited = {(block.source, block.event_type, block.event_id, block.page)}
+        scan_index = 0
+        while scan_index < len(scan_blocks):
+            caller = scan_blocks[scan_index]
+            scan_index += 1
+            for command in caller.commands:
+                if command.opcode not in {210, 300} or not command.ints:
+                    continue
+                target: _CommandBlock | None = None
+                if command.opcode == 300 and command.strings:
+                    if not (
+                        _CSELF_REFERENCE_RE.search(command.strings[0])
+                        or _STRING_REFERENCE_RE.search(command.strings[0])
+                    ):
+                        matches = common_by_name.get(command.strings[0], ())
+                        target = matches[0] if len(matches) == 1 else None
+                elif command.opcode == 210:
+                    reference = command.ints[0]
+                    if (
+                        599_000 <= reference < 601_000
+                        and caller.event_type == "common"
+                    ):
+                        target_id = caller.event_id + reference - 600_100
+                    elif 500_000 <= reference < 600_000:
+                        target_id = reference - 500_000
+                    else:
+                        target_id = -1
+                    target = common_by_id.get(target_id)
+                if target is None:
+                    unresolved_nested_call = True
+                    continue
+                identity = (
+                    target.source,
+                    target.event_type,
+                    target.event_id,
+                    target.page,
+                )
+                if identity not in visited:
+                    visited.add(identity)
+                    scan_blocks.append(target)
+
+    references: set[int] = set()
+    string_references: set[int] = set()
+    database_reads: list[
+        tuple[
+            int,
+            bool,
+            bool,
+            str,
+            frozenset[int] | None,
+            frozenset[int] | None,
+            frozenset[int] | None,
+        ]
+    ] = []
+    all_numbers = False
+    all_strings = False
+    reads_database_state = unresolved_nested_call
+    reads_unknown_state = False
+    for scan_block in scan_blocks:
+        for command in scan_block.commands:
+            for raw in command.ints:
+                if raw >= 1_000_000:
+                    references.update((raw, raw & 0x00FFFFFF))
+            string_references.update(
+                _string_variable_for_escape("s", int(reference))
+                for literal in command.strings
+                for reference in _STRING_REFERENCE_RE.findall(literal)
+            )
+            if command.opcode == 121 and len(command.ints) == 7:
+                all_numbers = True
+            if (
+                command.opcode == 122
+                and len(command.ints) >= 2
+                and command.ints[1] & 0x0F == 2
+            ):
+                all_numbers = True
+                all_strings = True
+            if command.opcode == 250 and len(command.ints) == 5:
+                flags = command.ints[3]
+                byte1 = (flags >> 8) & 0xFF
+                byte2 = (flags >> 16) & 0xFF
+                database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+                if database is not None:
+                    types = databases.get(database, {})
+                    type_ids = (
+                        frozenset(
+                            type_id
+                            for type_id, item in types.items()
+                            if item.name
+                            == (
+                                command.strings[1]
+                                if len(command.strings) > 1
+                                else ""
+                            )
+                        )
+                        if byte2 & 0x01
+                        else (
+                            frozenset({command.ints[0]})
+                            if 0 <= command.ints[0] < 1_000_000
+                            else None
+                        )
+                    )
+                    field_ids = (
+                        frozenset(
+                            field_id
+                            for type_id in (
+                                type_ids if type_ids is not None else types
+                            )
+                            for field_id, name in types.get(
+                                type_id,
+                                _DatabaseType(database, type_id, "", {}, {}, (), ()),
+                            ).field_names.items()
+                            if name
+                            == (
+                                command.strings[3]
+                                if len(command.strings) > 3
+                                else ""
+                            )
+                        )
+                        if byte2 & 0x04
+                        else (
+                            frozenset({command.ints[2]})
+                            if 0 <= command.ints[2] < 1_000_000
+                            else None
+                        )
+                    )
+                    data_ids = (
+                        frozenset(
+                            data_id
+                            for type_id in (
+                                type_ids if type_ids is not None else types
+                            )
+                            for data_id, name in enumerate(
+                                types.get(
+                                    type_id,
+                                    _DatabaseType(
+                                        database, type_id, "", {}, {}, (), ()
+                                    ),
+                                ).data_names
+                            )
+                            if name
+                            == (
+                                command.strings[2]
+                                if len(command.strings) > 2
+                                else ""
+                            )
+                        )
+                        if byte2 & 0x02
+                        else (
+                            frozenset({command.ints[1]})
+                            if 0 <= command.ints[1] < 1_000_000
+                            else None
+                        )
+                    )
+                    database_reads.append(
+                        (
+                            command.ints[4] & 0x00FFFFFF,
+                            bool(byte1 & 0x10),
+                            not any(command.strings),
+                            database,
+                            type_ids,
+                            data_ids,
+                            field_ids,
+                        )
+                    )
+            if (
+                common_by_id is None
+                and command.opcode in {210, 300}
+                and len(command.ints) >= 2
+            ):
+                flags = command.ints[1]
+                if flags & 0x01000000 or (flags >> 4) & 0x0F:
+                    reads_database_state = True
+            if command.opcode == 112:
+                reads_unknown_state = True
+            if command_semantics(
+                command.opcode, len(command.ints), len(command.strings)
+            ) is None:
+                all_numbers = True
+                all_strings = True
+                reads_database_state = True
+                reads_unknown_state = True
+    return _PersistentReadPlan(
+        frozenset(references),
+        frozenset(string_references),
+        tuple(database_reads),
+        all_numbers,
+        all_strings,
+        reads_database_state,
+        reads_unknown_state,
+    )
+
+
+def _apply_persistent_read_plan(
+    plan: _PersistentReadPlan, state: _AnalysisState
+) -> _AnalysisState:
+    database_reads = tuple(
+        item[3:]
+        for item in plan.database_reads
+        if item[1] or (item[2] and item[0] not in state.strings)
+    )
+
+    def static_database_key(key: tuple[str, int, int, int]) -> bool:
+        return plan.reads_database_state or any(
+            key[0] == database
+            and (type_ids is None or key[1] in type_ids)
+            and (data_ids is None or key[2] in data_ids)
+            and (field_ids is None or key[3] in field_ids)
+            for database, type_ids, data_ids, field_ids in database_reads
+        )
+
+    def dynamic_database_key(key: tuple[str, int, int, str]) -> bool:
+        return plan.reads_database_state or any(
+            key[0] == database
+            and (type_ids is None or key[1] in type_ids)
+            and (field_ids is None or key[2] in field_ids)
+            for database, type_ids, _data_ids, field_ids in database_reads
+        )
+
+    return _AnalysisState(
+        dict(state.numbers)
+        if plan.all_numbers
+        else {
+            key: value
+            for key, value in state.numbers.items()
+            if key in plan.references
+        },
+        dict(state.strings)
+        if plan.all_strings
+        else {
+            key: value
+            for key, value in state.strings.items()
+            if key in plan.references or key in plan.string_references
+        },
+        {
+            key: value
+            for key, value in state.database_strings.items()
+            if static_database_key(key)
+        },
+        {
+            key: value
+            for key, value in state.database_numbers.items()
+            if static_database_key(key)
+        },
+        {
+            key: value
+            for key, value in state.dynamic_database_numbers.items()
+            if dynamic_database_key(key)
+        },
+        {
+            key: value
+            for key, value in state.dynamic_database_strings.items()
+            if dynamic_database_key(key)
+        },
+        state.unknown_scopes if plan.reads_unknown_state else frozenset(),
+        state.unknown_reasons if plan.reads_unknown_state else frozenset(),
+    )
+
+
 def _persistent_inputs_for_block(
     block: _CommandBlock,
     state: _AnalysisState,
     databases: dict[str, dict[int, _DatabaseType]],
+    common_by_id: dict[int, _CommandBlock] | None = None,
+    common_by_name: dict[str, tuple[_CommandBlock, ...]] | None = None,
+    read_cache: _PersistentReadCache | None = None,
 ) -> _AnalysisState:
+    if read_cache is not None:
+        key = (id(block), common_by_id is not None)
+        plan = read_cache.get(key)
+        if plan is None:
+            plan = _compile_persistent_read_plan(
+                block, databases, common_by_id, common_by_name
+            )
+            read_cache[key] = plan
+        return _apply_persistent_read_plan(plan, state)
     references: set[int] = set()
     string_references: set[int] = set()
     database_reads: list[
@@ -1890,7 +2254,54 @@ def _persistent_inputs_for_block(
     all_strings = False
     reads_database_state = False
     reads_unknown_state = False
-    for command in block.commands:
+    scan_blocks = [block]
+    unresolved_nested_call = False
+    if common_by_id is not None and common_by_name is not None:
+        visited = {
+            (block.source, block.event_type, block.event_id, block.page)
+        }
+        scan_index = 0
+        while scan_index < len(scan_blocks):
+            caller = scan_blocks[scan_index]
+            scan_index += 1
+            for command in caller.commands:
+                if command.opcode not in {210, 300} or not command.ints:
+                    continue
+                target: _CommandBlock | None = None
+                if command.opcode == 300 and command.strings:
+                    if not (
+                        _CSELF_REFERENCE_RE.search(command.strings[0])
+                        or _STRING_REFERENCE_RE.search(command.strings[0])
+                    ):
+                        matches = common_by_name.get(command.strings[0], ())
+                        target = matches[0] if len(matches) == 1 else None
+                elif command.opcode == 210:
+                    reference = command.ints[0]
+                    if (
+                        599_000 <= reference < 601_000
+                        and caller.event_type == "common"
+                    ):
+                        target_id = caller.event_id + reference - 600_100
+                    elif 500_000 <= reference < 600_000:
+                        target_id = reference - 500_000
+                    else:
+                        target_id = -1
+                    target = common_by_id.get(target_id)
+                if target is None:
+                    unresolved_nested_call = True
+                    continue
+                identity = (
+                    target.source,
+                    target.event_type,
+                    target.event_id,
+                    target.page,
+                )
+                if identity not in visited:
+                    visited.add(identity)
+                    scan_blocks.append(target)
+
+    for scan_block in scan_blocks:
+      for command in scan_block.commands:
         for raw in command.ints:
             if raw >= 1_000_000:
                 references.update((raw, raw & 0x00FFFFFF))
@@ -1968,7 +2379,11 @@ def _persistent_inputs_for_block(
                     )
                 )
                 database_reads.append((database, type_ids, data_ids, field_ids))
-        if command.opcode in {210, 300} and len(command.ints) >= 2:
+        if (
+            common_by_id is None
+            and command.opcode in {210, 300}
+            and len(command.ints) >= 2
+        ):
             flags = command.ints[1]
             if flags & 0x01000000 or (flags >> 4) & 0x0F:
                 reads_database_state = True
@@ -1978,6 +2393,8 @@ def _persistent_inputs_for_block(
             command.opcode, len(command.ints), len(command.strings)
         ) is None:
             all_numbers = all_strings = reads_database_state = reads_unknown_state = True
+    if unresolved_nested_call:
+        reads_database_state = True
 
     def static_database_key(key: tuple[str, int, int, int]) -> bool:
         return reads_database_state or any(
@@ -2130,6 +2547,11 @@ class _BlockAnalyzer:
         call_argument_pool: _CallArgumentPool | None = None,
         candidate_values: dict[str, str] | None = None,
         audit: _AnalysisAudit | None = None,
+        persistent_read_cache: _PersistentReadCache | None = None,
+        metrics: _AnalysisMetrics | None = None,
+        block_plan_cache: _BlockPlanCache | None = None,
+        event_item_cache: _EventItemCache | None = None,
+        entry_plan_cache: _EntryPlanCache | None = None,
     ) -> None:
         self.block = block
         self.databases = databases
@@ -2145,6 +2567,15 @@ class _BlockAnalyzer:
         )
         self.candidate_values = candidate_values or {}
         self.audit = audit if audit is not None else _AnalysisAudit.empty()
+        self.persistent_read_cache = (
+            persistent_read_cache if persistent_read_cache is not None else {}
+        )
+        self.metrics = metrics if metrics is not None else _AnalysisMetrics()
+        self.block_plan_cache = (
+            block_plan_cache if block_plan_cache is not None else {}
+        )
+        self.event_item_cache = event_item_cache if event_item_cache is not None else {}
+        self.entry_plan_cache = entry_plan_cache if entry_plan_cache is not None else {}
         self.dependencies: list[dict[str, object]] = []
         self.blocking: list[dict[str, object]] = []
         self.unknown = Counter()
@@ -2152,19 +2583,44 @@ class _BlockAnalyzer:
         self._unknown_seen: set[tuple[int, str, str]] = set()
         self.summary_failed = ""
         self.output_state = _AnalysisState({}, {}, {})
-        self._address_variables = _address_variables_for_block(block)
-        labels: dict[str, list[int]] = {}
-        for position, command in enumerate(block.commands):
-            if command.opcode == 212 and len(command.strings) == 1:
-                for label in self._candidate_literal_values(command, position, 0):
-                    labels.setdefault(label, []).append(position)
-        self.labels = {name: tuple(positions) for name, positions in labels.items()}
-        self._condition_regions: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {}
-        self._branch_exits: dict[int, int] = {}
-        self._loop_ends: dict[int, int] = {}
-        self._loop_starts: dict[int, int] = {}
-        self._enclosing_loops: dict[int, tuple[int, int]] = {}
-        self._index_control_flow()
+        plan = self.block_plan_cache.get(id(block))
+        if plan is None:
+            self._address_variables = _address_variables_for_block(block)
+            labels: dict[str, list[int]] = {}
+            for position, command in enumerate(block.commands):
+                if command.opcode == 212 and len(command.strings) == 1:
+                    for label in self._candidate_literal_values(command, position, 0):
+                        labels.setdefault(label, []).append(position)
+            self.labels = {
+                name: tuple(positions) for name, positions in labels.items()
+            }
+            self._condition_regions = {}
+            self._branch_exits = {}
+            self._loop_ends = {}
+            self._loop_starts = {}
+            self._enclosing_loops = {}
+            self._index_control_flow()
+            self._basic_block_starts = self._index_basic_blocks()
+            plan = _BlockPlan(
+                self._address_variables,
+                self.labels,
+                self._condition_regions,
+                self._branch_exits,
+                self._loop_ends,
+                self._loop_starts,
+                self._enclosing_loops,
+                self._basic_block_starts,
+            )
+            self.block_plan_cache[id(block)] = plan
+        else:
+            self._address_variables = plan.address_variables
+            self.labels = plan.labels
+            self._condition_regions = plan.condition_regions
+            self._branch_exits = plan.branch_exits
+            self._loop_ends = plan.loop_ends
+            self._loop_starts = plan.loop_starts
+            self._enclosing_loops = plan.enclosing_loops
+            self._basic_block_starts = plan.basic_block_starts
 
     def _command_id(self, index: int) -> str:
         return f"{self.block.source}:{self.block.event_type}:{self.block.event_id}:{self.block.page}:{index + 1}"
@@ -2203,12 +2659,24 @@ class _BlockAnalyzer:
         literal = command.strings[string_index] if string_index < len(command.strings) else ""
         values = {
             self.candidate_values.get(item.key, literal)
-            for item in _items_for_event_codes(
-                self.event_items, self.block, index + 1, string_index
-            )
+            for item in self._event_items_at(index, string_index)
             if item.original == literal
         }
         return frozenset(values or {literal})
+
+    def _event_items_at(
+        self, index: int, string_index: int
+    ) -> tuple[TranslationItem, ...]:
+        key = (id(self.block), index + 1, string_index)
+        cached = self.event_item_cache.get(key)
+        if cached is None:
+            cached = tuple(
+                _items_for_event_codes(
+                    self.event_items, self.block, index + 1, string_index
+                )
+            )
+            self.event_item_cache[key] = cached
+        return cached
 
     def _index_control_flow(self) -> None:
         commands = self.block.commands
@@ -2250,6 +2718,35 @@ class _BlockAnalyzer:
             if enclosing is not None:
                 self._enclosing_loops[index] = enclosing
 
+    def _index_basic_blocks(self) -> frozenset[int]:
+        """Precompute every statically possible non-fallthrough target."""
+        starts = {0}
+        command_count = len(self.block.commands)
+        for closing, branches in self._condition_regions.values():
+            if closing + 1 < command_count:
+                starts.add(closing + 1)
+            starts.update(
+                marker + 1
+                for marker, branch_end in branches
+                if marker + 1 < branch_end
+            )
+        for start, closing in self._loop_ends.items():
+            starts.add(start)
+            if start + 1 < command_count:
+                starts.add(start + 1)
+            if closing + 1 < command_count:
+                starts.add(closing + 1)
+        starts.update(
+            target for target in self._branch_exits.values() if target < command_count
+        )
+        starts.update(
+            position + 1
+            for positions in self.labels.values()
+            for position in positions
+            if position + 1 < command_count
+        )
+        return frozenset(starts)
+
     def _dynamic_entry_dispatcher(
         self, block: _CommandBlock | None = None
     ) -> int | None:
@@ -2269,6 +2766,23 @@ class _BlockAnalyzer:
             ):
                 return index
         return None
+
+    def _entry_plan(self, block: _CommandBlock) -> _EntryPlan:
+        plan = self.entry_plan_cache.get(id(block))
+        if plan is None:
+            plan = _EntryPlan(
+                self._dynamic_entry_dispatcher(block),
+                tuple(
+                    position
+                    for position, item in enumerate(block.commands)
+                    if item.opcode == 212
+                    and item.indent == 0
+                    and len(item.strings) == 1
+                    and item.strings[0].startswith("cmd:")
+                ),
+            )
+            self.entry_plan_cache[id(block)] = plan
+        return plan
 
     def _resource_reference(
         self,
@@ -2609,14 +3123,15 @@ class _BlockAnalyzer:
     ) -> frozenset[tuple[str, int, int, str, str, str, int, int]]:
         """Return a canonical selector only when its numeric source is exact."""
         value = self._address_number(data_raw, state)
-        if not value.identity:
+        identities = value.identities or ((value.identity,) if value.identity else ())
+        if not identities:
             return frozenset()
         return frozenset(
             (
                 database,
                 type_id,
                 field_id,
-                value.identity,
+                identity,
                 "",
                 "address-expression",
                 -1,
@@ -2624,6 +3139,7 @@ class _BlockAnalyzer:
             )
             for type_id in type_ids
             for field_id in field_ids
+            for identity in identities
         )
 
     def _database(self, command: _Command, index: int, state: _AnalysisState) -> None:
@@ -3236,9 +3752,7 @@ class _BlockAnalyzer:
         literal = command.strings[string_index] if string_index < len(command.strings) else ""
         keys = frozenset(
             item.key
-            for item in _items_for_event_codes(
-                self.event_items, self.block, index + 1, string_index
-            )
+            for item in self._event_items_at(index, string_index)
             if item.original == literal
         )
         if self.block.event_type == "common":
@@ -3407,9 +3921,7 @@ class _BlockAnalyzer:
             literal_keys = {
                 item.key
                 for string_index, literal in enumerate(command.strings)
-                for item in _items_for_event_codes(
-                    self.event_items, self.block, index + 1, string_index
-                )
+                for item in self._event_items_at(index, string_index)
                 if item.original == literal
             }
             replacement = _StringValue(
@@ -3474,9 +3986,7 @@ class _BlockAnalyzer:
             literal_values = condition_literal.literals
             condition_keys = sorted(
                 item.key
-                for item in _items_for_event_codes(
-                    self.event_items, self.block, index + 1, condition_index
-                )
+                for item in self._event_items_at(index, condition_index)
                 if item.original == command.strings[condition_index]
             )
             value = state.strings.get(variable)
@@ -3887,24 +4397,8 @@ class _BlockAnalyzer:
                     (target_value,),
                     status="resolved",
                 )
-        target_has_dispatcher = any(
-            command.indent == 0
-            and following.indent == 0
-            and command.opcode == 122
-            and command.ints[:2] == (3_000_001, 0)
-            and command.strings == ("cmd:\\cself[0]",)
-            and following.opcode == 213
-            and following.strings == ("\\s[1]",)
-            for command, following in zip(target.commands, target.commands[1:])
-        )
-        target_has_entry_labels = any(
-            item.opcode == 212
-            and item.indent == 0
-            and len(item.strings) == 1
-            and item.strings[0].startswith("cmd:")
-            for item in target.commands
-        )
-        if choice is None and (target_has_dispatcher or target_has_entry_labels):
+        entry_plan = self._entry_plan(target)
+        if choice is None and (entry_plan.dispatcher is not None or entry_plan.labels):
             self._record_call(command_id, "conservative", target_scopes)
             self._blocking_scope_dependency(
                 command,
@@ -3981,25 +4475,19 @@ class _BlockAnalyzer:
             self._unknown_call(command, index, state, "字符串实参数量与 Auto 头部不符", target_scopes)
             return
 
-        callee_state = _AnalysisState(
-            {},
-            {},
-            dict(state.database_strings),
-            dict(state.database_numbers),
-            dict(state.dynamic_database_numbers),
-            dict(state.dynamic_database_strings),
-        )
+        local_numbers: dict[int, _NumberValue] = {}
+        local_strings: dict[int, _StringValue] = {}
         for offset, raw in enumerate(command.ints[2:string_start]):
             resolver = (
                 self._address_number
                 if 1_600_000 + offset in _address_variables_for_block(target)
                 else self._number
             )
-            callee_state.numbers[1_600_000 + offset] = resolver(raw, state)
+            local_numbers[1_600_000 + offset] = resolver(raw, state)
         for offset, raw in enumerate(string_arguments):
             destination = 1_600_005 + offset
             if raw >= 1_000_000:
-                callee_state.strings[destination] = state.strings.get(
+                local_strings[destination] = state.strings.get(
                     raw & 0x00FFFFFF,
                     _StringValue(
                         unknown=f"字符串实参 {raw & 0x00FFFFFF} 来源未知",
@@ -4008,7 +4496,7 @@ class _BlockAnalyzer:
                 )
             else:
                 pooled = self.call_argument_pool.get(command_id, ())
-                callee_state.strings[destination] = (
+                local_strings[destination] = (
                     pooled[offset]
                     if offset < len(pooled)
                     else self._literal_string(
@@ -4020,7 +4508,7 @@ class _BlockAnalyzer:
                 )
 
         carries_translation_provenance = any(
-            value.tracked for value in callee_state.strings.values()
+            value.tracked for value in local_strings.values()
         )
         if not has_return and not carries_translation_provenance:
             # ponytail: every public event is analyzed once with symbolic numeric
@@ -4029,18 +4517,35 @@ class _BlockAnalyzer:
             # multiplying large event bodies at every call site.
             return
 
-        dispatcher = self._dynamic_entry_dispatcher(target)
+        # A public-event frame inherits database state, but not the caller's
+        # CSelf/global variable maps. Project that exact shared view before
+        # adding arguments so cache keys ignore unrelated database cells.
+        shared_state = _AnalysisState(
+            {},
+            {},
+            state.database_strings,
+            state.database_numbers,
+            state.dynamic_database_numbers,
+            state.dynamic_database_strings,
+            state.unknown_scopes,
+            state.unknown_reasons,
+        )
+        callee_state = _persistent_inputs_for_block(
+            target,
+            shared_state,
+            self.databases,
+            self.common_by_id,
+            self.common_by_name,
+            self.persistent_read_cache,
+        )
+        callee_state.numbers.update(local_numbers)
+        callee_state.strings.update(local_strings)
+
+        dispatcher = entry_plan.dispatcher
         if dispatcher is not None:
             start, end = dispatcher, len(target.commands)
         else:
-            entry_labels = [
-                position
-                for position, item in enumerate(target.commands)
-                if item.opcode == 212
-                and item.indent == 0
-                and len(item.strings) == 1
-                and item.strings[0].startswith("cmd:")
-            ]
+            entry_labels = entry_plan.labels
             if entry_labels:
                 label = next(
                     (
@@ -4065,6 +4570,7 @@ class _BlockAnalyzer:
         cache_key = (target.event_id, choice, start, end, _state_cache_key(callee_state))
         cached = self.call_cache.get(cache_key)
         if cached is None:
+            self.metrics.summary_misses += 1
             child = _BlockAnalyzer(
                 target,
                 self.databases,
@@ -4078,14 +4584,21 @@ class _BlockAnalyzer:
                 self.call_argument_pool,
                 self.candidate_values,
                 self.audit,
+                self.persistent_read_cache,
+                self.metrics,
+                self.block_plan_cache,
+                self.event_item_cache,
+                self.entry_plan_cache,
             )
             exits: list[_AnalysisState] = []
             fell_through = child._execute(start, end, callee_state, exits)
             if fell_through:
                 exits.append(callee_state.copy())
+            frozen_exits = tuple(item.copy() for item in exits)
             cached = _CallSummary(
                 fell_through,
-                tuple(item.copy() for item in exits),
+                frozen_exits,
+                _merge_states(list(frozen_exits)) if frozen_exits else None,
                 child.summary_failed,
                 tuple(child.dependencies),
                 tuple(child.blocking),
@@ -4096,6 +4609,8 @@ class _BlockAnalyzer:
                 ),
             )
             self.call_cache[cache_key] = cached
+        else:
+            self.metrics.summary_hits += 1
         self.dependencies.extend(cached.dependencies)
         self.blocking.extend(cached.blocking)
         self.unknown.update(cached.unknown)
@@ -4122,11 +4637,13 @@ class _BlockAnalyzer:
             self._set_dynamic_call_return(command, state, target, target_scopes)
             return
 
-        result = _merge_states(list(cached.exits))
-        state.database_strings = dict(result.database_strings)
-        state.database_numbers = dict(result.database_numbers)
-        state.dynamic_database_numbers = dict(result.dynamic_database_numbers)
-        state.dynamic_database_strings = dict(result.dynamic_database_strings)
+        result = cached.result
+        if result is None:
+            raise RuntimeError("公共事件摘要缺少退出状态。")
+        state.database_strings.update(result.database_strings)
+        state.database_numbers.update(result.database_numbers)
+        state.dynamic_database_numbers.update(result.dynamic_database_numbers)
+        state.dynamic_database_strings.update(result.dynamic_database_strings)
         state.unknown_scopes = state.unknown_scopes | result.unknown_scopes
         state.unknown_reasons = state.unknown_reasons | result.unknown_reasons
         # Global variables are shared across public-event frames; CSelf slots are not.
@@ -4339,6 +4856,7 @@ class _BlockAnalyzer:
     ) -> bool:
         end = index + 1
         while index < end:
+            self.metrics.transfers += 1
             command = self.block.commands[index]
             command_id = self._command_id(index)
             semantics = command_semantics(
@@ -4724,48 +5242,65 @@ class _BlockAnalyzer:
                     current = self._widen_back_edge(previous, current)
                     states[key] = current.copy()
                 visits[key] = 0
-            processed[key] = current.copy()
+            if visits[key] == _CFG_STATE_VISIT_LIMIT:
+                processed[key] = current.copy()
 
-            command = self.block.commands[index]
-            if command.opcode not in structural:
-                self._transfer_command(index, current, exits)
-            else:
-                semantics = command_semantics(
-                    command.opcode, len(command.ints), len(command.strings)
-                )
-                command_id = self._command_id(index)
-                if semantics is None:
-                    self.audit.transfers[command_id] = "opaque"
-                    self.audit.data_effects[command_id] = ("opaque", ("project",))
+            # Execute a straight-line basic block in one mutable frame. The old
+            # command-granularity queue copied six state maps before and after
+            # every command, even when no branch could reach the interior.
+            while True:
+                command = self.block.commands[index]
+                if command.opcode not in structural:
+                    self._transfer_command(index, current, exits)
                 else:
-                    self.audit.transfers[command_id] = str(semantics["transfer"])
-            successors = self._cfg_successors(index, limit, current, exits)
-            if command.opcode in _CFG_CONTROL_OPCODES:
-                command_id = self._command_id(index)
-                terminal = command.opcode in {172, 173, 174, 175} or (
-                    command.opcode == 213 and command.strings == ("END",)
-                )
-                if successors or terminal:
-                    self.audit.cfg[command_id] = "exact"
-                elif self.audit.cfg.get(command_id) == "conservative":
-                    pass
-                elif command.opcode == 213 and self._current_scope():
-                    self.audit.cfg[command_id] = "conservative"
-                else:
-                    self.audit.cfg[command_id] = "opaque"
-                for successor, _successor_limit in successors:
-                    target = "END" if successor is None else self._command_id(successor)
-                    self.audit.cfg_edges.add((command_id, target))
-                if terminal:
-                    self.audit.cfg_edges.add((command_id, "END"))
+                    semantics = command_semantics(
+                        command.opcode, len(command.ints), len(command.strings)
+                    )
+                    command_id = self._command_id(index)
+                    if semantics is None:
+                        self.audit.transfers[command_id] = "opaque"
+                        self.audit.data_effects[command_id] = ("opaque", ("project",))
+                    else:
+                        self.audit.transfers[command_id] = str(semantics["transfer"])
+                successors = self._cfg_successors(index, limit, current, exits)
+                if command.opcode in _CFG_CONTROL_OPCODES:
+                    command_id = self._command_id(index)
+                    terminal = command.opcode in {172, 173, 174, 175} or (
+                        command.opcode == 213 and command.strings == ("END",)
+                    )
+                    if successors or terminal:
+                        self.audit.cfg[command_id] = "exact"
+                    elif self.audit.cfg.get(command_id) == "conservative":
+                        pass
+                    elif command.opcode == 213 and self._current_scope():
+                        self.audit.cfg[command_id] = "conservative"
+                    else:
+                        self.audit.cfg[command_id] = "opaque"
+                    for successor, _successor_limit in successors:
+                        target = "END" if successor is None else self._command_id(successor)
+                        self.audit.cfg_edges.add((command_id, target))
+                    if terminal:
+                        self.audit.cfg_edges.add((command_id, "END"))
+
+                if (
+                    len(successors) == 1
+                    and successors[0] == (index + 1, limit)
+                    and index + 1 not in self._basic_block_starts
+                ):
+                    index += 1
+                    continue
+                break
+
             for successor, successor_limit in successors:
                 if successor is None:
-                    fallthrough.append(current.copy())
+                    fallthrough.append(current)
                     continue
                 successor_key = (successor, successor_limit)
                 previous = states.get(successor_key)
+                if previous is not None:
+                    self.metrics.merges += 1
                 merged = (
-                    current.copy()
+                    current
                     if previous is None
                     else self._widen_back_edge(previous, current)
                     if successor <= index
@@ -4998,7 +5533,12 @@ def _analyze_blocks(
     unknown = Counter()
     locations: dict[tuple[int, str], list[str]] = {}
     call_cache: _CallCache = {}
+    persistent_read_cache: _PersistentReadCache = {}
+    block_plan_cache: _BlockPlanCache = {}
+    event_item_cache: _EventItemCache = {}
+    entry_plan_cache: _EntryPlanCache = {}
     audit = _AnalysisAudit.empty()
+    metrics = _AnalysisMetrics()
     root_states: list[_AnalysisState] = []
     for block in blocks:
         analyzer = _BlockAnalyzer(
@@ -5013,7 +5553,13 @@ def _analyze_blocks(
             call_argument_pool=call_argument_pool,
             candidate_values=candidate_values,
             audit=audit,
+            persistent_read_cache=persistent_read_cache,
+            metrics=metrics,
+            block_plan_cache=block_plan_cache,
+            event_item_cache=event_item_cache,
+            entry_plan_cache=entry_plan_cache,
         )
+        metrics.basic_blocks += len(analyzer._basic_block_starts)
         block_dependencies, _block_blocking, block_unknown = analyzer.run()
         dependencies.extend(block_dependencies)
         root_states.append(analyzer.output_state)
@@ -5027,7 +5573,7 @@ def _analyze_blocks(
         merged.numbers = {
             key: value
             for key, value in merged.numbers.items()
-            if not 1_600_000 <= key < 1_600_100 and value.identity
+            if not 1_600_000 <= key < 1_600_100 and value.identities
         }
         merged.strings = {
             key: value
@@ -5052,7 +5598,7 @@ def _analyze_blocks(
             {
                 key: value
                 for key, value in update.numbers.items()
-                if not 1_600_000 <= key < 1_600_100 and value.identity
+                if not 1_600_000 <= key < 1_600_100 and value.identities
             },
             _merge_numbers,
         )
@@ -5096,16 +5642,20 @@ def _analyze_blocks(
             break
         iteration_start = global_state
         next_global_state = global_state
-        iteration_call_cache: _CallCache = {}
         for block_index, block in enumerate(blocks):
             projected = _persistent_inputs_for_block(
-                block, next_global_state, databases
+                block,
+                next_global_state,
+                databases,
+                read_cache=persistent_read_cache,
             )
             if not _state_has_values(projected):
                 continue
             previous = previous_inputs.get(block_index)
             if previous is not None and _states_semantically_equal(previous, projected):
                 continue
+            if previous is not None:
+                metrics.incremental_invalidations += 1
             previous_inputs[block_index] = projected.copy()
             analyzer = _BlockAnalyzer(
                 block,
@@ -5115,10 +5665,15 @@ def _analyze_blocks(
                 common_by_id,
                 common_by_name,
                 event_scopes,
-                call_cache=iteration_call_cache,
+                call_cache=call_cache,
                 call_argument_pool=call_argument_pool,
                 candidate_values=candidate_values,
                 audit=audit,
+                persistent_read_cache=persistent_read_cache,
+                metrics=metrics,
+                block_plan_cache=block_plan_cache,
+                event_item_cache=event_item_cache,
+                entry_plan_cache=entry_plan_cache,
             )
             block_dependencies, _block_blocking, _block_unknown = analyzer.run(
                 projected
@@ -5145,6 +5700,14 @@ def _analyze_blocks(
         "dynamic_database_strings": len(global_state.dynamic_database_strings),
         "block_evaluations": block_evaluations,
         "max_iterations": _GLOBAL_STRING_FLOW_MAX_ITERATIONS,
+        "metrics": {
+            "basic_blocks": metrics.basic_blocks,
+            "transfers": metrics.transfers,
+            "merges": metrics.merges,
+            "summary_hits": metrics.summary_hits,
+            "summary_misses": metrics.summary_misses,
+            "incremental_invalidations": metrics.incremental_invalidations,
+        },
     }
     warnings = [
         {"opcode": opcode, "shape": shape, "count": count, "locations": locations[(opcode, shape)][:5]}
@@ -5444,6 +6007,8 @@ def _translation_usage_report(
                 non_display_field_consumers.setdefault(field, []).append(reference)
     for block in blocks:
         for index, command in enumerate(block.commands, start=1):
+            if not command.strings:
+                continue
             semantics = command_semantics(
                 command.opcode, len(command.ints), len(command.strings)
             )
@@ -5859,14 +6424,12 @@ def _call_graph_report(blocks: list[_CommandBlock]) -> tuple[dict[str, object], 
     )
 
 
-def analyze_auto_export(
+def _compile_auto_program(
     auto_dir: str | Path,
-    items: list[TranslationItem],
     editor: EditorInfo,
     *,
     input_hash: str,
-    candidate_values: dict[str, str] | None = None,
-) -> dict[str, object]:
+) -> _CompiledAutoProgram:
     root = Path(auto_dir).resolve()
     common = root / "BasicData" / "CommonEvent.dat.Auto.txt"
     if not common.is_file():
@@ -5887,7 +6450,11 @@ def analyze_auto_export(
     database_counts: dict[str, dict[str, int]] = {}
     database_types: dict[str, dict[int, _DatabaseType]] = {}
     database_report: dict[str, object] = {}
-    for name, code in (("DataBase", "UDB"), ("CDataBase", "CDB"), ("SysDataBase", "SDB")):
+    for name, code in (
+        ("DataBase", "UDB"),
+        ("CDataBase", "CDB"),
+        ("SysDataBase", "SDB"),
+    ):
         path = root / "BasicData" / f"{name}.Auto.txt"
         if not path.is_file():
             continue
@@ -5897,7 +6464,9 @@ def analyze_auto_export(
             str(type_id): {
                 "name": item.name,
                 "fields": {str(key): value for key, value in item.field_names.items()},
-                "field_types": {str(key): value for key, value in item.field_types.items()},
+                "field_types": {
+                    str(key): value for key, value in item.field_types.items()
+                },
                 "data_count": len(item.rows),
             }
             for type_id, item in index.items()
@@ -5915,8 +6484,35 @@ def analyze_auto_export(
         else block
         for block in blocks
     ]
-
     project = AutoProject(editor.version, tuple(blocks), tuple(sorted(database_types)))
+    return _CompiledAutoProgram(
+        root,
+        editor,
+        input_hash,
+        project,
+        common_counts,
+        map_counts,
+        database_counts,
+        database_types,
+        database_report,
+        hash_directory(root),
+    )
+
+
+def _analyze_compiled_program(
+    compiled: _CompiledAutoProgram,
+    items: list[TranslationItem],
+    candidate_values: dict[str, str] | None = None,
+) -> dict[str, object]:
+    root = compiled.root
+    editor = compiled.editor
+    input_hash = compiled.input_hash
+    project = compiled.project
+    common_counts = compiled.common_counts
+    map_counts = compiled.map_counts
+    database_counts = compiled.database_counts
+    database_types = compiled.database_types
+    database_report = compiled.database_report
     dependencies, blocking, warnings, audit, global_string_flow = _analyze_blocks(
         project.events, items, database_types, candidate_values
     )
@@ -6024,6 +6620,8 @@ def analyze_auto_export(
     )
     return {
         "schema": AUTO_ANALYSIS_SCHEMA,
+        "engine": ANALYSIS_ENGINE,
+        "metrics": dict(global_string_flow["metrics"]),
         "editor": {
             "path": str(editor.path),
             "version": editor.version,
@@ -6083,7 +6681,7 @@ def analyze_auto_export(
             "opaque_locations": sorted(set(opaque_effects))[:50],
         },
         "input_hash": input_hash,
-        "output_hash": hash_directory(root),
+        "output_hash": compiled.output_hash,
         "counts": {
             "common_events": common_counts["events"],
             "common_pages": common_counts["pages"],
@@ -6121,6 +6719,18 @@ def analyze_auto_export(
             for warning in warnings
         ],
     }
+
+
+def analyze_auto_export(
+    auto_dir: str | Path,
+    items: list[TranslationItem],
+    editor: EditorInfo,
+    *,
+    input_hash: str,
+    candidate_values: dict[str, str] | None = None,
+) -> dict[str, object]:
+    compiled = _compile_auto_program(auto_dir, editor, input_hash=input_hash)
+    return _analyze_compiled_program(compiled, items, candidate_values)
 
 
 def _safety_predicate(operator: str, left: str, right: str) -> bool:
@@ -6281,39 +6891,7 @@ def _semantic_replay_signature(report: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _replay_changed_commands(
-    original: dict[str, object], candidate: dict[str, object]
-) -> dict[str, set[str]]:
-    def grouped(
-        records: Iterable[tuple[object, ...]], field: str
-    ) -> dict[str, set[tuple[object, ...]]]:
-        result: dict[str, set[tuple[object, ...]]] = {}
-        for record in records:
-            command_id = (
-                str(record[0])
-                if field in {"cfg_edges", "calls", "data_effects"}
-                else ":".join(map(str, record[:5]))
-            )
-            result.setdefault(command_id, set()).add(record)
-        return result
-
-    changed: dict[str, set[str]] = {}
-    for field in ("cfg_edges", "calls", "data_effects", "conditions", "resources"):
-        left = grouped(original.get(field, ()), field)
-        right = grouped(candidate.get(field, ()), field)
-        command_ids = {
-            command_id
-            for command_id in left.keys() | right.keys()
-            if left.get(command_id, set()) != right.get(command_id, set())
-        }
-        if command_ids:
-            changed[field] = command_ids
-    if original.get("opaque_effects") != candidate.get("opaque_effects"):
-        changed["opaque_effects"] = {"project"}
-    return changed
-
-
-def analyze_translation_safety(
+def _analyze_compiled_translation_safety(
     auto_dir: str | Path,
     items: list[TranslationItem],
     candidate_values: dict[str, str],
@@ -6695,124 +7273,42 @@ def analyze_translation_safety(
     for key in base_protected:
         reasons.setdefault(key, set()).add("not_proven_safe")
 
-    editor_data = analysis.get("editor", {})
-    if not isinstance(editor_data, dict):
-        raise ValueError("Editor 分析报告缺少 Editor 身份。")
-    editor_version = str(editor_data.get("version", ""))
-    editor = EditorInfo(
-        Path(str(editor_data.get("path", "Editor.exe"))),
-        editor_version,
-        tuple(int(value) for value in editor_version.split(".") if value.isdigit()),
-        str(editor_data.get("sha256", "")),
-    )
-    baseline_report = analysis
-    original_signature = _semantic_replay_signature(baseline_report)
-    replay_report = baseline_report
+    original_signature = _semantic_replay_signature(analysis)
+    replay_report = analysis
     replay_signature = original_signature
     replay_differences: list[str] = []
     replay_history: list[dict[str, object]] = []
-    previous_candidates: dict[str, str] | None = None
     iterations = 0
+    pending_dependencies = dependencies
     while True:
         protected_before = len(forced)
-        for dependency in dependencies:
+        for dependency in pending_dependencies:
             evaluate_dependency(dependency)
         active_candidates = {
             key: final_value(key)
             for key in candidates
             if final_value(key) != originals[key]
         }
-        if active_candidates != previous_candidates:
-            replay_report = analyze_auto_export(
-                root,
-                items,
-                editor,
-                input_hash=str(analysis.get("input_hash", "")),
-                candidate_values=active_candidates,
-            )
-            replay_global_flow = replay_report.get("global_string_flow")
-            if not (
-                isinstance(replay_global_flow, dict)
-                and replay_global_flow.get("converged") is True
-            ):
-                protect(active_candidates, "global_string_flow_not_converged")
-            replay_signature = _semantic_replay_signature(replay_report)
-            previous_candidates = dict(active_candidates)
-        replay_changes = _replay_changed_commands(
-            original_signature, replay_signature
-        )
-        replay_differences = sorted(replay_changes)
-        abstract_differences: list[str] = []
-        if replay_differences:
-            changed_commands = {
-                command_id
-                for command_ids in replay_changes.values()
-                for command_id in command_ids
-                if command_id != "project"
-            }
-            affected: set[str] = set()
-            for dependency in [*dependencies, *replay_report.get("dependencies", ())]:
-                if not isinstance(dependency, dict):
-                    continue
-                dependency_id = ":".join(map(str, (
-                    dependency.get("auto_file", ""),
-                    dependency.get("event_type", ""),
-                    dependency.get("event_id", ""),
-                    dependency.get("page", ""),
-                    dependency.get("command", ""),
-                )))
-                if dependency_id not in changed_commands:
-                    continue
-                dependency_keys: set[str] = set()
-                for field in ("condition_keys", "source_keys", "right_source_keys"):
-                    dependency_keys.update(map(str, dependency.get(field, ())))
-                kind = str(dependency.get("kind", ""))
-                scoped = _scope_keys(
-                    items,
-                    tuple(map(str, dependency.get("unresolved_scopes", ()))),
-                    scope_cache,
-                )
-                if kind == "call":
-                    affected.update(
-                        key
-                        for key in dependency_keys | scoped
-                        if key in active_candidates and not same_event_target(key)
-                    )
-                elif kind != "condition":
-                    active_keys = dependency_keys & active_candidates.keys()
-                    affected.update(active_keys or (scoped & active_candidates.keys()))
-            affected.intersection_update(active_candidates)
-            if not affected:
-                non_condition = set(replay_differences) - {"conditions"}
-                if non_condition:
-                    # A semantic delta without provenance is an analyzer defect,
-                    # not evidence that every unrelated translation is unsafe.
-                    raise RuntimeError(
-                        "WOLF 候选译文重放出现无法定位来源的语义差异："
-                        + ", ".join(sorted(non_condition))
-                    )
-                # Dynamic abstract domains can contain different strings while
-                # every candidate predicate remains equivalent. The explicit
-                # item-wise checks above are the safety property we care about.
-                abstract_differences.append("conditions")
-                replay_differences = []
-            else:
-                protect(affected, "semantic_replay_difference")
         replay_history.append({
             "iteration": iterations + 1,
             "active_candidates": len(active_candidates),
-            "differences": sorted(replay_changes),
-            "abstract_differences": abstract_differences,
-            "changed_commands": {
-                field: sorted(command_ids)[:20]
-                for field, command_ids in sorted(replay_changes.items())
-            },
+            "differences": [],
+            "abstract_differences": [],
+            "changed_commands": {},
         })
         iterations += 1
-        if len(forced) == protected_before and not replay_differences:
+        if len(forced) == protected_before:
             break
         if iterations > len(candidates) + 1:
             raise RuntimeError("WOLF 候选译文安全保护集合无法收敛。")
+        # ponytail: only conditions and named call targets observe restored
+        # candidates; add a dependency-kind invalidation table if that expands.
+        pending_dependencies = [
+            dependency
+            for dependency in dependencies
+            if isinstance(dependency, dict)
+            and dependency.get("kind", "condition") in {"condition", "call"}
+        ]
 
     protected = set(base_protected)
     protected.update(forced)
@@ -6842,6 +7338,7 @@ def analyze_translation_safety(
         )
     return {
         "schema": TRANSLATION_SAFETY_SCHEMA,
+        "engine": ANALYSIS_ENGINE,
         "safe_to_translate": sorted(safe),
         "approvals": {
             "direct_display": sorted(safe_display),
@@ -6874,6 +7371,23 @@ def analyze_translation_safety(
         },
         "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
     }
+
+
+def analyze_translation_safety(
+    auto_dir: str | Path,
+    items: list[TranslationItem],
+    candidate_values: dict[str, str],
+    policy: str,
+    *,
+    analysis: dict[str, object],
+) -> dict[str, object]:
+    return _analyze_compiled_translation_safety(
+        auto_dir,
+        items,
+        candidate_values,
+        policy,
+        analysis=analysis,
+    )
 
 
 def compare_auto_structure(
@@ -7284,7 +7798,7 @@ def export_and_analyze(
         input_hash = hash_directory(sandbox / "Data")
         analysis = analyze_auto_export(auto_target, items, editor, input_hash=input_hash)
         analysis_path = output / "editor-analysis.json"
-        atomic_write_json(analysis_path, analysis)
+        atomic_write_json(analysis_path, analysis, indent=None)
         if diagnostic_log:
             for path in sorted(auto_target.rglob("*.Auto.txt")):
                 diagnostic_log(

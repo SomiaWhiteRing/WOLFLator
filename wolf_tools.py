@@ -38,6 +38,7 @@ from safe_io import (
     read_text_with_retry,
     replace_with_retry,
 )
+from wolf_analysis import AUTO_ANALYSIS_SCHEMA, TRANSLATION_SAFETY_SCHEMA
 
 
 CODE_HEADER = "Code (No Change)"
@@ -1864,7 +1865,7 @@ def analyze_import_protection(
     unresolved_scope_entries: list[dict[str, object]] = []
     proven_safe: set[str] = set()
     if logic_safety is not None:
-        if logic_safety.get("schema") != 3:
+        if logic_safety.get("schema") != TRANSLATION_SAFETY_SCHEMA:
             raise ValueError("WOLF 候选译文安全报告格式错误。")
         safe_values = logic_safety.get("safe_to_translate")
         if not isinstance(safe_values, list):
@@ -1990,8 +1991,14 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references and logic_safety is not None:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 15:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 15 Editor 分析报告，请重新执行导出文本。")
+        if (
+            not isinstance(logic_analysis, dict)
+            or logic_analysis.get("schema") != AUTO_ANALYSIS_SCHEMA
+        ):
+            raise ValueError(
+                f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} "
+                "Editor 分析报告，请重新执行导出文本。"
+            )
         keep_values = logic_safety.get("keep_original")
         safety_reasons = logic_safety.get("reasons")
         if not isinstance(keep_values, list) or not isinstance(safety_reasons, dict):
@@ -2034,8 +2041,14 @@ def analyze_import_protection(
                 "WOLF 静态安全分析需要保留风险原文，严格模式已阻止导入。"
             )
     elif rules.protect_logic_references:
-        if not isinstance(logic_analysis, dict) or logic_analysis.get("schema") != 15:
-            raise ValueError("WOLF 事件逻辑保护需要 schema 15 Editor 分析报告，请重新执行导出文本。")
+        if (
+            not isinstance(logic_analysis, dict)
+            or logic_analysis.get("schema") != AUTO_ANALYSIS_SCHEMA
+        ):
+            raise ValueError(
+                f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} "
+                "Editor 分析报告，请重新执行导出文本。"
+            )
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
