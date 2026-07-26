@@ -2836,6 +2836,23 @@ class _BlockAnalyzer:
             self.dependencies.append(dependency)
             if dependency["status"] == "blocking":
                 self.blocking.append(dependency)
+        if (
+            command.opcode == 150
+            and not command.strings
+            and len(command.ints) >= 12
+            and command.ints[0] & 0xFF == 0x10
+        ):
+            # Picture mode 0x10 stores its filename string-variable ID in
+            # operand 11; extended command shapes append fields after it.
+            variable = command.ints[11] & 0x00FFFFFF
+            value = state.strings.get(variable)
+            if value is not None:
+                self._value_boundary_reference(
+                    command,
+                    index,
+                    value,
+                    "resource_path_variable",
+                )
 
     def _display_reference(
         self,

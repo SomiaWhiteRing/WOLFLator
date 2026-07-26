@@ -9,8 +9,8 @@ from models import TranslationItem
 from safe_io import atomic_write_json
 
 
-AUTO_ANALYSIS_SCHEMA = 16
-TRANSLATION_SAFETY_SCHEMA = 4
+AUTO_ANALYSIS_SCHEMA = 17
+TRANSLATION_SAFETY_SCHEMA = 5
 PROGRAM_CACHE_SCHEMA = 1
 ANALYSIS_ENGINE = "sparse-relational-v2"
 

@@ -1968,6 +1968,70 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual([], report["blocking_issues"])
             self.assertEqual(0, report["command_catalog"]["opaque_effects"])
 
+    def test_translation_safety_protects_picture_path_from_string_variable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "\n".join(
+                    (
+                        "[COMMON_EVENT_TEXT_OUTPUT]",
+                        "COMMON_EVENT_NUM=1",
+                        "COMMON_ID=391",
+                        "COMMON_NAME=Picture",
+                        "COMMAND_NUM=3",
+                        "WoditorEvCOMMAND_START",
+                        '[122][3,1]<0>(1600009,0,0)("000すぽっと.png")',
+                        '[122][3,1]<0>(1600009,0,0)("1枚絵マップ/\\cself[9]")',
+                        "[150][12,0]<0>(16,1600010,0,1,1,1,1600014,0,0,1600011,0,1600009)()",
+                        "WoditorEvCOMMAND_END",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="picture_variable",
+                original="1枚絵マップ/\\cself[9]",
+                translation="静止画地图/\\cself[9]",
+                code="COMMON-391-1-0",
+            )
+            editor_path = root / "Editor.exe"
+            editor_path.write_bytes(b"editor")
+            editor = EditorInfo(
+                editor_path,
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+
+            analysis = analyze_auto_export(
+                root / "Auto", [item], editor, input_hash="input"
+            )
+            self.assertEqual(["resource"], analysis["usage_by_key"][item.key])
+            dependency = next(
+                dependency
+                for dependency in analysis["dependencies"]
+                if dependency.get("resource_role") == "resource_path_variable"
+            )
+            self.assertEqual([item.key], dependency["source_keys"])
+            self.assertEqual(
+                ["1枚絵マップ/000すぽっと.png"], dependency["source_values"]
+            )
+
+            safety = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([item.key], safety["keep_original"])
+            self.assertIn("resource", safety["reasons"][item.key])
+            self.assertNotIn(
+                item.key, safety["approvals"]["official_display_contract"]
+            )
+
     def test_translation_safety_uses_official_display_contract_and_auto_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
