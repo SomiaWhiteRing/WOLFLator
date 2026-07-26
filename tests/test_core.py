@@ -2216,7 +2216,7 @@ class WorkbookAndFontTests(unittest.TestCase):
         )
         self.assertFalse(writer["display_sink_proven"])
 
-    def test_database_display_sink_requires_exact_cell(self):
+    def test_database_display_sink_accepts_same_field_across_rows(self):
         item = TranslationItem(
             key="display_payload",
             original="状态提示",
@@ -2245,8 +2245,73 @@ class WorkbookAndFontTests(unittest.TestCase):
 
         usage, _ = _translation_usage_report((), [item], [writer, display])
 
-        self.assertEqual(["display_storage"], usage[item.key])
-        self.assertFalse(writer["display_sink_proven"])
+        self.assertEqual(["display_only", "display_storage"], usage[item.key])
+        self.assertTrue(writer["display_sink_proven"])
+        self.assertEqual("database_field", writer["display_sink_basis"])
+
+    def test_database_storage_splits_unproven_sink_by_source_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "[COMMON_EVENT_TEXT_OUTPUT]\nCOMMON_EVENT_NUM=0\n",
+                encoding="utf-8",
+            )
+            display = TranslationItem(
+                key="display_name",
+                original="ウィリアム",
+                translation="威廉",
+                code="UDB-16-1-0",
+                category=ImportCategory.DISPLAY,
+            )
+            internal = TranslationItem(
+                key="internal_name",
+                original="InternalKey",
+                translation="内部键",
+                code="COMMON-1-0-0",
+                category=ImportCategory.EXTERNAL,
+            )
+            items = [display, internal]
+            analysis = analyze_auto_export(
+                root / "Auto",
+                items,
+                EditorInfo(
+                    root / "Editor.exe",
+                    "3.713.2026.718",
+                    (3, 713, 2026, 718),
+                    "a" * 64,
+                ),
+                input_hash="input",
+            )
+            analysis["usage_by_key"] = {
+                display.key: ["display_only", "display_storage"],
+                internal.key: ["display_storage"],
+            }
+            analysis["dependencies"] = [{
+                "kind": "resource",
+                "resource_role": "database_string_write",
+                "source_keys": [display.key, internal.key],
+                "right_source_keys": [],
+                "condition_keys": [],
+                "display_sink_proven": False,
+            }]
+
+            with mock.patch("wolf_editor.analyze_auto_export", return_value=analysis):
+                safety = analyze_translation_safety(
+                    root / "Auto",
+                    items,
+                    {item.key: item.translation for item in items},
+                    "warn",
+                    analysis=analysis,
+                )
+
+            self.assertEqual([display.key], safety["safe_to_translate"])
+            self.assertEqual([internal.key], safety["keep_original"])
+            self.assertIn(
+                "database_storage_without_display_sink",
+                safety["reasons"][internal.key],
+            )
 
     def test_dynamic_database_sink_requires_same_selector_and_display_only(self):
         item = TranslationItem(
@@ -2617,7 +2682,7 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual([], safety["safe_to_translate"])
             self.assertEqual([item.key], safety["keep_original"])
             self.assertIn(
-                "database_storage_without_display_sink", safety["reasons"][item.key]
+                "condition_truth_change", safety["reasons"][item.key]
             )
 
     def test_translation_safety_allows_global_state_only_without_field_names(self):

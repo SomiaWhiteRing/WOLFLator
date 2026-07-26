@@ -53,7 +53,7 @@ MAX_EDITOR_PAGE_BYTES = 2 * 1024 * 1024
 # ponytail: This caps an official tool download, not game data; raise it if future packages outgrow 256 MiB.
 MAX_EDITOR_ARCHIVE_BYTES = 256 * 1024 * 1024
 MIN_EDITOR_VERSION = (3, 500)
-AUTO_ANALYSIS_SCHEMA = 14
+AUTO_ANALYSIS_SCHEMA = 15
 TRANSLATION_SAFETY_SCHEMA = 3
 _VALUE_LIMIT = 256
 # ponytail: concrete string names are cheap and materially improve dynamic DB
@@ -5397,36 +5397,51 @@ def _translation_usage_report(
 
     display_storage_cells: set[tuple[str, int, int, int]] = set()
     display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    display_storage_fields: set[tuple[str, int, int]] = set()
     non_display_cells: set[tuple[str, int, int, int]] = set()
     non_display_selectors: set[tuple[str, int, int, str, str, str, int, int]] = set()
+    non_display_fields: set[tuple[str, int, int]] = set()
     display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
     display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
+    display_field_consumers: dict[tuple[str, int, int], list[dict[str, object]]] = {}
     non_display_cell_consumers: dict[tuple[str, int, int, int], list[dict[str, object]]] = {}
     non_display_selector_consumers: dict[tuple[str, int, int, str, str, str, int, int], list[dict[str, object]]] = {}
+    non_display_field_consumers: dict[tuple[str, int, int], list[dict[str, object]]] = {}
     for dependency in dependencies:
         kind = str(dependency.get("kind", "condition"))
         cells = database_cells(dependency, "database_cells")
         cells.update(database_cells(dependency, "right_database_cells"))
         selectors = database_selectors(dependency, "database_selectors")
         selectors.update(database_selectors(dependency, "right_database_selectors"))
+        fields = {
+            (cell[0], cell[1], cell[3]) for cell in cells
+        } | {
+            (selector[0], selector[1], selector[2]) for selector in selectors
+        }
         reference = consumer_reference(dependency)
         if kind == "display":
             display_storage_cells.update(cells)
             display_selectors.update(selectors)
+            display_storage_fields.update(fields)
             for cell in cells:
                 display_cell_consumers.setdefault(cell, []).append(reference)
             for selector in selectors:
                 display_selector_consumers.setdefault(selector, []).append(reference)
+            for field in fields:
+                display_field_consumers.setdefault(field, []).append(reference)
         elif kind in {"condition", "call", "resource", "database", "control_flow", "opaque"} and not (
             kind == "resource"
             and dependency.get("resource_role") == "database_string_write"
         ):
             non_display_cells.update(cells)
             non_display_selectors.update(selectors)
+            non_display_fields.update(fields)
             for cell in cells:
                 non_display_cell_consumers.setdefault(cell, []).append(reference)
             for selector in selectors:
                 non_display_selector_consumers.setdefault(selector, []).append(reference)
+            for field in fields:
+                non_display_field_consumers.setdefault(field, []).append(reference)
     for block in blocks:
         for index, command in enumerate(block.commands, start=1):
             semantics = command_semantics(
@@ -5481,6 +5496,12 @@ def _translation_usage_report(
             target_selectors = database_selectors(
                 dependency, "target_database_selectors"
             )
+            target_fields = {
+                (cell[0], cell[1], cell[3]) for cell in target_cells
+            } | {
+                (selector[0], selector[1], selector[2])
+                for selector in target_selectors
+            }
             cells_proven = (
                 bool(target_cells)
                 and target_cells <= display_storage_cells
@@ -5491,6 +5512,11 @@ def _translation_usage_report(
                 and target_selectors <= display_selectors
                 and target_selectors.isdisjoint(non_display_selectors)
             )
+            fields_proven = (
+                bool(target_fields)
+                and target_fields <= display_storage_fields
+                and target_fields.isdisjoint(non_display_fields)
+            )
             dependency["display_consumers"] = [
                 consumer
                 for cell in sorted(target_cells)
@@ -5499,6 +5525,10 @@ def _translation_usage_report(
                 consumer
                 for selector in sorted(target_selectors)
                 for consumer in display_selector_consumers.get(selector, ())
+            ] + [
+                consumer
+                for field in sorted(target_fields)
+                for consumer in display_field_consumers.get(field, ())
             ]
             dependency["non_display_consumers"] = [
                 consumer
@@ -5508,14 +5538,29 @@ def _translation_usage_report(
                 consumer
                 for selector in sorted(target_selectors)
                 for consumer in non_display_selector_consumers.get(selector, ())
+            ] + [
+                consumer
+                for field in sorted(target_fields)
+                for consumer in non_display_field_consumers.get(field, ())
             ]
-            dependency["display_sink_proven"] = cells_proven or selectors_proven
+            dependency["display_sink_proven"] = (
+                cells_proven or selectors_proven or fields_proven
+            )
+            if cells_proven:
+                dependency["display_sink_basis"] = "exact_cell"
+            elif selectors_proven:
+                dependency["display_sink_basis"] = "dynamic_selector"
+            elif fields_proven:
+                dependency["display_sink_basis"] = "database_field"
+            else:
+                dependency["display_sink_basis"] = ""
             if not dependency["display_sink_proven"]:
                 dependency["display_sink_reason"] = (
                     "动态数据库地址存在非显示读取"
                     if (
                         target_cells & non_display_cells
                         or target_selectors & non_display_selectors
+                        or target_fields & non_display_fields
                     )
                     else "动态数据库地址没有可证明的显示读取"
                 )
@@ -6365,6 +6410,9 @@ def analyze_translation_safety(
     def has_display_evidence(key: str) -> bool:
         return "display_only" in set(map(str, usage_by_key.get(key, ())))
 
+    def has_display_transport_contract(key: str) -> bool:
+        return complete_ledger and has_display_evidence(key)
+
     scope_sets: dict[str, set[str]] = {"project": set(originals)}
     for item in items:
         upper = item.code.upper()
@@ -6511,15 +6559,23 @@ def analyze_translation_safety(
             kind == "resource"
             and dependency.get("resource_role") == "database_string_write"
         ):
-            if not dependency.get("display_sink_proven"):
+            transport_keys = [*source_keys, *right_keys]
+            if not global_string_flow_converged:
                 protect(
-                    [*source_keys, *right_keys],
-                    "database_storage_without_display_sink",
-                )
-            elif not global_string_flow_converged:
-                protect(
-                    [*source_keys, *right_keys],
+                    transport_keys,
                     "database_string_flow_not_converged",
+                )
+            elif not dependency.get("display_sink_proven"):
+                # ponytail: split a merged runtime value per source key. Direct
+                # display provenance is the ceiling; source-target relations can
+                # later prove transports that never reach a display command.
+                protect(
+                    (
+                        key
+                        for key in transport_keys
+                        if not has_display_transport_contract(key)
+                    ),
+                    "database_storage_without_display_sink",
                 )
             return
         if (
