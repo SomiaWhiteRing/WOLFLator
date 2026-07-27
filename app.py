@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QSortFilterProxyModel,
+    QThread,
+    QTimer,
+    Qt,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -20,6 +30,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -38,6 +49,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QSpinBox,
     QStackedWidget,
@@ -45,6 +57,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTableView,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -83,6 +96,7 @@ from models import (
     STAGE_ORDER,
     Stage,
     StageStatus,
+    TranslationItem,
     default_export_scope,
     default_processing_scope,
 )
@@ -109,6 +123,7 @@ from wolf_tools import (
     protect_control_tokens,
     read_font_slots,
     selected_translation_requirements,
+    sha256_file,
 )
 
 
@@ -173,7 +188,7 @@ STAGE_RESULT_LABELS = {
     Stage.EXTRACT: "导出表格",
     Stage.GLOSSARY: "查看术语",
     Stage.TRANSLATE: "翻译结果",
-    Stage.VALIDATE: "译文表格",
+    Stage.VALIDATE: "编辑译文",
     Stage.IMPORT: "导入结果",
     Stage.RELEASE: "启动游戏",
 }
@@ -297,17 +312,30 @@ class PipelineThread(QThread):
     result_ready = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, pipeline: Pipeline, stage: Stage | None = None):
+    def __init__(
+        self,
+        pipeline: Pipeline,
+        stage: Stage | None = None,
+        stages: tuple[Stage, ...] = (),
+    ):
         super().__init__()
+        if stage is not None and stages:
+            raise ValueError("不能同时执行单个阶段和连续阶段。")
         self.pipeline = pipeline
         self.stage = stage
+        self.stages = stages
         self.pipeline.set_log_sink(self.log_line.emit)
         self.pipeline.progress = lambda current, total, stage: self.stage_progress.emit(current, total, stage.value)
         self.pipeline.state = self.stage_state.emit
 
     def run(self) -> None:
         try:
-            result = self.pipeline.run_stage(self.stage) if self.stage is not None else self.pipeline.run()
+            if self.stages:
+                result = self.pipeline.run_stages(self.stages)
+            elif self.stage is not None:
+                result = self.pipeline.run_stage(self.stage)
+            else:
+                result = self.pipeline.run()
             self.result_ready.emit(result)
         except Exception:
             detail = traceback.format_exc()
@@ -595,7 +623,10 @@ class SettingsDialog(QDialog):
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
 
-        form = QFormLayout()
+        self.settings_tabs = QTabWidget()
+
+        tools_page = QWidget()
+        form = QFormLayout(tools_page)
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(12)
         self.wolf_path = QLineEdit(self.settings.wolf_tool_path)
@@ -664,9 +695,8 @@ class SettingsDialog(QDialog):
         form.addRow("项目目录", _path_row(self.projects_root, "选择", self._choose_projects_root))
         self.ascii_dir = QLineEdit(self.settings.ascii_runner_dir)
         form.addRow("ASCII 执行目录", _path_row(self.ascii_dir, "选择", self._choose_ascii_dir))
-        layout.addLayout(form)
+        self.settings_tabs.addTab(tools_page, "工具与目录")
 
-        self.api_tabs = QTabWidget()
         glossary_page = QWidget()
         glossary_form = QFormLayout(glossary_page)
         glossary_form.setHorizontalSpacing(18)
@@ -722,7 +752,7 @@ class SettingsDialog(QDialog):
         glossary_output_layout.addWidget(self.glossary_test_button)
         glossary_output_layout.addStretch(1)
         glossary_form.addRow("最大输出 Token", glossary_output)
-        self.api_tabs.addTab(glossary_page, "术语生成 API")
+        self.settings_tabs.addTab(glossary_page, "术语生成 API")
 
         translation_page = QWidget()
         translation_form = QFormLayout(translation_page)
@@ -779,6 +809,7 @@ class SettingsDialog(QDialog):
         translation_form.addRow("请求限制", quotas)
 
         chunking = QWidget()
+        chunking.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         chunking_layout = QHBoxLayout(chunking)
         chunking_layout.setContentsMargins(0, 0, 0, 0)
         self.translation_chunk_group = QButtonGroup(self)
@@ -792,26 +823,41 @@ class SettingsDialog(QDialog):
             chunking_layout.addWidget(button)
 
         self.translation_chunk_stack = QStackedWidget()
+        self.translation_chunk_stack.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        token_limits = QWidget()
+        token_limits_layout = QHBoxLayout(token_limits)
+        token_limits_layout.setContentsMargins(0, 0, 0, 0)
         self.translation_token_limit = QSpinBox()
         self.translation_token_limit.setRange(64, 8192)
-        self.translation_token_limit.setSuffix(" Token")
+        self.translation_token_limit.setFixedWidth(140)
         self.translation_token_limit.setValue(self.settings.translation_token_limit)
-        self.translation_chunk_stack.addWidget(self.translation_token_limit)
+        self.translation_token_unit = QLabel("Token")
+        token_limits_layout.addWidget(self.translation_token_limit)
+        token_limits_layout.addWidget(self.translation_token_unit)
+        token_limits_layout.addStretch(1)
+        self.translation_chunk_stack.addWidget(token_limits)
 
         line_limits = QWidget()
         line_limits_layout = QHBoxLayout(line_limits)
         line_limits_layout.setContentsMargins(0, 0, 0, 0)
         self.translation_line_limit = QSpinBox()
         self.translation_line_limit.setRange(1, 100)
-        self.translation_line_limit.setSuffix(" 条")
+        self.translation_line_limit.setFixedWidth(90)
         self.translation_line_limit.setValue(self.settings.translation_line_limit)
+        self.translation_line_unit = QLabel("条")
         self.translation_retry_min_lines = QSpinBox()
         self.translation_retry_min_lines.setRange(1, 100)
-        self.translation_retry_min_lines.setSuffix(" 条")
+        self.translation_retry_min_lines.setFixedWidth(90)
         self.translation_retry_min_lines.setValue(self.settings.translation_retry_min_lines)
+        self.translation_retry_unit = QLabel("条")
         line_limits_layout.addWidget(self.translation_line_limit)
+        line_limits_layout.addWidget(self.translation_line_unit)
         line_limits_layout.addWidget(QLabel("重试最小"))
         line_limits_layout.addWidget(self.translation_retry_min_lines)
+        line_limits_layout.addWidget(self.translation_retry_unit)
+        line_limits_layout.addStretch(1)
         self.translation_chunk_stack.addWidget(line_limits)
         chunking_layout.addWidget(self.translation_chunk_stack)
         chunking_layout.addStretch(1)
@@ -823,12 +869,20 @@ class SettingsDialog(QDialog):
         self.translation_line_mode.clicked.connect(lambda: self.translation_chunk_stack.setCurrentIndex(1))
         translation_form.addRow("翻译分块", chunking)
 
+        rounds = QWidget()
+        rounds_layout = QHBoxLayout(rounds)
+        rounds_layout.setContentsMargins(0, 0, 0, 0)
         self.translation_rounds = QSpinBox()
         self.translation_rounds.setRange(1, 20)
+        self.translation_rounds.setFixedWidth(140)
         self.translation_rounds.setValue(self.settings.translation_rounds)
-        translation_form.addRow("单次最大轮次", self.translation_rounds)
-        self.api_tabs.addTab(translation_page, "AiNiee 翻译 API")
-        layout.addWidget(self.api_tabs)
+        self.translation_rounds_unit = QLabel("轮")
+        rounds_layout.addWidget(self.translation_rounds)
+        rounds_layout.addWidget(self.translation_rounds_unit)
+        rounds_layout.addStretch(1)
+        translation_form.addRow("单次最大轮次", rounds)
+        self.settings_tabs.addTab(translation_page, "AiNiee 翻译 API")
+        layout.addWidget(self.settings_tabs)
 
         self.license_check = QCheckBox("我确认仅将 FreeGames 工具用于其许可范围内的免费游戏")
         self.license_check.setChecked(self.settings.license_accepted)
@@ -1088,6 +1142,90 @@ def _configure_table(table: QTableWidget) -> None:
     table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
 
+class TranslationEditModel(QAbstractTableModel):
+    HEADERS = ("WOLF 代码", "类型", "原文", "译文")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.items: list[TranslationItem] = []
+        self.edits: dict[str, str] = {}
+
+    def rowCount(self, _parent=QModelIndex()) -> int:
+        return len(self.items)
+
+    def columnCount(self, _parent=QModelIndex()) -> int:
+        return len(self.HEADERS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.items):
+            return None
+        item = self.items[index.row()]
+        translation = self.edits.get(item.key, item.translation)
+        values = (item.code, item.type, item.original, translation)
+        if role == Qt.DisplayRole:
+            return values[index.column()].replace("\r", "").replace("\n", " / ")
+        if role == Qt.ToolTipRole:
+            return values[index.column()]
+        if role == Qt.UserRole:
+            return item.key
+        return None
+
+    def set_items(self, items: list[TranslationItem]) -> None:
+        self.beginResetModel()
+        self.items = items
+        self.edits.clear()
+        self.endResetModel()
+
+    def item(self, row: int) -> TranslationItem | None:
+        return self.items[row] if 0 <= row < len(self.items) else None
+
+    def translation(self, row: int) -> str:
+        item = self.item(row)
+        return self.edits.get(item.key, item.translation) if item else ""
+
+    def set_translation(self, row: int, text: str) -> None:
+        item = self.item(row)
+        if not item:
+            return
+        if text == item.translation:
+            self.edits.pop(item.key, None)
+        else:
+            self.edits[item.key] = text
+        changed = self.index(row, 3)
+        self.dataChanged.emit(changed, changed, [Qt.DisplayRole, Qt.ToolTipRole])
+
+    def set_translations(self, replacements: dict[int, str]) -> None:
+        if not replacements:
+            return
+        for row, text in replacements.items():
+            item = self.item(row)
+            if not item:
+                continue
+            if text == item.translation:
+                self.edits.pop(item.key, None)
+            else:
+                self.edits[item.key] = text
+        first = min(replacements)
+        last = max(replacements)
+        self.dataChanged.emit(
+            self.index(first, 3),
+            self.index(last, 3),
+            [Qt.DisplayRole, Qt.ToolTipRole],
+        )
+
+    def discard_edits(self) -> None:
+        if not self.edits:
+            return
+        self.beginResetModel()
+        self.edits.clear()
+        self.endResetModel()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1100,6 +1238,12 @@ class MainWindow(QMainWindow):
         self.proofread_report_path: Path | None = None
         self.proofread_run_result: tuple[str, str] | None = None
         self._proofread_loading = False
+        self.edit_source_path: Path | None = None
+        self.edit_source_sha256 = ""
+        self.edit_source_identity: tuple[str, int, int] | None = None
+        self.edit_source_row = -1
+        self.edit_action_status = ""
+        self._edit_loading = False
         self.font_scan_thread: FontScanThread | None = None
         self.font_context: dict[str, object] | None = None
         self.font_apply_active = False
@@ -1128,7 +1272,9 @@ class MainWindow(QMainWindow):
         header.addWidget(brand)
         header.addStretch(1)
         self.settings_button = QToolButton()
-        self.settings_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.settings_button.setText("⚙️")
+        self.settings_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.settings_button.setAccessibleName("设置")
         self.settings_button.setToolTip("设置")
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.settings_button)
@@ -1153,6 +1299,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._workflow_tab(), "流程")
         self.tabs.addTab(self._glossary_tab(), "术语")
         self.proofread_tab_index = self.tabs.addTab(self._proofread_tab(), "校对")
+        self.edit_tab_index = self.tabs.addTab(self._edit_tab(), "编辑")
         self.tabs.addTab(self._scope_tab(), "范围")
         self.font_tab_index = self.tabs.addTab(self._font_tab(), "修改字体")
         self.tabs.currentChanged.connect(self._main_tab_changed)
@@ -1297,6 +1444,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(0)
         self.step_status_labels: dict[Stage, QLabel] = {}
+        self.step_checks: dict[Stage, QCheckBox] = {}
         self.step_buttons: dict[Stage, QPushButton] = {}
         self.step_result_buttons: dict[Stage, QPushButton] = {}
         for index, stage in enumerate(STAGE_ORDER, start=1):
@@ -1305,6 +1453,9 @@ class MainWindow(QMainWindow):
             row_layout = QGridLayout(row)
             row_layout.setContentsMargins(8, 6, 8, 6)
             row_layout.setHorizontalSpacing(8)
+            selected = QCheckBox()
+            selected.setAccessibleName(f"选择{STAGE_LABELS[stage]}")
+            selected.toggled.connect(self._update_step_range_controls)
             number = QLabel(str(index))
             number.setObjectName("stepNumberLarge")
             number.setAlignment(Qt.AlignCenter)
@@ -1327,18 +1478,32 @@ class MainWindow(QMainWindow):
             result_button.clicked.connect(
                 lambda _checked=False, target=stage: self._open_stage_result(target)
             )
-            row_layout.addWidget(number, 0, 0)
-            row_layout.addWidget(title, 0, 1)
-            row_layout.addWidget(description, 0, 2)
-            row_layout.addWidget(status, 0, 3)
-            row_layout.addWidget(result_button, 0, 4)
-            row_layout.addWidget(run_button, 0, 5)
-            row_layout.setColumnStretch(2, 1)
+            row_layout.addWidget(selected, 0, 0)
+            row_layout.addWidget(number, 0, 1)
+            row_layout.addWidget(title, 0, 2)
+            row_layout.addWidget(description, 0, 3)
+            row_layout.addWidget(status, 0, 4)
+            row_layout.addWidget(result_button, 0, 5)
+            row_layout.addWidget(run_button, 0, 6)
+            row_layout.setColumnStretch(3, 1)
+            self.step_checks[stage] = selected
             self.step_status_labels[stage] = status
             self.step_buttons[stage] = run_button
             self.step_result_buttons[stage] = result_button
             layout.addWidget(row)
         layout.addStretch(1)
+        range_row = QHBoxLayout()
+        self.step_range_summary = QLabel("未选择步骤")
+        self.step_range_summary.setObjectName("secondaryText")
+        self.run_range_button = QPushButton("连续执行")
+        self.run_range_button.setObjectName("primaryButton")
+        self.run_range_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.run_range_button.setEnabled(False)
+        self.run_range_button.clicked.connect(self._start_selected_steps)
+        range_row.addWidget(self.step_range_summary)
+        range_row.addStretch(1)
+        range_row.addWidget(self.run_range_button)
+        layout.addLayout(range_row)
         return page
 
     def _glossary_tab(self) -> QWidget:
@@ -1390,8 +1555,8 @@ class MainWindow(QMainWindow):
     def _proofread_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
         self.proofread_gate_label = QLabel("完成 AI 翻译后即可使用校对功能")
         self.proofread_gate_label.setObjectName("secondaryText")
@@ -1402,13 +1567,54 @@ class MainWindow(QMainWindow):
         self.proofread_content = QWidget()
         content = QVBoxLayout(self.proofread_content)
         content.setContentsMargins(0, 0, 0, 0)
-        content.setSpacing(9)
+        content.setSpacing(8)
 
         self.proofread_options = QWidget()
         options = QVBoxLayout(self.proofread_options)
         options.setContentsMargins(0, 0, 0, 0)
         options.setSpacing(6)
-        configuration = QHBoxLayout()
+        header = QHBoxLayout()
+        title = QLabel("AI 校对")
+        title.setObjectName("panelTitle")
+        header.addWidget(title)
+        self.proofread_summary = QLabel("受影响 0 · 高 0 · 中 0 · 低 0 · 已采纳 0 · 失败批次 0")
+        self.proofread_summary.setObjectName("secondaryText")
+        header.addWidget(self.proofread_summary)
+        header.addStretch(1)
+        self.proofread_settings_toggle = QToolButton()
+        self.proofread_settings_toggle.setText("校对设置")
+        self.proofread_settings_toggle.setArrowType(Qt.RightArrow)
+        self.proofread_settings_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.proofread_settings_toggle.setCheckable(True)
+        self.proofread_settings_toggle.toggled.connect(self._toggle_proofread_settings)
+        header.addWidget(self.proofread_settings_toggle)
+
+        self.start_proofread_button = QToolButton()
+        self.start_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_proofread_button.setToolTip("开始校对")
+        self.start_proofread_button.setObjectName("primaryButton")
+        self.start_proofread_button.clicked.connect(self._start_proofread)
+        self.stop_proofread_button = QToolButton()
+        self.stop_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_proofread_button.setToolTip("停止校对")
+        self.stop_proofread_button.setEnabled(False)
+        self.stop_proofread_button.clicked.connect(self._stop_proofread)
+        self.rerun_proofread_button = QToolButton()
+        self.rerun_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.rerun_proofread_button.setToolTip("重新校对")
+        self.rerun_proofread_button.clicked.connect(self._start_proofread)
+        for button in (
+            self.start_proofread_button,
+            self.stop_proofread_button,
+            self.rerun_proofread_button,
+        ):
+            button.setFixedSize(34, 34)
+            header.addWidget(button)
+        options.addLayout(header)
+
+        self.proofread_settings_panel = QWidget()
+        configuration = QHBoxLayout(self.proofread_settings_panel)
+        configuration.setContentsMargins(0, 0, 0, 0)
         self.proofread_mode = QComboBox()
         self.proofread_mode.addItem("规则 + AI", "rules_ai")
         self.proofread_mode.addItem("仅规则", "rules")
@@ -1433,42 +1639,19 @@ class MainWindow(QMainWindow):
         ):
             configuration.addWidget(QLabel(label))
             configuration.addWidget(control)
-        options.addLayout(configuration)
-        self.start_proofread_button = QToolButton()
-        self.start_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.start_proofread_button.setToolTip("开始校对")
-        self.start_proofread_button.setObjectName("primaryButton")
-        self.start_proofread_button.clicked.connect(self._start_proofread)
-        self.stop_proofread_button = QToolButton()
-        self.stop_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_proofread_button.setToolTip("停止校对")
-        self.stop_proofread_button.setEnabled(False)
-        self.stop_proofread_button.clicked.connect(self._stop_proofread)
-        self.rerun_proofread_button = QToolButton()
-        self.rerun_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
-        self.rerun_proofread_button.setToolTip("重新校对")
-        self.rerun_proofread_button.clicked.connect(self._start_proofread)
-        for button in (
-            self.start_proofread_button,
-            self.stop_proofread_button,
-            self.rerun_proofread_button,
-        ):
-            button.setFixedSize(36, 36)
-            configuration.addWidget(button)
+        self.proofread_settings_panel.hide()
+        options.addWidget(self.proofread_settings_panel)
         content.addWidget(self.proofread_options)
 
-        progress_row = QHBoxLayout()
         self.proofread_progress = QProgressBar()
         self.proofread_progress.setRange(0, 1)
         self.proofread_progress.setValue(0)
         self.proofread_progress.setFormat("尚未校对")
-        self.proofread_summary = QLabel("受影响 0 · 高 0 · 中 0 · 低 0 · 已采纳 0 · 失败批次 0")
-        self.proofread_summary.setObjectName("secondaryText")
-        progress_row.addWidget(self.proofread_progress, 1)
-        progress_row.addWidget(self.proofread_summary)
-        content.addLayout(progress_row)
+        content.addWidget(self.proofread_progress)
 
         filters = QHBoxLayout()
+        self.proofread_search = QLineEdit()
+        self.proofread_search.setPlaceholderText("搜索原文、译文、代码或问题")
         self.proofread_severity_filter = QComboBox()
         self.proofread_severity_filter.addItem("全部严重程度", "all")
         self.proofread_severity_filter.addItem("高风险", "high")
@@ -1481,40 +1664,64 @@ class MainWindow(QMainWindow):
         self.proofread_decision_filter.addItem("待处理", "pending")
         self.proofread_decision_filter.addItem("已采纳", "accept")
         self.proofread_decision_filter.addItem("保留现译", "keep")
-        self.proofread_search = QLineEdit()
-        self.proofread_search.setPlaceholderText("搜索原文、译文、代码或问题")
+        self.proofread_search.textChanged.connect(self._filter_proofread_rows)
+        filters.addWidget(self.proofread_search, 1)
         for control in (
             self.proofread_severity_filter,
             self.proofread_type_filter,
             self.proofread_decision_filter,
         ):
+            control.setMaximumWidth(150)
             control.currentIndexChanged.connect(self._filter_proofread_rows)
             filters.addWidget(control)
-        self.proofread_search.textChanged.connect(self._filter_proofread_rows)
-        filters.addWidget(self.proofread_search, 1)
+        content.addLayout(filters)
+
+        splitter = QSplitter(Qt.Horizontal)
+        list_panel = QWidget()
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(0, 0, 4, 0)
+        list_layout.setSpacing(5)
+        list_header = QHBoxLayout()
+        list_title = QLabel("问题列表")
+        list_title.setObjectName("panelTitle")
+        list_header.addWidget(list_title)
+        list_header.addStretch(1)
         self.proofread_accept_selected = QPushButton("批量采纳")
         self.proofread_accept_selected.clicked.connect(lambda: self._decide_selected_proofread("accept"))
         self.proofread_keep_selected = QPushButton("批量保留")
         self.proofread_keep_selected.clicked.connect(lambda: self._decide_selected_proofread("keep"))
-        filters.addWidget(self.proofread_accept_selected)
-        filters.addWidget(self.proofread_keep_selected)
-        content.addLayout(filters)
+        list_header.addWidget(self.proofread_accept_selected)
+        list_header.addWidget(self.proofread_keep_selected)
+        list_layout.addLayout(list_header)
 
-        splitter = QSplitter(Qt.Vertical)
-        self.proofread_table = QTableWidget(0, 6)
+        self.proofread_table = QTableWidget(0, 5)
         self.proofread_table.setHorizontalHeaderLabels(
-            ["选择", "风险", "WOLF 代码", "问题类型", "处理状态", "当前译文"]
+            ["选择", "风险", "WOLF 代码", "问题类型", "状态"]
         )
         _configure_table(self.proofread_table)
         self.proofread_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.proofread_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.proofread_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.proofread_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.proofread_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.proofread_table.itemSelectionChanged.connect(self._show_proofread_entry)
-        splitter.addWidget(self.proofread_table)
+        list_layout.addWidget(self.proofread_table, 1)
+        list_panel.setMinimumWidth(330)
+        splitter.addWidget(list_panel)
 
         review = QWidget()
         review_layout = QVBoxLayout(review)
-        review_layout.setContentsMargins(0, 6, 0, 0)
+        review_layout.setContentsMargins(6, 0, 0, 0)
+        review_layout.setSpacing(5)
+        review_header = QHBoxLayout()
+        review_title = QLabel("逐条审阅")
+        review_title.setObjectName("panelTitle")
+        review_header.addWidget(review_title)
+        self.proofread_entry_status = QLabel("选择左侧问题")
+        self.proofread_entry_status.setObjectName("secondaryText")
+        review_header.addWidget(self.proofread_entry_status)
+        review_header.addStretch(1)
+        review_layout.addLayout(review_header)
         texts = QHBoxLayout()
         self.proofread_original = QPlainTextEdit()
         self.proofread_current = QPlainTextEdit()
@@ -1522,45 +1729,56 @@ class MainWindow(QMainWindow):
             column = QVBoxLayout()
             column.addWidget(QLabel(title))
             editor.setReadOnly(True)
-            editor.setMinimumHeight(36)
-            editor.setMaximumHeight(105)
+            editor.setMinimumHeight(42)
+            editor.setMaximumHeight(72)
             column.addWidget(editor)
             texts.addLayout(column, 1)
         review_layout.addLayout(texts)
-        details = QHBoxLayout()
-        issue_column = QVBoxLayout()
-        issue_column.addWidget(QLabel("问题说明"))
+        review_layout.addWidget(QLabel("问题说明"))
         self.proofread_issues = QPlainTextEdit()
         self.proofread_issues.setReadOnly(True)
-        self.proofread_issues.setMinimumHeight(40)
-        self.proofread_issues.setMaximumHeight(120)
-        issue_column.addWidget(self.proofread_issues)
-        suggestion_column = QVBoxLayout()
-        suggestion_column.addWidget(QLabel("建议译文"))
-        self.proofread_suggestion = QPlainTextEdit()
-        self.proofread_suggestion.setMinimumHeight(40)
-        self.proofread_suggestion.setMaximumHeight(120)
-        self.proofread_suggestion.textChanged.connect(self._save_proofread_draft)
-        suggestion_column.addWidget(self.proofread_suggestion)
-        details.addLayout(issue_column, 1)
-        details.addLayout(suggestion_column, 1)
-        review_layout.addLayout(details)
+        self.proofread_issues.setMinimumHeight(50)
+        self.proofread_issues.setMaximumHeight(84)
+        review_layout.addWidget(self.proofread_issues)
+        suggestion_header = QHBoxLayout()
+        suggestion_title = QLabel("建议译文（可编辑）")
+        suggestion_title.setObjectName("panelTitle")
+        suggestion_header.addWidget(suggestion_title)
+        suggestion_header.addStretch(1)
         self.proofread_accept = QPushButton("采纳")
+        self.proofread_accept.setObjectName("primaryButton")
         self.proofread_accept.clicked.connect(lambda: self._decide_current_proofread("accept"))
         self.proofread_keep = QPushButton("保留现译")
         self.proofread_keep.clicked.connect(lambda: self._decide_current_proofread("keep"))
         self.proofread_reset = QPushButton("撤销决定")
         self.proofread_reset.clicked.connect(lambda: self._decide_current_proofread("pending"))
+        suggestion_header.addWidget(self.proofread_accept)
+        suggestion_header.addWidget(self.proofread_keep)
+        suggestion_header.addWidget(self.proofread_reset)
+        review_layout.addLayout(suggestion_header)
+        self.proofread_suggestion = QPlainTextEdit()
+        self.proofread_suggestion.setObjectName("proofreadSuggestion")
+        self.proofread_suggestion.setPlaceholderText("未生成完整建议时，可在此手动修订")
+        self.proofread_suggestion.setMinimumHeight(64)
+        self.proofread_suggestion.textChanged.connect(self._save_proofread_draft)
+        review_layout.addWidget(self.proofread_suggestion, 1)
+        review.setMinimumWidth(390)
         splitter.addWidget(review)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([110, 190])
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([410, 620])
         content.addWidget(splitter, 1)
 
         bottom = QHBoxLayout()
-        self.open_proofread_report_button = QPushButton("打开报告")
+        self.open_proofread_report_button = QToolButton()
+        self.open_proofread_report_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.open_proofread_report_button.setToolTip("打开校对报告")
+        self.open_proofread_report_button.setAccessibleName("打开校对报告")
         self.open_proofread_report_button.clicked.connect(self._open_proofread_report)
-        self.open_proofread_log_button = QPushButton("打开日志")
+        self.open_proofread_log_button = QToolButton()
+        self.open_proofread_log_button.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        self.open_proofread_log_button.setToolTip("打开校对日志")
+        self.open_proofread_log_button.setAccessibleName("打开校对日志")
         self.open_proofread_log_button.clicked.connect(self._open_proofread_log)
         self.restore_ai_translation_button = QPushButton("恢复 AI 原译")
         self.restore_ai_translation_button.clicked.connect(self._restore_ai_translation)
@@ -1569,9 +1787,6 @@ class MainWindow(QMainWindow):
         self.apply_proofread_button.clicked.connect(self._apply_proofread)
         bottom.addWidget(self.open_proofread_report_button)
         bottom.addWidget(self.open_proofread_log_button)
-        bottom.addWidget(self.proofread_accept)
-        bottom.addWidget(self.proofread_keep)
-        bottom.addWidget(self.proofread_reset)
         bottom.addStretch(1)
         bottom.addWidget(self.restore_ai_translation_button)
         bottom.addWidget(self.apply_proofread_button)
@@ -1588,6 +1803,175 @@ class MainWindow(QMainWindow):
                 control.currentIndexChanged.connect(self._save_proofread_settings)
             else:
                 control.valueChanged.connect(self._save_proofread_settings)
+        return page
+
+    def _edit_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.edit_gate_label = QLabel("完成 AI 翻译后即可编辑译文")
+        self.edit_gate_label.setObjectName("secondaryText")
+        self.edit_gate_label.setAlignment(Qt.AlignCenter)
+        self.edit_gate_label.setMinimumHeight(34)
+        layout.addWidget(self.edit_gate_label)
+
+        self.edit_content = QWidget()
+        content = QVBoxLayout(self.edit_content)
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("译文编辑")
+        title.setObjectName("panelTitle")
+        self.edit_summary = QLabel("共 0 条 · 匹配 0 条 · 已修改 0 条")
+        self.edit_summary.setObjectName("secondaryText")
+
+        self.edit_search_toolbar = QWidget()
+        self.edit_search_toolbar.setMinimumWidth(380)
+        self.edit_search_toolbar.setMaximumWidth(620)
+        toolbar_layout = QHBoxLayout(self.edit_search_toolbar)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(4)
+        self.edit_replace_toggle = QToolButton()
+        self.edit_replace_toggle.setObjectName("editReplaceToggle")
+        self.edit_replace_toggle.setText("▼")
+        self.edit_replace_toggle.setCheckable(True)
+        self.edit_replace_toggle.setFixedSize(36, 36)
+        toggle_font = self.edit_replace_toggle.font()
+        toggle_font.setPointSize(15)
+        self.edit_replace_toggle.setFont(toggle_font)
+        self.edit_replace_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.edit_replace_toggle.setToolTip("展开替换")
+        self.edit_replace_toggle.setAccessibleName("展开替换")
+        self.edit_replace_toggle.toggled.connect(self._toggle_edit_replace)
+        toolbar_layout.addWidget(self.edit_replace_toggle, 0, Qt.AlignTop)
+
+        search_fields = QWidget()
+        search_fields_layout = QVBoxLayout(search_fields)
+        search_fields_layout.setContentsMargins(0, 0, 0, 0)
+        search_fields_layout.setSpacing(4)
+        self.edit_search = QLineEdit()
+        self.edit_search.setObjectName("editSearch")
+        self.edit_search.setFixedHeight(36)
+        self.edit_search.setPlaceholderText("搜索原文、译文、WOLF 代码或类型")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.textChanged.connect(self._filter_edit_rows)
+        search_fields_layout.addWidget(self.edit_search)
+
+        self.edit_replace_popup = QFrame(self.edit_content)
+        self.edit_replace_popup.setObjectName("editReplacePopup")
+        replace_layout = QHBoxLayout(self.edit_replace_popup)
+        replace_layout.setContentsMargins(0, 0, 0, 0)
+        replace_layout.setSpacing(4)
+        replace_layout.addSpacing(40)
+        self.edit_replace = QLineEdit()
+        self.edit_replace.setObjectName("editReplace")
+        self.edit_replace.setFixedHeight(36)
+        self.edit_replace.setPlaceholderText("替换译文中的匹配项")
+        self.edit_replace.setClearButtonEnabled(True)
+        self.edit_replace.textChanged.connect(self._update_edit_replace_actions)
+        self.edit_replace_one = QPushButton("替换")
+        self.edit_replace_one.setObjectName("editReplaceButton")
+        self.edit_replace_one.setFixedHeight(36)
+        self.edit_replace_one.setToolTip("替换当前译文中的第一个匹配项")
+        self.edit_replace_one.clicked.connect(self._replace_current_translation)
+        self.edit_replace_all = QPushButton("全部替换")
+        self.edit_replace_all.setObjectName("editReplaceButton")
+        self.edit_replace_all.setFixedHeight(36)
+        self.edit_replace_all.setToolTip("替换所有译文中的匹配项")
+        self.edit_replace_all.clicked.connect(self._replace_all_translations)
+        replace_layout.addWidget(self.edit_replace, 1)
+        replace_layout.addWidget(self.edit_replace_one)
+        replace_layout.addWidget(self.edit_replace_all)
+        self.edit_replace_popup.hide()
+        toolbar_layout.addWidget(search_fields, 1)
+
+        header.addWidget(title)
+        header.addWidget(self.edit_summary)
+        header.addStretch(1)
+        header.addWidget(self.edit_search_toolbar, 2)
+        content.addLayout(header)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.edit_model = TranslationEditModel(self)
+        self.edit_proxy = QSortFilterProxyModel(self)
+        self.edit_proxy.setSourceModel(self.edit_model)
+        self.edit_proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.edit_proxy.setFilterKeyColumn(-1)
+        self.edit_proxy.setDynamicSortFilter(False)
+        self.edit_table = QTableView()
+        self.edit_table.setModel(self.edit_proxy)
+        self.edit_table.setAlternatingRowColors(True)
+        self.edit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.edit_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.edit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.edit_table.verticalHeader().setVisible(False)
+        self.edit_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.edit_table.selectionModel().currentRowChanged.connect(self._show_edit_entry)
+        splitter.addWidget(self.edit_table)
+
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(8, 0, 0, 0)
+        editor_layout.setSpacing(5)
+        editor_header = QHBoxLayout()
+        editor_title = QLabel("逐条编辑")
+        editor_title.setObjectName("panelTitle")
+        self.edit_entry_status = QLabel("选择左侧译文")
+        self.edit_entry_status.setObjectName("secondaryText")
+        editor_header.addWidget(editor_title)
+        editor_header.addWidget(self.edit_entry_status)
+        editor_header.addStretch(1)
+        editor_layout.addLayout(editor_header)
+
+        editor_layout.addWidget(QLabel("原文"))
+        self.edit_original = QPlainTextEdit()
+        self.edit_original.setReadOnly(True)
+        self.edit_original.setMinimumHeight(72)
+        self.edit_original.setMaximumHeight(130)
+        editor_layout.addWidget(self.edit_original)
+        editor_layout.addWidget(QLabel("上下文"))
+        self.edit_context = QPlainTextEdit()
+        self.edit_context.setReadOnly(True)
+        self.edit_context.setMinimumHeight(48)
+        self.edit_context.setMaximumHeight(90)
+        editor_layout.addWidget(self.edit_context)
+
+        translation_header = QHBoxLayout()
+        translation_title = QLabel("译文")
+        translation_title.setObjectName("panelTitle")
+        self.edit_reset_current = QPushButton("恢复本条")
+        self.edit_reset_current.clicked.connect(self._reset_current_edit)
+        translation_header.addWidget(translation_title)
+        translation_header.addStretch(1)
+        translation_header.addWidget(self.edit_reset_current)
+        editor_layout.addLayout(translation_header)
+        self.edit_translation = QPlainTextEdit()
+        self.edit_translation.setObjectName("translationEditor")
+        self.edit_translation.setPlaceholderText("输入润色后的完整译文")
+        self.edit_translation.textChanged.connect(self._edit_translation_changed)
+        editor_layout.addWidget(self.edit_translation, 1)
+        splitter.addWidget(editor)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([650, 430])
+        content.addWidget(splitter, 1)
+
+        bottom = QHBoxLayout()
+        self.edit_status = QLabel("")
+        self.edit_status.setObjectName("secondaryText")
+        self.edit_discard = QPushButton("撤销未保存修改")
+        self.edit_discard.clicked.connect(self._discard_translation_edits)
+        self.edit_save = QPushButton("保存修改")
+        self.edit_save.setObjectName("primaryButton")
+        self.edit_save.clicked.connect(self._save_translation_edits)
+        bottom.addWidget(self.edit_status, 1)
+        bottom.addWidget(self.edit_discard)
+        bottom.addWidget(self.edit_save)
+        content.addLayout(bottom)
+        layout.addWidget(self.edit_content, 1)
         return page
 
     def _scope_tab(self) -> QWidget:
@@ -1628,8 +2012,31 @@ class MainWindow(QMainWindow):
 
     def _scope_panel(self, stack: QStackedWidget, target: str) -> dict[str, QCheckBox]:
         panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 6, 0, 0)
+        if target == "import":
+            panel_layout = QHBoxLayout(panel)
+            panel_layout.setContentsMargins(0, 6, 0, 0)
+            panel_layout.setSpacing(24)
+
+            self.import_scope_column = QWidget()
+            self.import_scope_column.setMinimumWidth(250)
+            self.import_scope_column.setMaximumWidth(310)
+            scope_layout = QVBoxLayout(self.import_scope_column)
+            scope_layout.setContentsMargins(0, 0, 0, 0)
+            scope_layout.setSpacing(4)
+            scope_title = QLabel("导入内容")
+            scope_title.setObjectName("panelTitle")
+            scope_layout.addWidget(scope_title)
+            panel_layout.addWidget(self.import_scope_column)
+
+            self.import_protection_column = QWidget()
+            protection_layout = QVBoxLayout(self.import_protection_column)
+            protection_layout.setContentsMargins(0, 0, 0, 0)
+            protection_layout.setSpacing(6)
+            panel_layout.addWidget(self.import_protection_column, 1)
+        else:
+            panel_layout = QVBoxLayout(panel)
+            panel_layout.setContentsMargins(0, 6, 0, 0)
+            scope_layout = panel_layout
         checks = {
             "display": QCheckBox("显示文本"),
             "external": QCheckBox("外部 TXT / CSV"),
@@ -1642,7 +2049,7 @@ class MainWindow(QMainWindow):
             check.setChecked(bool(getattr(defaults, name)))
         for key, check in checks.items():
             check.toggled.connect(lambda _checked=False, scope_target=target: self._save_scope(scope_target))
-            panel_layout.addWidget(check)
+            scope_layout.addWidget(check)
             if target == "export" and key == "external":
                 self.external_filter_options = QWidget()
                 filter_layout = QHBoxLayout(self.external_filter_options)
@@ -1658,7 +2065,7 @@ class MainWindow(QMainWindow):
                 filter_layout.addWidget(self.external_file_limit_kb)
                 filter_layout.addWidget(filter_suffix)
                 filter_layout.addStretch(1)
-                panel_layout.addWidget(self.external_filter_options)
+                scope_layout.addWidget(self.external_filter_options)
                 check.toggled.connect(self._update_external_filter_controls)
                 self.exclude_large_external_files.toggled.connect(
                     self._external_filter_changed
@@ -1669,9 +2076,11 @@ class MainWindow(QMainWindow):
             if target == "import" and key == "filename":
                 warning = QLabel("启用文件名导入前，发布副本中必须存在对应的目标文件。")
                 warning.setObjectName("warningText")
-                panel_layout.addWidget(warning)
+                warning.setWordWrap(True)
+                scope_layout.addWidget(warning)
         if target == "import":
-            self._add_import_protection_controls(panel_layout)
+            scope_layout.addStretch(1)
+            self._add_import_protection_controls(protection_layout)
         else:
             panel_layout.addStretch(1)
         stack.addWidget(panel)
@@ -1710,13 +2119,24 @@ class MainWindow(QMainWindow):
         ):
             control.setChecked(True)
             control.toggled.connect(self._save_import_protection)
-            layout.addWidget(control)
+        protection_checks = QGridLayout()
+        protection_checks.setContentsMargins(0, 0, 0, 0)
+        protection_checks.setHorizontalSpacing(18)
+        protection_checks.setVerticalSpacing(0)
+        protection_checks.addWidget(self.protect_external_references, 0, 0)
+        protection_checks.addWidget(self.protect_paths_and_commands, 0, 1)
+        protection_checks.addWidget(self.protect_logic_references, 1, 0, 1, 2)
+        protection_checks.addWidget(self.allow_copy_condition_groups, 2, 0, 1, 2)
+        layout.addLayout(protection_checks)
         copy_note = QLabel("COPY-FROM 选项会改变 AiNiee 输入；修改后将重置术语及后续阶段。")
         copy_note.setObjectName("secondaryText")
+        copy_note.setWordWrap(True)
         layout.addWidget(copy_note)
 
-        logic_policy_row = QHBoxLayout()
-        logic_policy_row.addWidget(QLabel("未知事件逻辑"))
+        policy_row = QGridLayout()
+        policy_row.setContentsMargins(0, 0, 0, 0)
+        policy_row.setHorizontalSpacing(8)
+        policy_row.addWidget(QLabel("未知事件逻辑"), 0, 0)
         self.logic_unknown_policy = QComboBox()
         self.logic_unknown_policy.addItem("严格：阻止导入", "block")
         self.logic_unknown_policy.addItem("保守：保留风险原文后继续", "warn")
@@ -1726,12 +2146,8 @@ class MainWindow(QMainWindow):
         self.protect_logic_references.toggled.connect(
             self.logic_unknown_policy.setEnabled
         )
-        logic_policy_row.addWidget(self.logic_unknown_policy)
-        logic_policy_row.addStretch(1)
-        layout.addLayout(logic_policy_row)
-
-        identifier_row = QHBoxLayout()
-        identifier_row.addWidget(QLabel("可疑标识符"))
+        policy_row.addWidget(self.logic_unknown_policy, 0, 1)
+        policy_row.addWidget(QLabel("可疑标识符"), 0, 2)
         self.suspicious_identifier_action = QComboBox()
         self.suspicious_identifier_action.addItem("不处理", "ignore")
         self.suspicious_identifier_action.addItem("仅警告", "warn")
@@ -1740,13 +2156,15 @@ class MainWindow(QMainWindow):
         self.suspicious_identifier_action.currentIndexChanged.connect(
             self._save_import_protection
         )
-        identifier_row.addWidget(self.suspicious_identifier_action)
-        identifier_row.addStretch(1)
-        layout.addLayout(identifier_row)
+        policy_row.addWidget(self.suspicious_identifier_action, 0, 3)
+        policy_row.setColumnStretch(1, 1)
+        policy_row.setColumnStretch(3, 1)
+        layout.addLayout(policy_row)
 
         preview_row = QHBoxLayout()
         self.import_protection_summary = QLabel("完成翻译后可预览实际匹配项")
         self.import_protection_summary.setObjectName("secondaryText")
+        self.import_protection_summary.setWordWrap(True)
         preview_row.addWidget(self.import_protection_summary, 1)
         self.preview_import_protection_button = QPushButton("预览匹配项")
         self.preview_import_protection_button.clicked.connect(
@@ -1852,6 +2270,7 @@ class MainWindow(QMainWindow):
                 f"直接显示 {summary.get('logic_direct_display', 0)} 组，"
                 f"官方显示契约 {summary.get('logic_display_contract', 0)} 组，"
                 f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
+                f"外部显示链路 {summary.get('logic_external_text_flow', 0)} 组，"
                 f"未证明 {summary.get('logic_not_proven', 0)} 组，"
                 f"{logic_issue_label} {summary.get('logic_blocking_relevant', 0)} 组，"
                 f"已证明可翻译 {len(report.get('safe_to_translate', []))} 组，"
@@ -2011,8 +2430,328 @@ class MainWindow(QMainWindow):
             self._set_font_controls_enabled(False)
 
     def _main_tab_changed(self, index: int) -> None:
-        if index == self.font_tab_index:
+        if index == self.edit_tab_index:
+            self._refresh_edit_tab()
+        elif index == self.font_tab_index:
             self._refresh_font_tab()
+
+    def _clear_edit_view(self, message: str = "完成 AI 翻译后即可编辑译文") -> None:
+        self.edit_replace_toggle.setChecked(False)
+        self._edit_loading = True
+        try:
+            self.edit_source_path = None
+            self.edit_source_sha256 = ""
+            self.edit_source_identity = None
+            self.edit_source_row = -1
+            self.edit_action_status = ""
+            self.edit_model.set_items([])
+            self.edit_original.clear()
+            self.edit_context.clear()
+            self.edit_translation.clear()
+            self.edit_summary.setText("共 0 条 · 匹配 0 条 · 已修改 0 条")
+            self.edit_entry_status.setText("选择左侧译文")
+            self.edit_status.clear()
+            self.edit_gate_label.setText(message)
+            self.edit_gate_label.setVisible(True)
+            self.edit_content.setEnabled(False)
+            self.edit_save.setEnabled(False)
+            self.edit_discard.setEnabled(False)
+            self.edit_reset_current.setEnabled(False)
+        finally:
+            self._edit_loading = False
+
+    def _refresh_edit_tab(self, *, force: bool = False, manifest=None) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            self.edit_content.setEnabled(False)
+            return
+        if not self.current_manifest_path:
+            self._clear_edit_view()
+            return
+        manifest = manifest or load_manifest(self.current_manifest_path)
+        translate = manifest.version.stage(Stage.TRANSLATE)
+        items_value = translate.artifacts.get("items", "")
+        path = Path(items_value) if items_value else None
+        if translate.status is not StageStatus.COMPLETED or not path or not path.is_file():
+            self._clear_edit_view()
+            return
+
+        stat = path.stat()
+        identity = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        self.edit_gate_label.setVisible(False)
+        self.edit_content.setEnabled(True)
+        if not force and identity == self.edit_source_identity:
+            self._update_edit_summary()
+            return
+
+        items = load_items(path)
+        self._edit_loading = True
+        try:
+            self.edit_source_path = path.resolve()
+            self.edit_source_sha256 = sha256_file(path)
+            self.edit_source_identity = identity
+            self.edit_source_row = -1
+            self.edit_action_status = ""
+            self.edit_model.set_items(items)
+            self.edit_original.clear()
+            self.edit_context.clear()
+            self.edit_translation.clear()
+            self.edit_entry_status.setText("选择左侧译文")
+            self.edit_status.clear()
+        finally:
+            self._edit_loading = False
+        self._filter_edit_rows(self.edit_search.text())
+        if self.edit_proxy.rowCount():
+            self.edit_table.selectRow(0)
+        self._update_edit_actions()
+
+    def _filter_edit_rows(self, text: str) -> None:
+        if not hasattr(self, "edit_proxy"):
+            return
+        self.edit_action_status = ""
+        self.edit_proxy.setFilterFixedString(text.strip())
+        self._update_edit_summary()
+        if self.edit_proxy.rowCount() and not self.edit_table.currentIndex().isValid():
+            self.edit_table.selectRow(0)
+        self._update_edit_replace_actions()
+
+    def _toggle_edit_replace(self, visible: bool) -> None:
+        self.edit_replace_toggle.setText("▲" if visible else "▼")
+        self.edit_replace_toggle.setToolTip("收起替换" if visible else "展开替换")
+        self.edit_replace_toggle.setAccessibleName("收起替换" if visible else "展开替换")
+        self.edit_replace_popup.setVisible(visible)
+        if visible:
+            self._position_edit_replace_popup()
+            self.edit_replace_popup.raise_()
+            QTimer.singleShot(0, self.edit_replace.setFocus)
+
+    def _position_edit_replace_popup(self) -> None:
+        point = self.edit_search_toolbar.mapTo(
+            self.edit_content,
+            self.edit_search_toolbar.rect().bottomLeft(),
+        )
+        self.edit_replace_popup.setGeometry(
+            point.x(),
+            point.y() + 4,
+            self.edit_search_toolbar.width(),
+            self.edit_replace_popup.sizeHint().height(),
+        )
+        self.edit_replace_popup.layout().activate()
+
+    def _update_edit_replace_actions(self) -> None:
+        if not hasattr(self, "edit_replace_one"):
+            return
+        needle = self.edit_search.text().strip()
+        folded = needle.casefold()
+        current = self.edit_model.translation(self.edit_source_row)
+        self.edit_replace_one.setEnabled(bool(needle and folded in current.casefold()))
+        self.edit_replace_all.setEnabled(
+            bool(
+                needle
+                and any(
+                    folded in self.edit_model.translation(row).casefold()
+                    for row in range(self.edit_model.rowCount())
+                )
+            )
+        )
+
+    @staticmethod
+    def _replace_translation_text(
+        text: str,
+        needle: str,
+        replacement: str,
+        *,
+        count: int = 0,
+    ) -> tuple[str, int]:
+        return re.subn(
+            re.escape(needle),
+            lambda _match: replacement,
+            text,
+            count=count,
+            flags=re.IGNORECASE,
+        )
+
+    def _replace_current_translation(self) -> None:
+        item = self.edit_model.item(self.edit_source_row)
+        needle = self.edit_search.text().strip()
+        if not item or not needle:
+            return
+        updated, replaced = self._replace_translation_text(
+            self.edit_model.translation(self.edit_source_row),
+            needle,
+            self.edit_replace.text(),
+            count=1,
+        )
+        if not replaced:
+            return
+        error = self._translation_edit_error(item, updated)
+        if error:
+            QMessageBox.warning(self, "无法替换", f"{item.code or item.key}: {error}")
+            return
+        self.edit_translation.setPlainText(updated)
+        self._filter_edit_rows(self.edit_search.text())
+        self.edit_action_status = "已替换当前译文中的 1 处匹配。"
+        self._update_edit_actions()
+
+    def _replace_all_translations(self) -> None:
+        needle = self.edit_search.text().strip()
+        if not needle:
+            return
+        replacements: dict[int, str] = {}
+        occurrences = 0
+        for row, item in enumerate(self.edit_model.items):
+            updated, replaced = self._replace_translation_text(
+                self.edit_model.translation(row),
+                needle,
+                self.edit_replace.text(),
+            )
+            if not replaced:
+                continue
+            error = self._translation_edit_error(item, updated)
+            if error:
+                QMessageBox.warning(self, "无法全部替换", f"{item.code or item.key}: {error}")
+                return
+            replacements[row] = updated
+            occurrences += replaced
+        if not replacements:
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认全部替换",
+            f"将在 {len(replacements)} 条译文中替换 {occurrences} 处匹配。\n\n"
+            f"查找：{needle}\n替换为：{self.edit_replace.text() or '（空文本）'}\n\n"
+            "确定继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.edit_model.set_translations(replacements)
+        current = self.edit_model.item(self.edit_source_row)
+        if current and self.edit_source_row in replacements:
+            self._edit_loading = True
+            try:
+                self.edit_translation.setPlainText(
+                    self.edit_model.translation(self.edit_source_row)
+                )
+            finally:
+                self._edit_loading = False
+        self._filter_edit_rows(self.edit_search.text())
+        self.edit_action_status = (
+            f"已替换 {len(replacements)} 条译文中的 {occurrences} 处匹配。"
+        )
+        self._update_edit_actions()
+
+    def _show_edit_entry(self, current: QModelIndex, _previous: QModelIndex) -> None:
+        source = self.edit_proxy.mapToSource(current) if current.isValid() else QModelIndex()
+        row = source.row() if source.isValid() else -1
+        item = self.edit_model.item(row)
+        self._edit_loading = True
+        try:
+            self.edit_source_row = row
+            self.edit_original.setPlainText(item.original if item else "")
+            self.edit_context.setPlainText(
+                "\n".join(part for part in ((item.context if item else ""), (item.info if item else "")) if part)
+            )
+            self.edit_translation.setPlainText(self.edit_model.translation(row))
+        finally:
+            self._edit_loading = False
+        self._update_edit_actions()
+
+    @staticmethod
+    def _translation_edit_error(item: TranslationItem, text: str) -> str:
+        if not text:
+            return "译文不能为空。"
+        _protected, tokens = protect_control_tokens(text)
+        if tokens != item.control_signature:
+            return "控制符数量或顺序与原文不一致。"
+        return ""
+
+    def _edit_translation_changed(self) -> None:
+        if self._edit_loading or self.edit_source_row < 0:
+            return
+        self.edit_action_status = ""
+        self.edit_model.set_translation(
+            self.edit_source_row,
+            self.edit_translation.toPlainText(),
+        )
+        self._update_edit_actions()
+
+    def _update_edit_summary(self) -> None:
+        if not hasattr(self, "edit_model"):
+            return
+        self.edit_summary.setText(
+            f"共 {self.edit_model.rowCount()} 条 · 匹配 {self.edit_proxy.rowCount()} 条 · "
+            f"已修改 {len(self.edit_model.edits)} 条"
+        )
+
+    def _update_edit_actions(self) -> None:
+        self._update_edit_summary()
+        item = self.edit_model.item(self.edit_source_row)
+        current_error = ""
+        if item:
+            current_error = self._translation_edit_error(
+                item,
+                self.edit_model.translation(self.edit_source_row),
+            )
+            state = "已修改" if item.key in self.edit_model.edits else "未修改"
+            self.edit_entry_status.setText(f"{item.code or item.key} · {state}")
+        else:
+            self.edit_entry_status.setText("选择左侧译文")
+        errors = [
+            self._translation_edit_error(entry, self.edit_model.edits[entry.key])
+            for entry in self.edit_model.items
+            if entry.key in self.edit_model.edits
+        ]
+        invalid = next((error for error in errors if error), "")
+        self.edit_status.setText(current_error or invalid or self.edit_action_status)
+        dirty = bool(self.edit_model.edits)
+        self.edit_save.setEnabled(dirty and not invalid)
+        self.edit_discard.setEnabled(dirty)
+        self.edit_reset_current.setEnabled(bool(item and item.key in self.edit_model.edits))
+        self._update_edit_replace_actions()
+
+    def _reset_current_edit(self) -> None:
+        item = self.edit_model.item(self.edit_source_row)
+        if item:
+            self.edit_translation.setPlainText(item.translation)
+
+    def _discard_translation_edits(self) -> None:
+        row = self.edit_source_row
+        self.edit_action_status = ""
+        self._edit_loading = True
+        try:
+            self.edit_model.discard_edits()
+        finally:
+            self._edit_loading = False
+        if row >= 0:
+            source = self.edit_model.index(row, 0)
+            proxy = self.edit_proxy.mapFromSource(source)
+            if proxy.isValid():
+                self.edit_table.selectRow(proxy.row())
+                self._show_edit_entry(proxy, QModelIndex())
+        self._update_edit_actions()
+
+    def _save_translation_edits(self) -> None:
+        if not self.current_manifest_path or not self.edit_model.edits:
+            return
+        try:
+            pipeline = Pipeline(
+                self.current_manifest_path,
+                self.settings,
+                "",
+                local_data_dir(),
+                glossary_api_key="",
+            )
+            output = pipeline.apply_translation_edits(
+                dict(self.edit_model.edits),
+                source_sha256=self.edit_source_sha256,
+            )
+            self.edit_source_identity = None
+            self.status_label.setText(f"已保存译文：{output.name}")
+            self._load_project_view()
+            self.tabs.setCurrentIndex(self.edit_tab_index)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法保存译文", str(exc))
 
     def _refresh_font_tab(self, *, force: bool = False) -> None:
         if self.pipeline_thread and self.pipeline_thread.isRunning():
@@ -2348,6 +3087,24 @@ class MainWindow(QMainWindow):
         ):
             return
         value = self.project_combo.currentData()
+        if (
+            self.current_manifest_path
+            and str(value) != str(self.current_manifest_path)
+            and self.edit_model.edits
+        ):
+            answer = QMessageBox.question(
+                self,
+                "未保存的译文",
+                "当前译文修改尚未保存，放弃修改并切换项目？",
+            )
+            if answer != QMessageBox.Yes:
+                previous = self.project_combo.findData(str(self.current_manifest_path))
+                self.project_combo.blockSignals(True)
+                self.project_combo.setCurrentIndex(max(0, previous))
+                self.project_combo.blockSignals(False)
+                return
+            self.edit_model.discard_edits()
+            self.edit_source_identity = None
         self.font_context = None
         self.current_manifest_path = Path(value) if value else None
         if not self.current_manifest_path:
@@ -2386,9 +3143,11 @@ class MainWindow(QMainWindow):
         self.easy_summary.setText("选择项目后即可开始")
         self.start_button.setText("开始翻译")
         self.start_button.setEnabled(False)
+        self._update_step_range_controls()
         self.proofread_gate_label.setVisible(True)
         self.proofread_content.setEnabled(False)
         self._clear_proofread_view()
+        self._clear_edit_view()
         self._clear_font_view()
 
     def _load_project_view(self) -> None:
@@ -2438,12 +3197,21 @@ class MainWindow(QMainWindow):
             )
             self.step_buttons[stage].setEnabled(not running)
             result_path = self._stage_result_path(stage, record.artifacts)
-            self.step_result_buttons[stage].setEnabled(
-                not running
-                and record.status is StageStatus.COMPLETED
-                and result_path is not None
-                and result_path.exists()
-            )
+            if stage is Stage.VALIDATE:
+                translate = manifest.version.stage(Stage.TRANSLATE)
+                items_value = translate.artifacts.get("items", "")
+                result_available = (
+                    translate.status is StageStatus.COMPLETED
+                    and bool(items_value)
+                    and Path(items_value).is_file()
+                )
+            else:
+                result_available = (
+                    record.status is StageStatus.COMPLETED
+                    and result_path is not None
+                    and result_path.exists()
+                )
+            self.step_result_buttons[stage].setEnabled(not running and result_available)
             if record.status in {StageStatus.FAILED, StageStatus.CANCELLED}:
                 failed_stages.append(stage)
             if record.status is StageStatus.COMPLETED:
@@ -2464,6 +3232,7 @@ class MainWindow(QMainWindow):
             self.easy_summary.setText(f"下一阶段：{STAGE_LABELS[next_stage]}")
         self.start_button.setText("继续翻译" if completed else "开始翻译")
         self.start_button.setEnabled(not running and completed < len(STAGE_ORDER))
+        self._update_step_range_controls()
         if manifest.run_mode is RunMode.STEP:
             if failed_stages and self.active_step_stage not in failed_stages:
                 self.active_step_stage = max(
@@ -2520,9 +3289,25 @@ class MainWindow(QMainWindow):
         self.import_protection_summary.setText("点击预览分析当前译文")
         self._load_glossary()
         self._load_proofread_view(manifest)
+        if self.tabs.currentIndex() == self.edit_tab_index:
+            self._refresh_edit_tab(manifest=manifest)
+        else:
+            translate = manifest.version.stage(Stage.TRANSLATE)
+            items_value = translate.artifacts.get("items", "")
+            available = (
+                translate.status is StageStatus.COMPLETED
+                and bool(items_value)
+                and Path(items_value).is_file()
+            )
+            self.edit_gate_label.setVisible(not available)
+            self.edit_content.setEnabled(available)
         # Preload while the workflow page is visible so the first font-tab click
         # only paints already-complete choices and coverage.
         self._refresh_font_tab()
+
+    def _toggle_proofread_settings(self, visible: bool) -> None:
+        self.proofread_settings_panel.setVisible(visible)
+        self.proofread_settings_toggle.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)
 
     def _clear_proofread_view(self) -> None:
         self.proofread_report = None
@@ -2536,6 +3321,7 @@ class MainWindow(QMainWindow):
         self.proofread_progress.setValue(0)
         self.proofread_progress.setFormat("尚未校对")
         self.proofread_summary.setText("受影响 0 · 高 0 · 中 0 · 低 0 · 已采纳 0 · 失败批次 0")
+        self.proofread_entry_status.setText("选择左侧问题")
 
     def _load_proofread_view(self, manifest=None) -> None:
         self._proofread_loading = True
@@ -2576,6 +3362,17 @@ class MainWindow(QMainWindow):
             if report_path.is_file():
                 try:
                     self.proofread_report = load_report(report_path)
+                    changed = False
+                    for entry in self.proofread_report["entries"]:
+                        before = (entry["applicable"], entry["apply_error"], entry["decision"])
+                        self._update_entry_applicability(entry)
+                        if entry["decision"] == "accept" and not entry["applicable"]:
+                            entry["decision"] = "pending"
+                        changed = changed or before != (
+                            entry["applicable"], entry["apply_error"], entry["decision"]
+                        )
+                    if changed:
+                        save_report(report_path, self.proofread_report)
                     stale = not current_value or not current.is_file() or report_is_stale(
                         self.proofread_report, current
                     )
@@ -2647,7 +3444,6 @@ class MainWindow(QMainWindow):
                 QTableWidgetItem(entry["code"]),
                 QTableWidgetItem(issue_types),
                 QTableWidgetItem(decision_labels[entry["decision"]]),
-                QTableWidgetItem(entry["translation"].replace("\n", " ")),
             )
             for column, item in enumerate(values):
                 if column:
@@ -2677,22 +3473,36 @@ class MainWindow(QMainWindow):
             self.proofread_original.setPlainText(entry["original"] if entry else "")
             self.proofread_current.setPlainText(entry["translation"] if entry else "")
             self.proofread_suggestion.setPlainText(entry["edited_translation"] if entry else "")
-            if entry:
-                descriptions = []
-                for issue in entry["issues"]:
-                    confidence = round(float(issue["confidence"]) * 100)
-                    descriptions.append(
-                        f"[{issue['severity'].upper()} · {issue['type']} · {confidence}%] "
-                        f"{issue['description']}"
-                        + (f"\n建议：{issue['suggestion']}" if issue["suggestion"] else "")
-                    )
-                if entry["apply_error"]:
-                    descriptions.append("[不可应用] " + entry["apply_error"])
-                self.proofread_issues.setPlainText("\n\n".join(descriptions))
-            else:
-                self.proofread_issues.clear()
+            self._update_proofread_entry_state(entry)
         finally:
             self._proofread_loading = False
+
+    def _update_proofread_entry_state(self, entry: dict[str, object] | None) -> None:
+        if not entry:
+            self.proofread_issues.clear()
+            self.proofread_entry_status.setText("选择左侧问题")
+            self.proofread_entry_status.setToolTip("")
+            for button in (self.proofread_accept, self.proofread_keep, self.proofread_reset):
+                button.setEnabled(False)
+            return
+        descriptions = []
+        for issue in entry["issues"]:
+            confidence = round(float(issue["confidence"]) * 100)
+            descriptions.append(
+                f"[{issue['severity'].upper()} · {issue['type']} · {confidence}%] "
+                f"{issue['description']}"
+                + (f"\n建议：{issue['suggestion']}" if issue["suggestion"] else "")
+            )
+        if entry["apply_error"]:
+            descriptions.append("[需要人工编辑] " + entry["apply_error"])
+        self.proofread_issues.setPlainText("\n\n".join(descriptions))
+        decision = {"pending": "待处理", "accept": "已采纳", "keep": "保留现译"}[entry["decision"]]
+        state = "可采纳" if entry["applicable"] else "需编辑"
+        self.proofread_entry_status.setText(f"{decision} · {state}")
+        self.proofread_entry_status.setToolTip(str(entry["apply_error"]))
+        self.proofread_accept.setEnabled(bool(entry["applicable"]))
+        self.proofread_keep.setEnabled(True)
+        self.proofread_reset.setEnabled(True)
 
     def _filter_proofread_rows(self) -> None:
         if not hasattr(self, "proofread_table"):
@@ -2723,7 +3533,11 @@ class MainWindow(QMainWindow):
         text = str(entry["edited_translation"])
         if not text:
             entry["applicable"] = False
-            entry["apply_error"] = "建议译文为空。"
+            entry["apply_error"] = "AI 未生成可直接替换的完整修订译文，请重新校对或手动编辑。"
+            return
+        if text == str(entry["translation"]):
+            entry["applicable"] = False
+            entry["apply_error"] = "建议译文没有产生任何修改，请重新校对或手动编辑。"
             return
         _, expected = protect_control_tokens(str(entry["translation"]))
         _, actual = protect_control_tokens(text)
@@ -2739,6 +3553,7 @@ class MainWindow(QMainWindow):
         entry["edited_translation"] = self.proofread_suggestion.toPlainText()
         self._update_entry_applicability(entry)
         save_report(self.proofread_report_path, self.proofread_report)
+        self._update_proofread_entry_state(entry)
 
     def _save_proofread_decisions(self) -> None:
         if not self.proofread_report or not self.proofread_report_path:
@@ -2774,7 +3589,11 @@ class MainWindow(QMainWindow):
         if selected:
             self._save_proofread_decisions()
         if skipped:
-            QMessageBox.warning(self, "部分未处理", f"{skipped} 条建议因控制符不一致未被采纳。")
+            QMessageBox.warning(
+                self,
+                "部分未处理",
+                f"{skipped} 条建议因没有有效修订或控制符不一致而未被采纳。",
+            )
 
     def _update_proofread_summary(self) -> None:
         summary = self.proofread_report["summary"] if self.proofread_report else {}
@@ -2840,6 +3659,10 @@ class MainWindow(QMainWindow):
         if not self.current_manifest_path or (
             self.proofread_thread and self.proofread_thread.isRunning()
         ) or (self.pipeline_thread and self.pipeline_thread.isRunning()):
+            return
+        if self.edit_model.edits:
+            self.tabs.setCurrentIndex(self.edit_tab_index)
+            QMessageBox.information(self, "译文尚未保存", "请先保存或撤销当前译文修改。")
             return
         self._save_proofread_settings()
         errors = []
@@ -2983,6 +3806,10 @@ class MainWindow(QMainWindow):
     def _new_project(self) -> None:
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             return
+        if self.edit_model.edits:
+            self.tabs.setCurrentIndex(self.edit_tab_index)
+            QMessageBox.information(self, "译文尚未保存", "请先保存或撤销当前译文修改。")
+            return
         errors = validate_settings(self.settings)
         if errors:
             QMessageBox.warning(self, "设置未完成", "\n".join(errors))
@@ -2999,6 +3826,10 @@ class MainWindow(QMainWindow):
 
     def _add_version(self) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
+            return
+        if self.edit_model.edits:
+            self.tabs.setCurrentIndex(self.edit_tab_index)
+            QMessageBox.information(self, "译文尚未保存", "请先保存或撤销当前译文修改。")
             return
         game = QFileDialog.getExistingDirectory(self, "选择新版本游戏目录")
         if not game:
@@ -3025,6 +3856,39 @@ class MainWindow(QMainWindow):
         self.workflow_stack.setCurrentIndex(0 if mode is RunMode.ONE_CLICK else 1)
         self._set_mode(mode)
         self._load_project_view()
+
+    def _selected_step_range(self) -> tuple[Stage, ...] | None:
+        selected = tuple(stage for stage in STAGE_ORDER if self.step_checks[stage].isChecked())
+        if not selected:
+            return ()
+        start = STAGE_ORDER.index(selected[0])
+        expected = STAGE_ORDER[start : start + len(selected)]
+        return selected if selected == expected else None
+
+    def _update_step_range_controls(self, _checked: bool = False) -> None:
+        selected = self._selected_step_range()
+        running = bool(self.pipeline_thread and self.pipeline_thread.isRunning())
+        if selected is None:
+            self.step_range_summary.setText("选择不连续")
+        elif not selected:
+            self.step_range_summary.setText("未选择步骤")
+        elif len(selected) == 1:
+            self.step_range_summary.setText(f"已选择：{STAGE_LABELS[selected[0]]}")
+        else:
+            self.step_range_summary.setText(
+                f"已选择：{STAGE_LABELS[selected[0]]} 至 {STAGE_LABELS[selected[-1]]}"
+            )
+        self.run_range_button.setEnabled(
+            bool(selected) and self.current_manifest_path is not None and not running
+        )
+
+    def _start_selected_steps(self) -> None:
+        stages = self._selected_step_range()
+        if stages is None:
+            QMessageBox.warning(self, "无法连续执行", "请选择一段连续的步骤。")
+            return
+        if stages:
+            self._start(stages=stages)
 
     def _save_scope(self, target: str) -> None:
         if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
@@ -3155,6 +4019,7 @@ class MainWindow(QMainWindow):
             self.one_click,
             self.step_mode,
             self.start_button,
+            self.run_range_button,
             self.retry_button,
             self.open_release_button,
             self.open_font_release_button,
@@ -3163,6 +4028,8 @@ class MainWindow(QMainWindow):
             control.setEnabled(enabled)
         for button in (*self.step_buttons.values(), *self.step_result_buttons.values()):
             button.setEnabled(enabled)
+        for check in self.step_checks.values():
+            check.setEnabled(enabled)
         for checks in (
             self.export_scope_checks,
             self.translation_scope_checks,
@@ -3195,17 +4062,29 @@ class MainWindow(QMainWindow):
             self.logic_unknown_policy.setEnabled(
                 self.protect_logic_references.isChecked()
             )
+            self._update_step_range_controls()
         self.stop_button.setEnabled(locked)
 
-    def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:
+    def _start(
+        self,
+        stage: Stage | None = None,
+        *,
+        stages: tuple[Stage, ...] = (),
+        switch_to_step: bool = True,
+    ) -> None:
         if (
             not self.current_manifest_path
             or (self.pipeline_thread and self.pipeline_thread.isRunning())
             or (self.proofread_thread and self.proofread_thread.isRunning())
         ):
             return
-        errors = validate_settings(self.settings) if stage is None else []
-        if stage is Stage.EXTRACT:
+        if self.edit_model.edits:
+            self.tabs.setCurrentIndex(self.edit_tab_index)
+            QMessageBox.information(self, "译文尚未保存", "请先保存或撤销当前译文修改。")
+            return
+        selected = stages or ((stage,) if stage is not None else ())
+        errors = validate_settings(self.settings) if not selected else []
+        if Stage.EXTRACT in selected:
             try:
                 inspect_wolf_editor(self.settings.wolf_editor_path)
             except (OSError, ValueError) as error:
@@ -3215,16 +4094,16 @@ class MainWindow(QMainWindow):
             return
         try:
             self._stop_font_scan_for_pipeline()
-            if stage is not None and switch_to_step:
-                self.active_step_stage = stage
+            if selected and switch_to_step:
+                self.active_step_stage = selected[0]
                 self.step_mode.setChecked(True)
                 self.workflow_stack.setCurrentIndex(1)
                 self._set_mode(RunMode.STEP)
             key = ""
             glossary_key = ""
-            if stage is None or stage is Stage.TRANSLATE:
+            if not selected or Stage.TRANSLATE in selected:
                 key = self.store.api_key(self.settings)
-            if stage is None or stage is Stage.GLOSSARY:
+            if not selected or Stage.GLOSSARY in selected:
                 glossary_key = self.store.glossary_api_key(self.settings)
             self.pipeline = Pipeline(
                 self.current_manifest_path,
@@ -3233,7 +4112,7 @@ class MainWindow(QMainWindow):
                 local_data_dir(),
                 glossary_api_key=glossary_key,
             )
-            self.pipeline_thread = PipelineThread(self.pipeline, stage)
+            self.pipeline_thread = PipelineThread(self.pipeline, stage, stages)
             self.pipeline_thread.log_line.connect(self._append_log)
             self.pipeline_thread.stage_progress.connect(self._stage_progress)
             self.pipeline_thread.stage_state.connect(self._stage_state)
@@ -3241,11 +4120,15 @@ class MainWindow(QMainWindow):
             self.pipeline_thread.failed.connect(self._pipeline_failed)
             self.pipeline_thread.finished.connect(self._pipeline_finished)
             self._set_pipeline_ui_locked(True)
-            self.status_label.setText(
-                "正在应用字体"
-                if self.font_apply_active
-                else (f"正在执行：{STAGE_LABELS[stage]}" if stage is not None else "运行中")
-            )
+            if self.font_apply_active:
+                status = "正在应用字体"
+            elif stages:
+                status = f"正在连续执行：{STAGE_LABELS[stages[0]]} 至 {STAGE_LABELS[stages[-1]]}"
+            elif stage is not None:
+                status = f"正在执行：{STAGE_LABELS[stage]}"
+            else:
+                status = "运行中"
+            self.status_label.setText(status)
             self.pipeline_thread.start()
         except Exception as exc:
             self.pipeline_thread = None
@@ -3305,6 +4188,19 @@ class MainWindow(QMainWindow):
             return
         try:
             manifest = load_manifest(self.current_manifest_path)
+            if stage is Stage.VALIDATE:
+                translate = manifest.version.stage(Stage.TRANSLATE)
+                items_value = translate.artifacts.get("items", "")
+                if (
+                    translate.status is not StageStatus.COMPLETED
+                    or not items_value
+                    or not Path(items_value).is_file()
+                ):
+                    QMessageBox.information(self, "编辑译文", "完成 AI 翻译后即可编辑译文。")
+                    return
+                self.tabs.setCurrentIndex(self.edit_tab_index)
+                self._refresh_edit_tab(manifest=manifest)
+                return
             record = manifest.version.stage(stage)
             path = self._stage_result_path(stage, record.artifacts)
             if record.status is not StageStatus.COMPLETED or path is None or not path.exists():
@@ -3350,22 +4246,36 @@ class MainWindow(QMainWindow):
 
     def _pipeline_result(self, result: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
+        stages = self.pipeline_thread.stages if self.pipeline_thread else ()
         self.status_label.setText(
             "字体已应用"
             if self.font_apply_active
-            else (f"已完成：{STAGE_LABELS[target]}" if target is not None else "已完成")
+            else (
+                f"已完成：{STAGE_LABELS[stages[0]]} 至 {STAGE_LABELS[stages[-1]]}"
+                if stages
+                else (f"已完成：{STAGE_LABELS[target]}" if target is not None else "已完成")
+            )
         )
 
     def _pipeline_failed(self, detail: str) -> None:
         target = self.pipeline_thread.stage if self.pipeline_thread else None
+        stages = self.pipeline_thread.stages if self.pipeline_thread else ()
         self.status_label.setText(
             "字体应用错误"
             if self.font_apply_active
-            else (f"出现错误：{STAGE_LABELS[target]}" if target is not None else "出现错误")
+            else (
+                f"连续执行出错：{STAGE_LABELS[stages[0]]} 至 {STAGE_LABELS[stages[-1]]}"
+                if stages
+                else (f"出现错误：{STAGE_LABELS[target]}" if target is not None else "出现错误")
+            )
         )
         if not self.font_apply_active:
             self.tabs.setCurrentIndex(0)
-        title = "字体应用错误" if self.font_apply_active else ("步骤执行错误" if target is not None else "流水线失败")
+        title = (
+            "字体应用错误"
+            if self.font_apply_active
+            else ("步骤执行错误" if target is not None or stages else "流水线失败")
+        )
         QMessageBox.critical(self, title, detail.splitlines()[-1] if detail.splitlines() else detail)
 
     def _pipeline_finished(self) -> None:
@@ -3423,7 +4333,20 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "发布目录", "当前版本尚未发布。")
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if (
+            hasattr(self, "edit_replace_toggle")
+            and self.edit_replace_toggle.isChecked()
+        ):
+            QTimer.singleShot(0, self._position_edit_replace_popup)
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.edit_model.edits:
+            answer = QMessageBox.question(self, "退出", "译文修改尚未保存，仍要退出？")
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
         if self.proofread_thread and self.proofread_thread.isRunning():
             if QMessageBox.question(self, "退出", "校对仍在运行，停止并退出？") != QMessageBox.Yes:
                 event.ignore()
@@ -3467,6 +4390,8 @@ QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTableWidget {
     selection-background-color: #dceae0; selection-color: #18211b;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus { border: 1px solid #267247; }
+QPlainTextEdit#proofreadSuggestion { border: 2px solid #79a98a; background: #fbfefc; }
+QPlainTextEdit#proofreadSuggestion:focus { border-color: #267247; }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QPlainTextEdit:disabled, QTableWidget:disabled {
     color: #9aa49d; background: #edf0ed; border-color: #d8ddd9;
 }
@@ -3484,6 +4409,13 @@ QPushButton#primaryButton:disabled, QToolButton#primaryButton:disabled {
 QPushButton#primaryButton:hover { background: #1d5b38; }
 QPushButton#segment { border-radius: 0; min-width: 48px; }
 QPushButton#segment:checked { background: #dceae0; border-color: #5d8d6f; color: #17482d; }
+QFrame#editReplacePopup { background: #f6f8f6; border: 0; }
+QToolButton#editReplaceToggle { padding: 0; }
+QPushButton#editReplaceButton { font-size: 15px; }
+QLineEdit#editSearch QToolButton, QLineEdit#editReplace QToolButton {
+    background: transparent; border: 0; padding: 0; margin: 0;
+    min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;
+}
 QFrame#stageNode { background: #ffffff; border: 1px solid #d9e0db; border-radius: 6px; }
 QFrame#stageRow { background: transparent; border: 0; border-bottom: 1px solid #e2e7e3; }
 QLabel#stepNumber { color: #637068; font-size: 12px; font-weight: 600; }

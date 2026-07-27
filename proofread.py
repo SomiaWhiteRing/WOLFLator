@@ -207,24 +207,28 @@ def make_report(
             )
         if not issues:
             continue
-        suggested = str(result.get("suggested_translation", "") or row.get("translation", ""))
-        applicable = True
-        apply_error = ""
-        try:
-            suggested = restore_control_tokens(suggested, tokens)
-            if not suggested:
-                raise ValueError("建议译文为空。")
-        except ValueError as exc:
-            suggested = restore_control_tokens(str(row.get("translation", "")), tokens)
-            applicable = False
-            apply_error = str(exc)
+        current_translation = restore_control_tokens(str(row.get("translation", "")), tokens)
+        raw_suggested = str(result.get("suggested_translation", "") or "")
+        suggested = ""
+        applicable = False
+        apply_error = "AI 未生成可直接替换的完整修订译文，请重新校对或手动编辑。"
+        if raw_suggested:
+            try:
+                suggested = restore_control_tokens(raw_suggested, tokens)
+                if suggested == current_translation:
+                    raise ValueError("建议译文没有产生任何修改，请重新校对或手动编辑。")
+                applicable = True
+                apply_error = ""
+            except ValueError as exc:
+                suggested = current_translation
+                apply_error = str(exc)
         severity = max(issues, key=lambda issue: SEVERITY_ORDER[str(issue["severity"])])["severity"]
         entries.append(
             {
                 "key": key,
                 "code": str(row.get("code", "")),
                 "original": restore_control_tokens(str(row.get("original", "")), tokens),
-                "translation": restore_control_tokens(str(row.get("translation", "")), tokens),
+                "translation": current_translation,
                 "suggested_translation": suggested,
                 "edited_translation": suggested,
                 "issues": issues,

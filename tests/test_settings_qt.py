@@ -8,8 +8,16 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QHeaderView,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QToolButton,
+)
 
 from app import (
     EditorInstallThread,
@@ -35,7 +43,7 @@ from models import (
 from pipeline import PipelineStateEvent, create_project, load_manifest
 from proofread import build_worker_input, load_report, make_report, proofread_paths, save_report
 from settings import SettingsStore, protect_secret, unprotect_secret
-from wolf_tools import dump_items
+from wolf_tools import dump_items, load_items
 
 
 class SettingsQtTests(unittest.TestCase):
@@ -143,7 +151,21 @@ class SettingsQtTests(unittest.TestCase):
             )
             store.save(item)
             dialog = SettingsDialog(store)
-            self.assertEqual(2, dialog.api_tabs.count())
+            self.assertEqual(3, dialog.settings_tabs.count())
+            self.assertEqual(
+                ["工具与目录", "术语生成 API", "AiNiee 翻译 API"],
+                [
+                    dialog.settings_tabs.tabText(index)
+                    for index in range(dialog.settings_tabs.count())
+                ],
+            )
+            self.assertTrue(
+                dialog.settings_tabs.widget(0).isAncestorOf(dialog.wolf_path)
+            )
+            self.assertTrue(
+                dialog.settings_tabs.widget(1).isAncestorOf(dialog.glossary_api_url)
+            )
+            self.assertTrue(dialog.settings_tabs.widget(2).isAncestorOf(dialog.api_url))
             self.assertEqual("https://translate.example/v1", dialog.api_url.text())
             self.assertEqual("https://glossary.example/v1", dialog.glossary_api_url.text())
             self.assertEqual(12, dialog.api_threads.value())
@@ -152,6 +174,21 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(8, dialog.translation_line_limit.value())
             self.assertEqual(1, dialog.translation_retry_min_lines.value())
             self.assertEqual(6, dialog.translation_rounds.value())
+            self.assertEqual("", dialog.translation_token_limit.suffix())
+            self.assertEqual("", dialog.translation_line_limit.suffix())
+            self.assertEqual("", dialog.translation_retry_min_lines.suffix())
+            self.assertEqual("Token", dialog.translation_token_unit.text())
+            self.assertEqual("条", dialog.translation_line_unit.text())
+            self.assertEqual("条", dialog.translation_retry_unit.text())
+            self.assertEqual("轮", dialog.translation_rounds_unit.text())
+            self.assertEqual(140, dialog.translation_token_limit.maximumWidth())
+            self.assertEqual(90, dialog.translation_line_limit.maximumWidth())
+            self.assertEqual(90, dialog.translation_retry_min_lines.maximumWidth())
+            self.assertEqual(140, dialog.translation_rounds.maximumWidth())
+            self.assertEqual(
+                QSizePolicy.Fixed,
+                dialog.translation_chunk_stack.sizePolicy().verticalPolicy(),
+            )
             self.assertEqual(2, dialog.glossary_api_threads.value())
             self.assertEqual(456_789, dialog.glossary_chunk_chars.value())
             self.assertEqual(65_535, dialog.glossary_api_max_tokens.value())
@@ -209,22 +246,33 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(window.workflow_page.isAncestorOf(window.one_click))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.step_mode))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.log_view))
-                self.assertEqual(5, window.tabs.count())
+                self.assertEqual(6, window.tabs.count())
                 self.assertEqual("校对", window.tabs.tabText(2))
-                self.assertEqual("范围", window.tabs.tabText(3))
-                self.assertEqual("修改字体", window.tabs.tabText(4))
+                self.assertEqual("编辑", window.tabs.tabText(3))
+                self.assertEqual("范围", window.tabs.tabText(4))
+                self.assertEqual("修改字体", window.tabs.tabText(5))
                 self.assertTrue(
                     any(
                         label.text() == "原字体"
-                        for label in window.tabs.widget(4).findChildren(QLabel)
+                        for label in window.tabs.widget(5).findChildren(QLabel)
                     )
                 )
                 self.assertEqual(3, window.scope_stack.count())
-                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.translation_scope_button))
-                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.import_scope_button))
-                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.export_scope_button))
+                self.assertTrue(window.tabs.widget(4).isAncestorOf(window.translation_scope_button))
+                self.assertTrue(window.tabs.widget(4).isAncestorOf(window.import_scope_button))
+                self.assertTrue(window.tabs.widget(4).isAncestorOf(window.export_scope_button))
                 self.assertTrue(window.translation_scope_checks["external"].isChecked())
                 self.assertTrue(window.import_scope_checks["external"].isChecked())
+                self.assertTrue(
+                    window.import_scope_column.isAncestorOf(
+                        window.import_scope_checks["filename"]
+                    )
+                )
+                self.assertTrue(
+                    window.import_protection_column.isAncestorOf(
+                        window.protect_external_references
+                    )
+                )
                 self.assertFalse(window.external_filter_options.isHidden())
                 self.assertTrue(window.exclude_large_external_files.isChecked())
                 self.assertEqual(128, window.external_file_limit_kb.value())
@@ -403,18 +451,33 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertEqual(1, window.progress.maximum())
                 self.assertTrue(window.step_buttons[Stage.COPY].isEnabled())
                 self.assertTrue(window.retry_button.isEnabled())
+                self.assertEqual(8, len(window.step_checks))
+                self.assertFalse(window.run_range_button.isEnabled())
+                window.step_checks[Stage.UNPACK].setChecked(True)
+                window.step_checks[Stage.EXTRACT].setChecked(True)
+                self.assertEqual(
+                    (Stage.UNPACK, Stage.EXTRACT), window._selected_step_range()
+                )
+                self.assertTrue(window.run_range_button.isEnabled())
+                self.assertEqual("已选择：解包 至 导出文本", window.step_range_summary.text())
+                with patch.object(window, "_start") as start:
+                    window.run_range_button.click()
+                    start.assert_called_once_with(stages=(Stage.UNPACK, Stage.EXTRACT))
+                window.step_checks[Stage.RELEASE].setChecked(True)
+                self.assertIsNone(window._selected_step_range())
+                self.assertFalse(window.run_range_button.isEnabled())
+                window.step_checks[Stage.RELEASE].setChecked(False)
                 window._set_pipeline_ui_locked(True)
                 self.assertFalse(window.settings_button.isEnabled())
                 self.assertFalse(window.project_combo.isEnabled())
                 self.assertFalse(window.new_project_button.isEnabled())
                 self.assertFalse(window.add_version_button.isEnabled())
                 self.assertFalse(window.one_click.isEnabled())
+                self.assertFalse(window.run_range_button.isEnabled())
+                self.assertTrue(all(not check.isEnabled() for check in window.step_checks.values()))
                 self.assertFalse(window.open_release_button.isEnabled())
                 self.assertTrue(window.stop_button.isEnabled())
-                self.assertFalse(window.tabs.isTabEnabled(1))
-                self.assertFalse(window.tabs.isTabEnabled(2))
-                self.assertFalse(window.tabs.isTabEnabled(3))
-                self.assertFalse(window.tabs.isTabEnabled(4))
+                self.assertTrue(all(not window.tabs.isTabEnabled(index) for index in range(1, 6)))
 
                 with patch.object(window, "_load_project_view") as reload_view:
                     window._stage_progress(1, 8, Stage.COPY.value)
@@ -461,6 +524,130 @@ class SettingsQtTests(unittest.TestCase):
                     self.assertTrue(window.tabs.isTabEnabled(window.proofread_tab_index))
                     self.assertEqual(status is StageStatus.COMPLETED, window.proofread_content.isEnabled())
                     self.assertEqual(status is StageStatus.COMPLETED, window.proofread_gate_label.isHidden())
+                window.close()
+
+    def test_edit_tab_edits_normal_translation_and_validate_result_redirects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            projects = root / "projects"
+            manifest_path = create_project(projects, game)
+            items_path = dump_items(
+                root / "items-translated.json",
+                [
+                    TranslationItem(
+                        key="one", code="C-1", original="原文一", translation="ABC译文一"
+                    ),
+                    TranslationItem(
+                        key="two",
+                        code="C-2",
+                        original=r"\C[1]原文二",
+                        translation=r"\C[1]译文二",
+                        control_signature=[r"\C[1]"],
+                    ),
+                ],
+            )
+            manifest = load_manifest(manifest_path)
+            translate = manifest.version.stage(Stage.TRANSLATE)
+            translate.status = StageStatus.COMPLETED
+            translate.artifacts["items"] = str(items_path)
+            manifest_path.write_text(
+                json.dumps(manifest.to_dict(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            store = SettingsStore(root / "settings.ini")
+            store.save(AppSettings(projects_root=str(projects), last_project=str(manifest_path)))
+            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
+                window = MainWindow()
+                window.show()
+                self.app.processEvents()
+                self.assertEqual("编辑译文", window.step_result_buttons[Stage.VALIDATE].text())
+                self.assertTrue(window.step_result_buttons[Stage.VALIDATE].isEnabled())
+                window._open_stage_result(Stage.VALIDATE)
+                self.assertEqual(window.edit_tab_index, window.tabs.currentIndex())
+                self.assertEqual(2, window.edit_model.rowCount())
+                header = window.edit_table.horizontalHeader()
+                self.assertTrue(
+                    all(
+                        header.sectionResizeMode(column) == QHeaderView.Stretch
+                        for column in range(4)
+                    )
+                )
+                self.assertEqual("▼", window.edit_replace_toggle.text())
+                self.assertEqual(window.edit_search.height(), window.edit_replace_toggle.height())
+                window.edit_replace_toggle.setChecked(True)
+                self.app.processEvents()
+                self.assertEqual("▲", window.edit_replace_toggle.text())
+                self.assertFalse(window.edit_replace_popup.isHidden())
+                self.assertEqual(window.edit_replace.height(), window.edit_replace_one.height())
+                self.assertEqual(window.edit_replace.height(), window.edit_replace_all.height())
+                self.assertEqual(
+                    window.edit_search.mapTo(window.edit_content, QPoint()).x(),
+                    window.edit_replace.mapTo(window.edit_content, QPoint()).x(),
+                )
+                for line_edit in (window.edit_search, window.edit_replace):
+                    clear_button = line_edit.findChild(QToolButton)
+                    self.assertIsNotNone(clear_button)
+                    self.assertLessEqual(
+                        abs(
+                            clear_button.geometry().center().y()
+                            - line_edit.rect().center().y()
+                        ),
+                        1,
+                    )
+                window.edit_table.setFocus()
+                self.app.processEvents()
+                self.assertTrue(window.edit_replace_toggle.isChecked())
+                self.assertFalse(window.edit_replace_popup.isHidden())
+                window.edit_replace_toggle.setChecked(False)
+                self.assertEqual("▼", window.edit_replace_toggle.text())
+
+                window.edit_search.setText("原文二")
+                self.app.processEvents()
+                self.assertEqual(1, window.edit_proxy.rowCount())
+                window.edit_table.selectRow(0)
+                self.app.processEvents()
+                self.assertEqual(r"\C[1]原文二", window.edit_original.toPlainText())
+                self.assertFalse(window.edit_replace_one.isEnabled())
+                self.assertFalse(window.edit_replace_all.isEnabled())
+
+                window.edit_search.setText("C")
+                window.edit_replace.setText("X")
+                self.app.processEvents()
+                with patch("app.QMessageBox.warning") as warning:
+                    window._replace_all_translations()
+                warning.assert_called_once()
+                self.assertFalse(window.edit_model.edits)
+
+                window.edit_search.setText("译文")
+                window.edit_replace.setText("润色")
+                self.app.processEvents()
+                window.edit_table.selectRow(0)
+                self.app.processEvents()
+                window._replace_current_translation()
+                with patch("app.QMessageBox.question", return_value=QMessageBox.No) as question:
+                    window._replace_all_translations()
+                question.assert_called_once()
+                self.assertNotIn("two", window.edit_model.edits)
+                with patch("app.QMessageBox.question", return_value=QMessageBox.Yes):
+                    window._replace_all_translations()
+                self.assertEqual("ABC润色一", window.edit_model.edits["one"])
+                self.assertEqual(r"\C[1]润色二", window.edit_model.edits["two"])
+                self.assertEqual("原文一", window.edit_model.items[0].original)
+                self.assertEqual(r"\C[1]原文二", window.edit_model.items[1].original)
+                self.assertTrue(window.edit_save.isEnabled())
+                window._save_translation_edits()
+
+                manifest = load_manifest(manifest_path)
+                output = Path(manifest.version.stage(Stage.TRANSLATE).artifacts["items"])
+                self.assertEqual("items-edited.json", output.name)
+                saved = load_items(output)
+                self.assertEqual("ABC润色一", saved[0].translation)
+                self.assertEqual(r"\C[1]润色二", saved[1].translation)
+                self.assertFalse(window.edit_model.edits)
                 window.close()
 
     def test_proofread_review_saves_edits_and_individual_and_batch_decisions(self):

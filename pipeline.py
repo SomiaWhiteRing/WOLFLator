@@ -90,6 +90,7 @@ from wolf_tools import (
     official_dialogs_indicate_legacy_game,
     prepare_official_tool,
     prepare_uberwolf,
+    protect_control_tokens,
     read_translation_items,
     read_font_slots,
     reconcile_incremental,
@@ -543,6 +544,59 @@ class Pipeline:
                 translate.artifacts["items"] = str(output)
                 translate.artifacts["items_proofread"] = str(output)
                 translate.artifacts["proofread_report"] = str(Path(report_path).resolve())
+                self._reset_after_proofread()
+                self.save()
+                return output
+            except Exception:
+                if rollback is not None:
+                    atomic_write_bytes(output_path, rollback)
+                raise
+
+    def apply_translation_edits(
+        self,
+        changes: dict[str, str],
+        *,
+        source_sha256: str,
+    ) -> Path:
+        with self._mutation("apply-translation-edits"):
+            translate = self.manifest.version.stage(Stage.TRANSLATE)
+            if translate.status is not StageStatus.COMPLETED:
+                raise RuntimeError("AI 翻译尚未完成，不能编辑译文。")
+            current_value = translate.artifacts.get("items", "")
+            current = Path(current_value)
+            if not current_value or not current.is_file():
+                raise FileNotFoundError("当前翻译产物不存在。")
+            if sha256_file(current) != source_sha256:
+                raise RuntimeError("译文已在别处发生变化，请重新载入后再保存。")
+            if not changes:
+                raise ValueError("没有需要保存的译文修改。")
+
+            items = load_items(current)
+            by_key = {item.key: item for item in items}
+            unknown = sorted(set(changes) - set(by_key))
+            if unknown:
+                raise ValueError(f"译文修改包含未知条目: {unknown[:3]}")
+            applied = 0
+            for key, text in changes.items():
+                if not isinstance(text, str) or not text:
+                    raise ValueError(f"译文不能为空: {by_key[key].code or key}")
+                item = by_key[key]
+                _protected, tokens = protect_control_tokens(text)
+                if tokens != item.control_signature:
+                    raise ValueError(f"译文控制符数量或顺序不一致: {item.code or key}")
+                if text != item.translation:
+                    item.translation = text
+                    applied += 1
+            if not applied:
+                raise ValueError("没有需要保存的译文修改。")
+
+            output_path = self.artifacts_dir / "items-edited.json"
+            rollback = output_path.read_bytes() if output_path.is_file() else None
+            try:
+                output = dump_items(output_path, items)
+                translate.artifacts.setdefault("items_before_edit", current_value)
+                translate.artifacts["items"] = str(output)
+                translate.artifacts["items_edited"] = str(output)
                 self._reset_after_proofread()
                 self.save()
                 return output
@@ -1358,6 +1412,10 @@ class Pipeline:
             logic_safety=logic_safety,
         )
         protected_keys = set(protection["protected_keys"])
+        translation_overrides = {
+            str(key): str(value)
+            for key, value in protection.get("translation_overrides", {}).items()
+        }
         required = selected_translation_requirements(
             items,
             self.manifest.import_scope,
@@ -1397,6 +1455,7 @@ class Pipeline:
             f"直接显示 {summary.get('logic_direct_display', 0)} 组，"
             f"官方显示契约 {summary.get('logic_display_contract', 0)} 组，"
             f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
+            f"外部显示链路 {summary.get('logic_external_text_flow', 0)} 组，"
             f"未证明 {summary.get('logic_not_proven', 0)} 组，"
             f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
             f"中点转换 {summary.get('middle_dot_normalized', 0)} 组，"
@@ -1415,6 +1474,7 @@ class Pipeline:
             items,
             allow_copy_condition_groups=rules.allow_copy_condition_groups,
             protected_keys=protected_keys,
+            translation_overrides=translation_overrides,
         )
         staging_game = self.artifacts_dir / f".import-game-{token}"
         shutil.copytree(
@@ -1429,7 +1489,15 @@ class Pipeline:
         support = staging_game / SUPPORT_DIR
         support.mkdir(parents=True, exist_ok=True)
         shutil.copy2(scoped, support / WORKBOOK_NAME)
-        runner = self._official_runner(full_export_scope())
+        runner = self._official_runner(
+            ImportScope(
+                display=True,
+                external=self.manifest.import_scope.external,
+                optional_name=True,
+                halfwidth=True,
+                filename=True,
+            )
+        )
         post_editor_dir = self.artifacts_dir / f"post-import-editor-{token}"
         previous = self.work_dir / ".wolflator-translated-previous"
         translated: Path | None = None
@@ -1993,13 +2061,39 @@ class Pipeline:
         with self._mutation(stage.value):
             return self._run_stage_locked(stage)
 
-    def _run_stage_locked(self, stage: Stage) -> str:
-        self.cancel_event.clear()
-        self._start_run_log(stage.value)
+    def run_stages(self, stages: tuple[Stage, ...]) -> str:
+        if not stages:
+            raise ValueError("连续执行至少需要一个阶段。")
+        start = STAGE_ORDER.index(stages[0])
+        if stages != STAGE_ORDER[start : start + len(stages)]:
+            raise ValueError("连续执行只能选择相邻且按顺序排列的阶段。")
+        with self._mutation(f"{stages[0].value}-{stages[-1].value}"):
+            self.cancel_event.clear()
+            self._start_run_log(f"{stages[0].value}-{stages[-1].value}")
+            for index, stage in enumerate(stages):
+                self._run_stage_locked(
+                    stage,
+                    initialize=False,
+                    current=index,
+                    total=len(stages),
+                )
+        return "completed"
+
+    def _run_stage_locked(
+        self,
+        stage: Stage,
+        *,
+        initialize: bool = True,
+        current: int = 0,
+        total: int = 1,
+    ) -> str:
+        if initialize:
+            self.cancel_event.clear()
+            self._start_run_log(stage.value)
         input_hash = self._stage_input_hash(stage)
         self._mark_running(stage, input_hash)
-        self._emit_state(stage, StageStatus.RUNNING, 0, 1, "正在执行")
-        self.progress(0, 0, stage)
+        self._emit_state(stage, StageStatus.RUNNING, current, total, "正在执行")
+        self.progress(current, total, stage)
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 开始")
         started = time.monotonic()
         try:
@@ -2011,13 +2105,19 @@ class Pipeline:
                 + traceback.format_exc()
             )
             self._mark_failed(stage, exc)
-            self._emit_state(stage, self.manifest.version.stage(stage).status, 0, 1, str(exc))
+            self._emit_state(
+                stage,
+                self.manifest.version.stage(stage).status,
+                current,
+                total,
+                str(exc),
+            )
             self.error(
                 f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 出现错误: {exc}"
             )
             raise
-        self.progress(1, 1, stage)
-        self._emit_state(stage, StageStatus.COMPLETED, 1, 1, "已完成")
+        self.progress(current + 1, total, stage)
+        self._emit_state(stage, StageStatus.COMPLETED, current + 1, total, "已完成")
         self.detail(f"stage.complete stage={stage.value} elapsed={time.monotonic() - started:.3f}s")
         self.log(f"[{STAGE_ORDER.index(stage) + 1}/{len(STAGE_ORDER)}] {stage.value} 完成")
         return "completed"

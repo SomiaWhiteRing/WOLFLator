@@ -52,7 +52,7 @@ SUPPORT_DIR = "WOLF_Translation_Support_Tool_Data"
 WORKBOOK_NAME = "WOLF_Translation_Text.xlsx"
 GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
 ITEMS_SCHEMA = 1
-IMPORT_PROTECTION_SCHEMA = 7
+IMPORT_PROTECTION_SCHEMA = 8
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
@@ -1227,7 +1227,8 @@ def _external_script_control_spans(text: str) -> list[tuple[int, int]]:
         _EXTERNAL_DISPLAY_COMMAND_RE.match(match.group(0).rstrip("\r\n"))
         for match in lines
     ):
-        return []
+        # ponytail: AiNiee cannot split one Paratranz row; preserve line structure as control tokens.
+        return [match.span() for match in re.finditer(r"\r\n|\n|\r", text)]
 
     first = next(
         (match.group(0).rstrip("\r\n").strip() for match in lines if match.group(0).strip()),
@@ -2415,6 +2416,12 @@ def analyze_import_protection(
         "protected_keys": sorted(protected),
         "safe_to_translate": sorted((set(requirements) & proven_safe) - protected),
         "keep_original": sorted(protected),
+        "translation_overrides": (
+            dict(logic_safety.get("translation_overrides", {}))
+            if isinstance(logic_safety, dict)
+            and isinstance(logic_safety.get("translation_overrides"), dict)
+            else {}
+        ),
         "approvals": (
             dict(logic_safety.get("approvals", {}))
             if isinstance(logic_safety, dict)
@@ -2482,6 +2489,12 @@ def analyze_import_protection(
             ),
             "logic_semantic_equivalence": len(
                 logic_safety.get("approvals", {}).get("semantic_equivalence", ())
+                if isinstance(logic_safety, dict)
+                and isinstance(logic_safety.get("approvals"), dict)
+                else ()
+            ),
+            "logic_external_text_flow": len(
+                logic_safety.get("approvals", {}).get("external_text_flow", ())
                 if isinstance(logic_safety, dict)
                 and isinstance(logic_safety.get("approvals"), dict)
                 else ()
@@ -2604,6 +2617,7 @@ def write_scoped_workbook(
     *,
     allow_copy_condition_groups: bool = False,
     protected_keys: set[str] | None = None,
+    translation_overrides: dict[str, str] | None = None,
 ) -> Path:
     workbook = load_workbook(full_path)
     worksheet = workbook.active
@@ -2645,7 +2659,10 @@ def write_scoped_workbook(
             continue
         if item is None:
             raise ValueError(f"范围工作簿找不到翻译条目: {values['code']}")
-        target = item.translation if item.translation != item.original else ""
+        target = (translation_overrides or {}).get(
+            item.key,
+            item.translation if item.translation != item.original else "",
+        )
         # ponytail: rewrite every selected cell from the item model so a stale
         # workbook formula cannot leak into the official tool input.
         _set_literal_cell(cell, target)

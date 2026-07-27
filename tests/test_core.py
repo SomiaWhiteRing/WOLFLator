@@ -105,6 +105,7 @@ from wolf_editor import (
     _legacy_conversion_action,
     _database_index,
     _editor_execution_lock,
+    _external_text_observer_report,
     _inspect_matching_runtime,
     _merge_states,
     _merge_numbers,
@@ -2730,6 +2731,143 @@ class WorkbookAndFontTests(unittest.TestCase):
             self.assertEqual([item.key], safety["keep_original"])
             self.assertIn("file_content_not_proven_display_only", safety["reasons"][item.key])
 
+    def test_external_text_flow_approves_only_program_proven_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basic = root / "Auto" / "BasicData"
+            basic.mkdir(parents=True)
+            (basic / "CommonEvent.dat.Auto.txt").write_text(
+                "[COMMON_EVENT_TEXT_OUTPUT]\nCOMMON_EVENT_NUM=0\n",
+                encoding="utf-8",
+            )
+            item = TranslationItem(
+                key="external-story",
+                original="@show\nold story\n@image\nface.png",
+                translation="@show\nnew story\n@image\nface.png",
+                code='TXTFILE-"Data\\story.txt"',
+                type="Text File",
+                category=ImportCategory.EXTERNAL,
+            )
+            editor = EditorInfo(
+                root / "Editor.exe",
+                "3.713.2026.718",
+                (3, 713, 2026, 718),
+                "a" * 64,
+            )
+            analysis = analyze_auto_export(
+                root / "Auto", [item], editor, input_hash="input"
+            )
+            analysis["external_text_flows"] = [{
+                "path": "Data/story.txt",
+                "item_keys": [item.key],
+                "mappings": [
+                    {
+                        "marker": "@show",
+                        "dispatch_token": "@1",
+                        "safe_display_sink": True,
+                        "conditions": [],
+                    },
+                    {
+                        "marker": "@image",
+                        "dispatch_token": "@2",
+                        "safe_display_sink": False,
+                        "conditions": [],
+                    },
+                ],
+                "section_prefixes": [],
+                "structural_prefixes": [],
+            }]
+            analysis["external_text_flow_coverage"] = {
+                "data/story.txt": {"readers": 1, "modeled": 1}
+            }
+
+            safe = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([item.key], safe["approvals"]["external_text_flow"])
+            self.assertEqual({}, safe["translation_overrides"])
+
+            mixed = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: "@show\nnew story\n@image\nnew-face.png"},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([], mixed["keep_original"])
+            self.assertEqual(
+                "@show\nnew story\n@image\nface.png",
+                mixed["translation_overrides"][item.key],
+            )
+
+            protected = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: " @show\nnew story\n@image\nface.png"},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([item.key], protected["keep_original"])
+            self.assertEqual({}, protected["translation_overrides"])
+
+            analysis["external_text_flow_coverage"]["data/story.txt"]["readers"] = 2
+            incomplete = analyze_translation_safety(
+                root / "Auto",
+                [item],
+                {item.key: item.translation},
+                "warn",
+                analysis=analysis,
+            )
+            self.assertEqual([item.key], incomplete["keep_original"])
+            self.assertIn(
+                "external_readers_not_fully_modeled", incomplete["reasons"][item.key]
+            )
+
+    def test_external_text_observer_requires_structural_contains(self):
+        flow = {
+            "path": "Data/story.txt",
+            "source_key": "external-file:story",
+            "reader": {
+                "auto_file": "BasicData/CommonEvent.dat.Auto.txt",
+                "event_type": "common",
+                "event_id": 2,
+                "page": 1,
+                "command": 1,
+            },
+            "section_prefixes": ["section:"],
+        }
+        read = {
+            "resource_role": "file_path_runtime_read",
+            "external_file_paths": ["Data/story.txt"],
+            "auto_file": "BasicData/CommonEvent.dat.Auto.txt",
+            "event_type": "common",
+            "event_id": 1,
+            "page": 1,
+            "command": 4,
+        }
+        trace = (
+            "BasicData/CommonEvent.dat.Auto.txt event=1 page=1 "
+            "command=4 opcode=122 external-file-content"
+        )
+        condition = {
+            "kind": "condition",
+            "operator": "contains",
+            "source_keys": ["external-file:story"],
+            "right_source_keys": [],
+            "right_templates": [r"section:\cself[0]"],
+            "trace": [trace],
+            "right_trace": [],
+        }
+        self.assertEqual(
+            1, len(_external_text_observer_report([flow], [read, condition]))
+        )
+        condition["operator"] = "equals"
+        self.assertEqual([], _external_text_observer_report([flow], [read, condition]))
+
     def test_translation_safety_protects_cross_event_database_condition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3770,6 +3908,35 @@ class ControlTests(unittest.TestCase):
         )
 
         broken = translated.replace(chr(0xE100), "", 1)
+        with self.assertRaisesRegex(ValueError, "占位序列"):
+            merge_ainiee_output([item], [{**payload[0], "translation": broken}], scope)
+
+    def test_external_script_continuation_preserves_line_breaks_without_command_header(self):
+        original = "一行。\r\n\r\n二行。\n三行。"
+        item = TranslationItem(
+            key="script-continuation",
+            original=original,
+            code='SEGMENT_51-TXTFILE-"Data\\ノベル\\シーン1.txt"',
+            type="Text File",
+            category=ImportCategory.EXTERNAL,
+        )
+        scope = ImportScope(external=True)
+        payload = to_paratranz([item], scope)
+        protected = str(payload[0]["original"])
+
+        self.assertNotRegex(protected, r"[\r\n]")
+        self.assertEqual(3, sum("\ue100" <= char <= "\uf7ff" for char in protected))
+        translated = (
+            protected.replace("一行。", "第一行。")
+            .replace("二行。", "第二行。")
+            .replace("三行。", "第三行。")
+        )
+        merged = merge_ainiee_output(
+            [item], [{**payload[0], "translation": translated}], scope
+        )
+        self.assertEqual("第一行。\r\n\r\n第二行。\n第三行。", merged[0].translation)
+
+        broken = translated.replace(chr(0xE101), "", 1)
         with self.assertRaisesRegex(ValueError, "占位序列"):
             merge_ainiee_output([item], [{**payload[0], "translation": broken}], scope)
 

@@ -18,7 +18,7 @@ from proofread import (
     run_project_proofread,
     save_report,
 )
-from wolf_tools import dump_items, load_items
+from wolf_tools import dump_items, load_items, sha256_file
 
 
 def make_game(root: Path) -> Path:
@@ -132,6 +132,35 @@ class ProofreadTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "字段不匹配"):
                 load_report(path)
 
+    def test_report_rejects_missing_or_unchanged_full_suggestion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, items_path = translated_project(root)
+            payload = build_worker_input(items_path, load_manifest(manifest_path), context_lines=0)
+            issue = {
+                "source": "rule", "type": "quote_pair", "severity": "medium",
+                "description": "引号不配对", "suggestion": "修正引号", "confidence": 1.0,
+            }
+            result = {
+                "schema": 1,
+                "entries": {
+                    "display-one": {"issues": [issue], "suggested_translation": ""},
+                    "display-two": {"issues": [issue], "suggested_translation": "第二译文"},
+                },
+                "failed_batches": [],
+            }
+            report = make_report(
+                payload, result, mode="rules_ai", model="model", batch_size=20,
+                context_lines=0, confidence_percent=70,
+            )
+            missing, unchanged = report["entries"]
+            self.assertFalse(missing["applicable"])
+            self.assertEqual("", missing["suggested_translation"])
+            self.assertIn("未生成", missing["apply_error"])
+            self.assertFalse(unchanged["applicable"])
+            self.assertEqual("第二译文", unchanged["suggested_translation"])
+            self.assertIn("没有产生任何修改", unchanged["apply_error"])
+
     def test_apply_and_restore_preserve_ai_items_and_reset_only_downstream(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -184,6 +213,46 @@ class ProofreadTests(unittest.TestCase):
             self.assertEqual(str(items_path), restored.artifacts["items"])
             self.assertNotIn("items_ai_translation", restored.artifacts)
 
+    def test_manual_translation_edits_validate_tokens_and_reset_downstream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, items_path = translated_project(root)
+            manifest = load_manifest(manifest_path)
+            for stage in (Stage.VALIDATE, Stage.IMPORT, Stage.RELEASE):
+                manifest.version.stage(stage).status = StageStatus.COMPLETED
+            manifest_path.write_text(
+                json.dumps(manifest.to_dict(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            pipeline = Pipeline(
+                manifest_path,
+                AppSettings(),
+                "",
+                root / "cache",
+                glossary_api_key="",
+            )
+            source_hash = sha256_file(items_path)
+            with self.assertRaisesRegex(ValueError, "控制符"):
+                pipeline.apply_translation_edits(
+                    {"display-one": r"\C[2]错误修订"},
+                    source_sha256=source_hash,
+                )
+
+            output = pipeline.apply_translation_edits(
+                {"display-one": r"\C[1]人工润色"},
+                source_sha256=source_hash,
+            )
+            edited = load_items(output)
+            self.assertEqual(r"\C[1]人工润色", edited[0].translation)
+            manifest = load_manifest(manifest_path)
+            translate = manifest.version.stage(Stage.TRANSLATE)
+            self.assertEqual(str(output), translate.artifacts["items"])
+            self.assertEqual(str(items_path), translate.artifacts["items_before_edit"])
+            self.assertTrue(all(
+                manifest.version.stage(stage).status is StageStatus.PENDING
+                for stage in (Stage.VALIDATE, Stage.IMPORT, Stage.RELEASE)
+            ))
+
     def test_worker_reports_progress_partial_failure_and_keeps_secret_out_of_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -203,13 +272,20 @@ class RuleBasedChecker:
                 """
 from types import SimpleNamespace
 class AIProofreader:
-    def __init__(self, config): pass
+    def __init__(self, config): self.prompt_template = 'base prompt'
     def proofread_lines_block(self, items, **kwargs):
+        assert 'corrected_translation' in self.prompt_template
+        assert 'WOLFLator已核验规则问题' in kwargs['world_building']
         if items[0]['index'] >= 2:
             raise RuntimeError('batch failed')
         issue = SimpleNamespace(type='logic_error', severity='high', description='ai', suggestion='fix', confidence=.9)
-        result = SimpleNamespace(issues=[issue], corrected_translation='fixed')
-        return {items[0]['index']: result}
+        return {
+            item['index']: SimpleNamespace(
+                issues=[issue],
+                corrected_translation='fixed' if item['index'] == 0 else '',
+            )
+            for item in items
+        }
 """,
                 encoding="utf-8",
             )
@@ -241,7 +317,11 @@ class AIProofreader:
                 check=True,
             )
             output = json.loads(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(1, len(output["failed_batches"]))
+            self.assertEqual(2, len(output["failed_batches"]))
+            self.assertIn(
+                "未返回可直接替换",
+                "\n".join(batch["error"] for batch in output["failed_batches"]),
+            )
             self.assertIn("WOLFLATOR_PROOFREAD_EVENT", result.stdout)
             self.assertIn("logic_error", {issue["type"] for issue in output["entries"]["key-0"]["issues"]})
             self.assertNotIn(secret, input_path.read_text(encoding="utf-8"))

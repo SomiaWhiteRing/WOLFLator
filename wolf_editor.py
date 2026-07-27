@@ -45,6 +45,7 @@ from wolf_analysis import (
 from wolf_tools import (
     COPY_FROM_RE,
     CancelledError,
+    _scan_control_tokens,
     _kill_process_tree,
     _process_startupinfo,
     hash_directory,
@@ -139,6 +140,12 @@ _COMMAND_RE = re.compile(
 _WORKBOOK_DB_CODE_RE = re.compile(r"^(?P<database>UDB|CDB|SDB)-(?P<type>\d+)-(?P<data>\d+)-(?P<field>\d+)$", re.IGNORECASE)
 _CSELF_REFERENCE_RE = re.compile(r"\\cself\[(\d+)]", re.IGNORECASE)
 _STRING_REFERENCE_RE = re.compile(r"\\s\[(\d+)]", re.IGNORECASE)
+_EXTERNAL_FILE_CODE_RE = re.compile(
+    r'^(?:SEGMENT_\d+-)?(?P<kind>TXTFILE|CSVFILE)-"(?P<path>.+)"$',
+    re.IGNORECASE,
+)
+_WOLF_PATH_REFERENCE_RE = re.compile(r"\\[A-Za-z_]+\[[^\]\r\n]+]", re.IGNORECASE)
+_EXTERNAL_SOURCE_PREFIX = "external-file:"
 
 
 @dataclass(frozen=True)
@@ -289,10 +296,75 @@ class _StringValue:
     literals: frozenset[str] | None = frozenset()
     database_selectors: frozenset[tuple[str, int, int, str, str, str, int, int]] = frozenset()
     loop_source_keys: frozenset[str] = frozenset()
+    templates: frozenset[str] | None = frozenset()
 
     @property
     def tracked(self) -> bool:
         return bool(self.source_keys or self.cells or self.symbolic_all or self.scopes)
+
+
+@dataclass(frozen=True)
+class _ExternalTextSource:
+    path: str
+    source_key: str
+    items: tuple[TranslationItem, ...]
+
+
+def _normalize_external_path(value: str) -> str:
+    normalized = value.strip().replace("\\", "/").lstrip("./")
+    return ntpath.normcase(ntpath.normpath(normalized)).replace("\\", "/")
+
+
+def _external_text_sources(items: list[TranslationItem]) -> tuple[_ExternalTextSource, ...]:
+    groups: dict[str, list[TranslationItem]] = {}
+    paths: dict[str, str] = {}
+    for item in items:
+        match = _EXTERNAL_FILE_CODE_RE.fullmatch(item.code)
+        if match is None:
+            continue
+        path = _normalize_external_path(match.group("path"))
+        groups.setdefault(path, []).append(item)
+        paths.setdefault(path, match.group("path").replace("\\", "/"))
+
+    sources: list[_ExternalTextSource] = []
+    for path, group in sorted(groups.items()):
+        by_code = {item.code.upper(): item for item in group}
+        roots = [item for item in group if not item.code.upper().startswith("SEGMENT_")]
+        if len(roots) != 1 or len(by_code) != len(group):
+            continue
+        ordered: list[TranslationItem] = []
+        seen: set[str] = set()
+        current = roots[0]
+        while current.code.upper() not in seen:
+            seen.add(current.code.upper())
+            ordered.append(current)
+            match = re.search(r"(?:^|\r?\n)NEXT=([^\r\n]+)", current.flag, re.IGNORECASE)
+            if match is None:
+                break
+            following = by_code.get(match.group(1).upper())
+            if following is None:
+                ordered = []
+                break
+            current = following
+        if len(ordered) != len(group):
+            continue
+        digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+        sources.append(
+            _ExternalTextSource(
+                paths[path],
+                f"{_EXTERNAL_SOURCE_PREFIX}{digest}",
+                tuple(ordered),
+            )
+        )
+    return tuple(sources)
+
+
+def _external_template_matches(template: str, path: str) -> bool:
+    marker = "\x00"
+    templated = _WOLF_PATH_REFERENCE_RE.sub(marker, template.strip())
+    normalized = _normalize_external_path(templated)
+    expression = re.escape(normalized).replace(re.escape(marker), r"[^/]+")
+    return bool(expression and re.fullmatch(expression, _normalize_external_path(path)))
 
 
 @dataclass
@@ -1630,6 +1702,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             value.literals,
             value.database_selectors,
             value.loop_source_keys,
+            value.templates,
         )
     keys = set(left.source_keys) | set(right.source_keys)
     cells = set(left.cells) | set(right.cells)
@@ -1637,6 +1710,11 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
     scopes = left.scopes | right.scopes
     database_selectors = left.database_selectors | right.database_selectors
     loop_source_keys = left.loop_source_keys | right.loop_source_keys
+    templates = (
+        None
+        if left.templates is None or right.templates is None
+        else frozenset(set(left.templates) | set(right.templates))
+    )
     literals = (
         None
         if left.literals is None or right.literals is None
@@ -1653,6 +1731,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
             literals=literals,
             database_selectors=database_selectors,
             loop_source_keys=loop_source_keys,
+            templates=templates,
         )
     return _StringValue(
         frozenset(keys),
@@ -1664,6 +1743,7 @@ def _merge_strings(left: _StringValue | None, right: _StringValue | None) -> _St
         literals,
         database_selectors,
         loop_source_keys,
+        templates,
     )
 
 
@@ -1680,6 +1760,7 @@ def _with_literals(
         literals,
         value.database_selectors,
         value.loop_source_keys,
+        value.templates,
     )
 
 
@@ -1779,6 +1860,42 @@ def _expand_string_references(
             if changed:
                 break
     return frozenset(concrete)
+
+
+def _expand_string_templates(
+    literals: frozenset[str], state: _AnalysisState
+) -> frozenset[str] | None:
+    templates = set(literals)
+    for _iteration in range(32):
+        changed = False
+        for text in tuple(templates):
+            for pattern, prefix in (
+                (_CSELF_REFERENCE_RE, "cself"),
+                (_STRING_REFERENCE_RE, "s"),
+            ):
+                for match in pattern.finditer(text):
+                    value = state.strings.get(
+                        _string_variable_for_escape(prefix, int(match.group(1)))
+                    )
+                    replacements = value.templates if value else None
+                    if not replacements:
+                        continue
+                    templates.remove(text)
+                    templates.update(
+                        text.replace(match.group(0), replacement)
+                        for replacement in replacements
+                    )
+                    if len(templates) > _VALUE_LIMIT:
+                        return None
+                    changed = True
+                    break
+                if changed:
+                    break
+            if changed:
+                break
+        if not changed:
+            return frozenset(templates)
+    return None
 
 
 def _merge_value_maps(left: dict, right: dict, merge: Callable) -> dict:
@@ -1893,6 +2010,7 @@ def _string_semantic_key(value: _StringValue) -> tuple[object, ...]:
         value.scopes,
         value.literals,
         value.database_selectors,
+        value.templates,
     )
 
 
@@ -2552,6 +2670,7 @@ class _BlockAnalyzer:
         block_plan_cache: _BlockPlanCache | None = None,
         event_item_cache: _EventItemCache | None = None,
         entry_plan_cache: _EntryPlanCache | None = None,
+        external_sources: tuple[_ExternalTextSource, ...] = (),
     ) -> None:
         self.block = block
         self.databases = databases
@@ -2576,6 +2695,7 @@ class _BlockAnalyzer:
         )
         self.event_item_cache = event_item_cache if event_item_cache is not None else {}
         self.entry_plan_cache = entry_plan_cache if entry_plan_cache is not None else {}
+        self.external_sources = external_sources
         self.dependencies: list[dict[str, object]] = []
         self.blocking: list[dict[str, object]] = []
         self.unknown = Counter()
@@ -2940,6 +3060,7 @@ class _BlockAnalyzer:
             tuple[str, int, int, str, str, str, int, int]
         ] = (),
         resource_path_values: frozenset[str] | None = None,
+        external_file_paths: Iterable[str] = (),
     ) -> None:
         if not value.tracked and role not in {
             "file_path_runtime_read",
@@ -3024,6 +3145,10 @@ class _BlockAnalyzer:
                 if resource_path_values is not None
                 else None
             ),
+            "source_templates": (
+                sorted(value.templates) if value.templates is not None else None
+            ),
+            "external_file_paths": sorted(set(map(str, external_file_paths))),
         }
         self.dependencies.append(dependency)
         if dependency["status"] == "blocking":
@@ -3785,6 +3910,7 @@ class _BlockAnalyzer:
             trace=(f"{self._location(index)} opcode={command.opcode} literal",),
             scopes=frozenset({source_scope}) if keys else frozenset(),
             literals=candidate_literals,
+            templates=candidate_literals,
         )
         referenced = _string_reference_value(literal, state)
         if referenced is not None:
@@ -3800,7 +3926,10 @@ class _BlockAnalyzer:
                 break
             concrete_values.update(expanded)
         concrete = frozenset(concrete_values) if concrete_known else None
-        value = _with_literals(value, concrete)
+        value = replace(
+            _with_literals(value, concrete),
+            templates=_expand_string_templates(candidate_literals, state),
+        )
         return value
 
     def _set_string(self, command: _Command, index: int, state: _AnalysisState) -> None:
@@ -3875,6 +4004,29 @@ class _BlockAnalyzer:
             )
         extended_string_operation = bool(flags & 0x00040000)
 
+        def external_read_value() -> tuple[_StringValue | None, tuple[str, ...]]:
+            templates = value.templates or value.literals or frozenset()
+            matched = tuple(
+                source
+                for source in self.external_sources
+                if any(_external_template_matches(template, source.path) for template in templates)
+            )
+            if not matched:
+                return None, ()
+            return (
+                _StringValue(
+                    source_keys=frozenset(source.source_key for source in matched),
+                    trace=(f"{self._location(index)} opcode=122 external-file-content",),
+                    scopes=frozenset(
+                        f"external:{_normalize_external_path(source.path)}"
+                        for source in matched
+                    ),
+                    literals=None,
+                    templates=None,
+                ),
+                tuple(source.path for source in matched),
+            )
+
         def derived(*values: _StringValue | None, note: str) -> _StringValue:
             merged: _StringValue | None = None
             for item in values:
@@ -3891,6 +4043,7 @@ class _BlockAnalyzer:
                 None,
                 merged.database_selectors,
                 merged.loop_source_keys,
+                None,
             )
 
         if extended_string_operation and assignment in {3, 4, 5}:
@@ -3902,10 +4055,16 @@ class _BlockAnalyzer:
             state.strings[destination] = value
         elif assignment == 1:
             merged = _merge_strings(current, value) or value
-            state.strings[destination] = _with_literals(
+            concatenated = _with_literals(
                 merged,
                 _concat_literals(
                     current.literals if current else frozenset({""}), value.literals
+                ),
+            )
+            state.strings[destination] = replace(
+                concatenated,
+                templates=_concat_literals(
+                    current.templates if current else frozenset({""}), value.templates
                 ),
             )
         elif assignment in {2, 3, 4, 10, 11}:
@@ -3915,8 +4074,17 @@ class _BlockAnalyzer:
             if assignment in {3, 4} and source_kind == 1:
                 state.strings[source_raw & 0x00FFFFFF] = traced
         elif assignment in {5, 7, 8}:
-            self._value_boundary_reference(command, index, value, "file_path_runtime_read")
-            state.strings[destination] = derived(value, note=f"op={assignment} runtime-read")
+            external_value, external_paths = external_read_value()
+            self._value_boundary_reference(
+                command,
+                index,
+                value,
+                "file_path_runtime_read",
+                external_file_paths=external_paths,
+            )
+            state.strings[destination] = external_value or derived(
+                value, note=f"op={assignment} runtime-read"
+            )
         elif assignment == 6:
             content = derived(current, note="op=6 file-content")
             self._value_boundary_reference(
@@ -4118,6 +4286,14 @@ class _BlockAnalyzer:
                     sorted(right_value.literals)
                     if right_value and right_value.literals is not None
                     else sorted(literal_values or ())
+                ),
+                "left_templates": (
+                    sorted(value.templates) if value and value.templates is not None else []
+                ),
+                "right_templates": (
+                    sorted(right_value.templates)
+                    if right_value and right_value.templates is not None
+                    else []
                 ),
                 "source_scopes": sorted(value.scopes if value else ()),
                 "right_source_scopes": sorted(
@@ -4606,6 +4782,7 @@ class _BlockAnalyzer:
                 self.block_plan_cache,
                 self.event_item_cache,
                 self.entry_plan_cache,
+                self.external_sources,
             )
             exits: list[_AnalysisState] = []
             fell_through = child._execute(start, end, callee_state, exits)
@@ -5436,6 +5613,7 @@ def _analyze_blocks(
     items: list[TranslationItem],
     databases: dict[str, dict[int, _DatabaseType]],
     candidate_values: dict[str, str] | None = None,
+    external_sources: tuple[_ExternalTextSource, ...] = (),
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
@@ -5575,6 +5753,7 @@ def _analyze_blocks(
             block_plan_cache=block_plan_cache,
             event_item_cache=event_item_cache,
             entry_plan_cache=entry_plan_cache,
+            external_sources=external_sources,
         )
         metrics.basic_blocks += len(analyzer._basic_block_starts)
         block_dependencies, _block_blocking, block_unknown = analyzer.run()
@@ -5691,6 +5870,7 @@ def _analyze_blocks(
                 block_plan_cache=block_plan_cache,
                 event_item_cache=event_item_cache,
                 entry_plan_cache=entry_plan_cache,
+                external_sources=external_sources,
             )
             block_dependencies, _block_blocking, _block_unknown = analyzer.run(
                 projected
@@ -5767,6 +5947,8 @@ def _analyze_blocks(
             tuple(map(str, dependency.get("right_source_keys", ()))),
             tuple(map(str, dependency.get("left_values", ()))),
             tuple(map(str, dependency.get("right_values", ()))),
+            tuple(map(str, dependency.get("left_templates", ()))),
+            tuple(map(str, dependency.get("right_templates", ()))),
         )
         identity = (
             dependency["auto_file"], dependency["event_type"], dependency["event_id"],
@@ -5805,6 +5987,8 @@ def _analyze_blocks(
             current["_trace"] = dict.fromkeys(dependency["trace"])
             current["_left_values"] = set(dependency.get("left_values", []))
             current["_right_values"] = set(dependency.get("right_values", []))
+            current["_left_templates"] = set(dependency.get("left_templates", []))
+            current["_right_templates"] = set(dependency.get("right_templates", []))
             current["_source_scopes"] = set(dependency.get("source_scopes", []))
             current["_right_source_scopes"] = set(
                 dependency.get("right_source_scopes", [])
@@ -5844,6 +6028,8 @@ def _analyze_blocks(
         current["_trace"].update(dict.fromkeys(dependency["trace"]))
         current["_left_values"].update(dependency.get("left_values", []))
         current["_right_values"].update(dependency.get("right_values", []))
+        current["_left_templates"].update(dependency.get("left_templates", []))
+        current["_right_templates"].update(dependency.get("right_templates", []))
         current["_source_scopes"].update(dependency.get("source_scopes", []))
         current["_right_source_scopes"].update(
             dependency.get("right_source_scopes", [])
@@ -5901,7 +6087,7 @@ def _analyze_blocks(
                 for item in sorted(current.pop(f"_{field}"))
             ]
         current["trace"] = list(current.pop("_trace"))[:_VALUE_LIMIT]
-        for field in ("left_values", "right_values"):
+        for field in ("left_values", "right_values", "left_templates", "right_templates"):
             current[field] = sorted(current.pop(f"_{field}"))[:_VALUE_LIMIT]
         for field in ("source_scopes", "right_source_scopes", "unresolved_scopes"):
             current[field] = sorted(current.pop(f"_{field}"))
@@ -6166,6 +6352,410 @@ def _translation_usage_report(
         key for key, values in usages.items() if values == {"display_only"}
     )
     return ({key: sorted(values) for key, values in sorted(usages.items())}, proven_display)
+
+
+def _external_text_flow_report(
+    blocks: tuple[_CommandBlock, ...],
+    external_sources: tuple[_ExternalTextSource, ...],
+    databases: dict[str, dict[int, _DatabaseType]],
+    dependencies: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not external_sources:
+        return []
+    common_by_id = {
+        block.event_id: block for block in blocks if block.event_type == "common"
+    }
+    common_by_name: dict[str, list[_CommandBlock]] = {}
+    for block in common_by_id.values():
+        common_by_name.setdefault(block.event_name, []).append(block)
+
+    def database_signature(command: _Command) -> tuple[str, str, str, bool] | None:
+        if command.opcode != 250 or len(command.ints) != 5:
+            return None
+        byte1 = (command.ints[3] >> 8) & 0xFF
+        database = {0: "CDB", 1: "SDB", 2: "UDB"}.get(byte1 & 0x0F)
+        if database is None or len(command.strings) < 4:
+            return None
+        return database, command.strings[1], command.strings[3], bool(byte1 & 0x10)
+
+    def database_fields(signature: tuple[str, str, str]) -> set[tuple[str, int, int]]:
+        database, type_name, field_name = signature
+        return {
+            (database, type_id, field_id)
+            for type_id, db_type in databases.get(database, {}).items()
+            if db_type.name == type_name
+            for field_id, name in db_type.field_names.items()
+            if name == field_name
+        }
+
+    def dependency_fields(dependency: dict[str, object]) -> set[tuple[str, int, int]]:
+        fields = {
+            (str(cell["database"]), int(cell["type"]), int(cell["field"]))
+            for name in (
+                "database_cells", "right_database_cells", "target_database_cells"
+            )
+            for cell in dependency.get(name, ())
+            if isinstance(cell, dict)
+            and all(key in cell for key in ("database", "type", "field"))
+        }
+        fields.update(
+            (str(selector["database"]), int(selector["type"]), int(selector["field"]))
+            for name in (
+                "database_selectors", "right_database_selectors",
+                "target_database_selectors",
+            )
+            for selector in dependency.get(name, ())
+            if isinstance(selector, dict)
+            and all(key in selector for key in ("database", "type", "field"))
+        )
+        return fields
+
+    def exact_descendants(root: _CommandBlock) -> tuple[set[int], bool]:
+        reached = {root.event_id}
+        queue = deque((root,))
+        dynamic = False
+        while queue:
+            block = queue.popleft()
+            for command in block.commands:
+                if command.opcode == 300 and command.strings:
+                    targets = common_by_name.get(command.strings[0], ())
+                    if len(targets) != 1:
+                        dynamic = True
+                        continue
+                    target = targets[0]
+                    if target.event_id not in reached:
+                        reached.add(target.event_id)
+                        queue.append(target)
+                elif command.opcode == 210:
+                    reference = command.ints[0] if command.ints else -1
+                    target_id = reference - 500_000 if 500_000 <= reference < 600_000 else -1
+                    target = common_by_id.get(target_id)
+                    if target is None:
+                        dynamic = True
+                    elif target.event_id not in reached:
+                        reached.add(target.event_id)
+                        queue.append(target)
+        return reached, dynamic
+
+    def dispatcher_base(
+        block: _CommandBlock, command_signature: tuple[str, str, str]
+    ) -> int | None:
+        for call_index, command in enumerate(block.commands):
+            if command.opcode != 210 or not command.ints or command.ints[0] < 1_000_000:
+                continue
+            variable = command.ints[0] & 0x00FFFFFF
+            added_reference = any(
+                prior.opcode == 121
+                and len(prior.ints) >= 4
+                and prior.ints[0] == variable
+                and prior.ints[1] == 500_000
+                and ((prior.ints[3] >> 8) & 0x0F) == 1
+                for prior in block.commands[:call_index]
+            )
+            added_current_event = any(
+                prior.opcode == 124
+                and len(prior.ints) >= 3
+                and prior.ints[0] == variable
+                and prior.ints[2] == 17
+                and ((prior.ints[1] >> 8) & 0x0F) == 1
+                for prior in block.commands[:call_index]
+            )
+            read_command_number = any(
+                (signature := database_signature(prior)) is not None
+                and signature[3]
+                and signature[:3] == command_signature
+                and prior.ints[4] == variable
+                for prior in block.commands[:call_index]
+            )
+            if added_reference and added_current_event and read_command_number:
+                return block.event_id
+        return None
+
+    reports: list[dict[str, object]] = []
+    source_by_path = {
+        _normalize_external_path(source.path): source for source in external_sources
+    }
+    for read in dependencies:
+        paths = tuple(map(str, read.get("external_file_paths", ())))
+        if read.get("resource_role") != "file_path_runtime_read" or not paths:
+            continue
+        block = next(
+            (
+                item
+                for item in blocks
+                if item.source == read.get("auto_file")
+                and item.event_type == read.get("event_type")
+                and item.event_id == read.get("event_id")
+                and item.page == read.get("page")
+            ),
+            None,
+        )
+        command_index = int(read.get("command", 0)) - 1
+        if block is None or not 0 <= command_index < len(block.commands):
+            continue
+        read_command = block.commands[command_index]
+        if read_command.opcode != 122 or len(read_command.ints) < 2:
+            continue
+        content_variable = read_command.ints[0]
+        replacements: list[tuple[str, str, int]] = []
+        for command in block.commands[command_index + 1 :]:
+            if (
+                command.opcode == 122
+                and len(command.ints) >= 2
+                and command.ints[0] == content_variable
+                and ((command.ints[1] >> 8) & 0x0F) == 9
+                and len(command.strings) >= 2
+                and (label := re.fullmatch(r"\D*(-?\d+)", command.strings[1]))
+            ):
+                replacements.append((command.strings[0], command.strings[1], int(label.group(1))))
+        labels = {
+            int(command.strings[0]): index
+            for index, command in enumerate(block.commands)
+            if command.opcode == 212
+            and len(command.strings) == 1
+            and re.fullmatch(r"-?\d+", command.strings[0])
+        }
+        if not replacements or not labels or not any(
+            command.opcode == 213 and any(
+                pattern.search(command.strings[0])
+                for pattern in (_CSELF_REFERENCE_RE, _STRING_REFERENCE_RE)
+            )
+            for command in block.commands
+            if command.strings
+        ):
+            continue
+        jump_variables = {
+            _string_variable_for_escape("cself", int(match.group(1)))
+            for command in block.commands
+            if command.opcode == 213 and command.strings
+            if (match := _CSELF_REFERENCE_RE.fullmatch(command.strings[0]))
+        }
+        command_signatures = {
+            signature[:3]
+            for command in block.commands
+            if (signature := database_signature(command)) is not None
+            and not signature[3]
+            and command.ints[4] in jump_variables
+        }
+        if len(command_signatures) != 1:
+            continue
+        command_signature = next(iter(command_signatures))
+        callers = [
+            caller
+            for caller in common_by_id.values()
+            if any(
+                command.opcode == 300
+                and command.strings
+                and command.strings[0] == block.event_name
+                for command in caller.commands
+            )
+            and dispatcher_base(caller, command_signature) is not None
+        ]
+        if len(callers) != 1:
+            continue
+        base = dispatcher_base(callers[0], command_signature)
+        if base is None:
+            continue
+
+        mappings: list[dict[str, object]] = []
+        label_positions = sorted((position, label) for label, position in labels.items())
+        for marker, dispatch_token, label in replacements:
+            label_position = labels.get(label)
+            target = common_by_id.get(base + label)
+            if (
+                label_position is None
+                or target is None
+                or not target.event_name.startswith(dispatch_token)
+                or len(target.event_name) > len(dispatch_token)
+                and target.event_name[len(dispatch_token)].isdigit()
+            ):
+                continue
+            end = next(
+                (position for position, _value in label_positions if position > label_position),
+                len(block.commands),
+            )
+            handler_commands = block.commands[label_position + 1 : end]
+            string_variables = {content_variable}
+            for command in handler_commands:
+                if command.opcode != 122 or len(command.ints) < 3:
+                    continue
+                source_kind = command.ints[1] & 0x0F
+                source = command.ints[2] & 0x00FFFFFF
+                if source_kind == 1 and source in string_variables:
+                    string_variables.add(command.ints[0])
+            payload_signatures = {
+                signature[:3]
+                for command in handler_commands
+                if (signature := database_signature(command)) is not None
+                and not signature[3]
+                and command.ints[4] in string_variables
+            }
+            if len(payload_signatures) != 1:
+                continue
+            payload_signature = next(iter(payload_signatures))
+            payload_fields = database_fields(payload_signature)
+            if not payload_fields or not any(
+                (signature := database_signature(command)) is not None
+                and signature[:3] == payload_signature
+                and signature[3]
+                for command in target.commands
+            ):
+                continue
+            descendants, dynamic_calls = exact_descendants(target)
+            relevant = [
+                dependency
+                for dependency in dependencies
+                if dependency.get("event_type") == "common"
+                and dependency.get("event_id") in descendants
+                and dependency_fields(dependency) & payload_fields
+            ]
+            has_display = any(item.get("kind") == "display" for item in relevant)
+            unsafe = dynamic_calls or any(
+                item.get("kind") not in {"display", "condition", "flow", "state", "resource"}
+                or item.get("kind") == "resource"
+                and item.get("resource_role") != "database_string_write"
+                for item in relevant
+            )
+            conditions = sorted(
+                {
+                    (str(item.get("operator", "unknown")), str(item.get("literal", "")))
+                    for item in relevant
+                    if item.get("kind") == "condition"
+                }
+            )
+            mappings.append({
+                "marker": marker,
+                "dispatch_token": dispatch_token,
+                "label": label,
+                "target_event": target.event_id,
+                "target_name": target.event_name,
+                "safe_display_sink": has_display and not unsafe,
+                "conditions": [list(condition) for condition in conditions],
+            })
+
+        section_prefixes = sorted({
+            prefix
+            for command in block.commands[command_index + 1 :]
+            for literal in command.strings
+            if (reference := _WOLF_PATH_REFERENCE_RE.search(literal)) is not None
+            and (prefix := literal[: reference.start()])
+        })
+        structural_prefixes = sorted({
+            literal
+            for command in block.commands
+            if command.opcode == 112
+            for encoded, literal in zip(command.ints[1:], command.strings)
+            if _condition_operator(encoded)[1] == "starts_with" and literal
+        })
+        for path in paths:
+            source = source_by_path.get(_normalize_external_path(path))
+            if source is None:
+                continue
+            reports.append({
+                "path": source.path,
+                "source_key": source.source_key,
+                "item_keys": [item.key for item in source.items],
+                "reader": {
+                    "auto_file": block.source,
+                    "event_type": block.event_type,
+                    "event_id": block.event_id,
+                    "page": block.page,
+                    "command": command_index + 1,
+                    "templates": list(read.get("source_templates") or ()),
+                },
+                "dispatcher_event": callers[0].event_id,
+                "mappings": mappings,
+                "section_prefixes": section_prefixes,
+                "structural_prefixes": structural_prefixes,
+            })
+    return reports
+
+
+def _external_text_observer_report(
+    flows: list[dict[str, object]],
+    dependencies: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    flows_by_path: dict[str, list[dict[str, object]]] = {}
+    primary_readers: set[tuple[object, ...]] = set()
+    for flow in flows:
+        path = _normalize_external_path(str(flow.get("path", "")))
+        flows_by_path.setdefault(path, []).append(flow)
+        reader = flow.get("reader", {})
+        if isinstance(reader, dict):
+            primary_readers.add((
+                path,
+                reader.get("auto_file"),
+                reader.get("event_type"),
+                reader.get("event_id"),
+                reader.get("page"),
+                reader.get("command"),
+            ))
+
+    observers: list[dict[str, object]] = []
+    for read in dependencies:
+        if read.get("resource_role") != "file_path_runtime_read":
+            continue
+        reader = {
+            "auto_file": read.get("auto_file"),
+            "event_type": read.get("event_type"),
+            "event_id": read.get("event_id"),
+            "page": read.get("page"),
+            "command": read.get("command"),
+        }
+        trace = (
+            f"{reader['auto_file']} event={reader['event_id']} page={reader['page']} "
+            f"command={reader['command']} opcode=122 external-file-content"
+        )
+        for raw_path in read.get("external_file_paths", ()):
+            path = _normalize_external_path(str(raw_path))
+            path_flows = flows_by_path.get(path, ())
+            identity = (path, *reader.values())
+            if not path_flows or identity in primary_readers:
+                continue
+            source_keys = {
+                str(flow.get("source_key", "")) for flow in path_flows
+            } - {""}
+            prefixes = {
+                str(prefix)
+                for flow in path_flows
+                for prefix in flow.get("section_prefixes", ())
+                if prefix
+            }
+            uses = [
+                dependency
+                for dependency in dependencies
+                if trace in dependency.get("trace", ())
+                or trace in dependency.get("right_trace", ())
+            ]
+            predicates: list[dict[str, object]] = []
+            for dependency in uses:
+                left_sources = set(map(str, dependency.get("source_keys", ())))
+                right_sources = set(map(str, dependency.get("right_source_keys", ())))
+                templates = tuple(map(str, dependency.get("right_templates", ())))
+                if (
+                    dependency.get("kind") != "condition"
+                    or dependency.get("operator") != "contains"
+                    or not source_keys & left_sources
+                    or source_keys & right_sources
+                    or not templates
+                    or any(
+                        not any(template.startswith(prefix) for prefix in prefixes)
+                        for template in templates
+                    )
+                ):
+                    predicates = []
+                    break
+                predicates.append({
+                    "operator": "contains",
+                    "right_templates": list(templates),
+                })
+            if predicates:
+                observers.append({
+                    "path": str(raw_path),
+                    "reader": reader,
+                    "predicates": predicates,
+                })
+    return observers
 
 
 def _command_transfer_complete(command: _Command) -> bool:
@@ -6530,13 +7120,72 @@ def _analyze_compiled_program(
     database_counts = compiled.database_counts
     database_types = compiled.database_types
     database_report = compiled.database_report
+    external_sources = _external_text_sources(items)
     dependencies, blocking, warnings, audit, global_string_flow = _analyze_blocks(
-        project.events, items, database_types, candidate_values
+        project.events,
+        items,
+        database_types,
+        candidate_values,
+        external_sources,
     )
     call_graph, event_summaries = _call_graph_report(list(project.events))
     usage_by_key, proven_display = _translation_usage_report(
         project.events, items, dependencies
     )
+    external_text_flows = _external_text_flow_report(
+        project.events,
+        external_sources,
+        database_types,
+        dependencies,
+    )
+    external_text_observers = _external_text_observer_report(
+        external_text_flows, dependencies
+    )
+    external_readers: dict[str, set[tuple[object, ...]]] = {}
+    for dependency in dependencies:
+        if dependency.get("resource_role") != "file_path_runtime_read":
+            continue
+        reader = (
+            dependency.get("auto_file"),
+            dependency.get("event_type"),
+            dependency.get("event_id"),
+            dependency.get("page"),
+            dependency.get("command"),
+        )
+        for path in dependency.get("external_file_paths", ()):
+            external_readers.setdefault(_normalize_external_path(str(path)), set()).add(reader)
+    modeled_external_readers: dict[str, set[tuple[object, ...]]] = {}
+    for flow in external_text_flows:
+        reader = flow.get("reader", {})
+        if not isinstance(reader, dict):
+            continue
+        path = _normalize_external_path(str(flow.get("path", "")))
+        modeled_external_readers.setdefault(path, set()).add((
+            reader.get("auto_file"),
+            reader.get("event_type"),
+            reader.get("event_id"),
+            reader.get("page"),
+            reader.get("command"),
+        ))
+    for observer in external_text_observers:
+        reader = observer.get("reader", {})
+        if not isinstance(reader, dict):
+            continue
+        path = _normalize_external_path(str(observer.get("path", "")))
+        modeled_external_readers.setdefault(path, set()).add((
+            reader.get("auto_file"),
+            reader.get("event_type"),
+            reader.get("event_id"),
+            reader.get("page"),
+            reader.get("command"),
+        ))
+    external_text_flow_coverage = {
+        path: {
+            "readers": len(external_readers.get(path, ())),
+            "modeled": len(modeled_external_readers.get(path, ())),
+        }
+        for path in sorted(external_readers.keys() | modeled_external_readers.keys())
+    }
     command_records = [
         (
             f"{block.source}:{block.event_type}:{block.event_id}:{block.page}:{index + 1}",
@@ -6708,6 +7357,9 @@ def _analyze_compiled_program(
         },
         "databases": database_report,
         "global_string_flow": global_string_flow,
+        "external_text_flows": external_text_flows,
+        "external_text_observers": external_text_observers,
+        "external_text_flow_coverage": external_text_flow_coverage,
         "dependencies": dependencies,
         "blocking_issues": blocking,
         "event_summaries": event_summaries,
@@ -6810,6 +7462,12 @@ def _scope_keys(
                         and (field_id == "*" or match.group("field") == field_id)
                     ):
                         matched.add(item.key)
+        elif scope.startswith("external:"):
+            expected = _normalize_external_path(scope.split(":", 1)[1])
+            for item in items:
+                match = _EXTERNAL_FILE_CODE_RE.fullmatch(item.code)
+                if match and _normalize_external_path(match.group("path")) == expected:
+                    matched.add(item.key)
         else:
             matched.update(item.key for item in items)
         if cache is not None:
@@ -6984,15 +7642,295 @@ def _analyze_compiled_translation_safety(
         if item.key in candidates
         and getattr(item.category, "value", str(item.category)) == "display"
     }
+    return _finish_compiled_translation_safety(
+        items,
+        candidates,
+        analysis,
+        policy=policy,
+        originals=originals,
+        event_targets=event_targets,
+        direct_safe=direct_safe,
+        complete_ledger=complete_ledger,
+        official_display=official_display,
+        usage_by_key=usage_by_key,
+        dependencies=dependencies,
+    )
+
+
+def _finish_compiled_translation_safety(
+    items: list[TranslationItem],
+    candidate_values: dict[str, str],
+    analysis: dict[str, object],
+    *,
+    policy: str,
+    originals: dict[str, str],
+    event_targets: dict[str, int],
+    direct_safe: set[str],
+    complete_ledger: bool,
+    official_display: set[str],
+    usage_by_key: dict[object, object],
+    dependencies: list[object],
+) -> dict[str, object]:
+    candidates = candidate_values
+    flows = analysis.get("external_text_flows")
+    if not isinstance(flows, list):
+        flows = []
+    coverage = analysis.get("external_text_flow_coverage")
+    if not isinstance(coverage, dict):
+        coverage = {}
+    sources = {
+        _normalize_external_path(source.path): source
+        for source in _external_text_sources(items)
+    }
+    safe: set[str] = set()
+    rejected: dict[str, str] = {}
+    external_overrides: dict[str, str] = {}
+
+    def part_ranges(parts: list[str]) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        offset = 0
+        for part in parts:
+            ranges.append((offset, offset + len(part)))
+            offset += len(part)
+        return ranges
+
+    def line_ranges(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+        lines = text.splitlines(keepends=True)
+        if not lines and text == "":
+            return [], []
+        if lines and sum(map(len, lines)) != len(text):
+            lines.append(text[sum(map(len, lines)) :])
+        ranges: list[tuple[int, int]] = []
+        offset = 0
+        for line in lines:
+            ranges.append((offset, offset + len(line)))
+            offset += len(line)
+        return lines, ranges
+
+    def overlapping_keys(
+        line_range: tuple[int, int],
+        ranges: list[tuple[int, int]],
+        keys: list[str],
+    ) -> set[str]:
+        start, end = line_range
+        return {
+            key
+            for key, (part_start, part_end) in zip(keys, ranges)
+            if start < part_end and part_start < end
+        }
+
+    for flow in flows:
+        if not isinstance(flow, dict):
+            continue
+        source = sources.get(_normalize_external_path(str(flow.get("path", ""))))
+        if source is None or list(flow.get("item_keys", ())) != [
+            item.key for item in source.items
+        ]:
+            continue
+        changed_keys = {
+            item.key
+            for item in source.items
+            if item.key in candidate_values
+            and candidate_values[item.key]
+            and candidate_values[item.key] != item.original
+        }
+        if not changed_keys:
+            continue
+        path = _normalize_external_path(source.path)
+        path_coverage = coverage.get(path)
+        if (
+            not isinstance(path_coverage, dict)
+            or not isinstance(path_coverage.get("readers"), int)
+            or not isinstance(path_coverage.get("modeled"), int)
+            or path_coverage["readers"] < 1
+            or path_coverage["readers"] != path_coverage["modeled"]
+        ):
+            rejected.update(
+                (key, "external_readers_not_fully_modeled") for key in changed_keys
+            )
+            continue
+        mappings = {
+            str(mapping.get("marker", "")): mapping
+            for mapping in flow.get("mappings", ())
+            if isinstance(mapping, dict) and mapping.get("marker")
+        }
+        markers = sorted(mappings, key=len, reverse=True)
+        dispatch_prefixes = {
+            match.group(1)
+            for mapping in mappings.values()
+            if (match := re.fullmatch(r"(\D*)-?\d+", str(mapping.get("dispatch_token", ""))))
+            and match.group(1)
+        }
+        section_prefixes = tuple(map(str, flow.get("section_prefixes", ())))
+        structural_prefixes = tuple(map(str, flow.get("structural_prefixes", ())))
+
+        # ponytail: Only line-oriented external interpreters are approved here;
+        # any mid-line marker effect is classified as structure and rejected.
+        def looks_structural(line: str) -> bool:
+            content = line.rstrip("\r\n")
+            return (
+                any(prefix in content for prefix in dispatch_prefixes)
+                or any(prefix in content for prefix in section_prefixes)
+                or any(content.startswith(prefix) for prefix in structural_prefixes)
+            )
+
+        original_parts = [item.original for item in source.items]
+        candidate_parts: list[str] = []
+        for item in source.items:
+            candidate_part = candidate_values.get(item.key, item.original) or item.original
+            original_item_lines = item.original.splitlines(keepends=True)
+            candidate_item_lines = candidate_part.splitlines(keepends=True)
+            if item.key in changed_keys and (
+                re.findall(r"\r\n|\n|\r", item.original)
+                != re.findall(r"\r\n|\n|\r", candidate_part)
+                or _scan_control_tokens(item.original)
+                != _scan_control_tokens(candidate_part)
+                or any(
+                    left != right and (looks_structural(left) or looks_structural(right))
+                    for left, right in zip(original_item_lines, candidate_item_lines)
+                )
+            ):
+                rejected[item.key] = "external_item_structure_changed"
+                candidate_part = item.original
+            candidate_parts.append(candidate_part)
+        original = "".join(original_parts)
+        candidate = "".join(candidate_parts)
+        original_lines, original_line_ranges = line_ranges(original)
+        candidate_lines, candidate_line_ranges = line_ranges(candidate)
+        if len(original_lines) != len(candidate_lines):
+            rejected.update((key, "external_line_structure_changed") for key in changed_keys)
+            continue
+        item_keys = [item.key for item in source.items]
+        original_item_ranges = part_ranges(original_parts)
+        candidate_item_ranges = part_ranges(candidate_parts)
+        def classify(line: str) -> tuple[str, str | None]:
+            content = line.rstrip("\r\n")
+            if any(prefix in content for prefix in section_prefixes):
+                return "structure", None
+            for prefix in structural_prefixes:
+                if content.startswith(prefix):
+                    return "structure", None
+            for marker in markers:
+                if content.startswith(marker):
+                    return "command", marker
+            if any(marker in content for marker in markers) or any(
+                prefix in content for prefix in dispatch_prefixes
+            ):
+                return "structure", None
+            return "payload", None
+
+        source_safe: set[str] = set()
+        source_rejected: set[str] = set()
+        safe_line_indices: set[int] = set()
+        active_marker: str | None = None
+        payload_original: list[str] = []
+        payload_candidate: list[str] = []
+        payload_keys: set[str] = set()
+        payload_line_indices: list[int] = []
+
+        def finish_payload() -> None:
+            nonlocal payload_original, payload_candidate, payload_keys, payload_line_indices
+            left = "".join(payload_original)
+            right = "".join(payload_candidate)
+            if left != right and payload_keys:
+                mapping = mappings.get(active_marker or "", {})
+                proven = bool(mapping.get("safe_display_sink"))
+                equivalent = proven and all(
+                    operator in {"equals", "not_equals", "contains", "starts_with", "ends_with"}
+                    and _safety_predicate(operator, left, literal)
+                    == _safety_predicate(operator, right, literal)
+                    for operator, literal in (
+                        tuple(map(str, condition))
+                        for condition in mapping.get("conditions", ())
+                        if isinstance(condition, list) and len(condition) == 2
+                    )
+                )
+                (source_safe if equivalent else source_rejected).update(payload_keys)
+                if equivalent:
+                    safe_line_indices.update(payload_line_indices)
+            payload_original = []
+            payload_candidate = []
+            payload_keys = set()
+            payload_line_indices = []
+
+        structure_changed = False
+        for index, (left, right) in enumerate(zip(original_lines, candidate_lines)):
+            left_kind, left_marker = classify(left)
+            right_kind, right_marker = classify(right)
+            if left_kind != "payload" or right_kind != "payload":
+                finish_payload()
+                if left != right or (left_kind, left_marker) != (right_kind, right_marker):
+                    structure_changed = True
+                    break
+                active_marker = left_marker if left_kind == "command" else None
+                continue
+            if left != right:
+                payload_keys.update(
+                    overlapping_keys(
+                        original_line_ranges[index], original_item_ranges, item_keys
+                    )
+                )
+                payload_keys.update(
+                    overlapping_keys(
+                        candidate_line_ranges[index], candidate_item_ranges, item_keys
+                    )
+                )
+            payload_original.append(left)
+            payload_candidate.append(right)
+            payload_line_indices.append(index)
+        finish_payload()
+        if structure_changed:
+            rejected.update((key, "external_parser_signature_changed") for key in changed_keys)
+            continue
+        source_rejected &= changed_keys
+        source_safe &= changed_keys
+        partial_keys = source_safe & source_rejected
+        if partial_keys:
+            # ponytail: Official TXT segments in the observed protocol end on
+            # line boundaries. A span rope is the upgrade if a future tool
+            # splits one logical line across workbook rows.
+            merged_parts = {key: [] for key in item_keys}
+            partitionable = True
+            for index, (left, right) in enumerate(zip(original_lines, candidate_lines)):
+                left_keys = overlapping_keys(
+                    original_line_ranges[index], original_item_ranges, item_keys
+                )
+                right_keys = overlapping_keys(
+                    candidate_line_ranges[index], candidate_item_ranges, item_keys
+                )
+                if left_keys != right_keys or len(left_keys) != 1:
+                    partitionable = False
+                    break
+                key = next(iter(left_keys))
+                merged_parts[key].append(right if index in safe_line_indices else left)
+            if partitionable:
+                for key in tuple(partial_keys):
+                    merged = "".join(merged_parts[key])
+                    if merged != originals[key]:
+                        external_overrides[key] = merged
+                        candidates[key] = merged
+                        source_rejected.discard(key)
+        for key in changed_keys - source_safe:
+            rejected.setdefault(key, "external_payload_not_proven_display_only")
+        for key in source_rejected:
+            rejected[key] = "external_payload_semantics_changed"
+        safe.update(source_safe - source_rejected)
+    safe.difference_update(rejected)
+    external_safe = safe
+    external_rejected = rejected
     safe = set(direct_safe)
     if complete_ledger:
         # The official translation workbook defines the display surface. Static
         # analysis subtracts every observed logic/resource use below; requiring
         # an Auto read for DB labels would incorrectly reject engine-rendered UI.
         safe.update(official_display)
+        safe.update(external_safe)
     base_protected = set(candidates) - safe
     forced: set[str] = set()
     reasons: dict[str, set[str]] = {}
+    for key, reason in external_rejected.items():
+        if key in candidates:
+            reasons.setdefault(key, set()).add(reason)
 
     def final_value(key: str) -> str:
         if key in base_protected or key in forced:
@@ -7003,7 +7941,9 @@ def _analyze_compiled_translation_safety(
         return event_targets.get(originals[key]) == event_targets.get(final_value(key))
 
     def has_display_evidence(key: str) -> bool:
-        return "display_only" in set(map(str, usage_by_key.get(key, ())))
+        return key in external_safe or "display_only" in set(
+            map(str, usage_by_key.get(key, ()))
+        )
 
     def has_display_transport_contract(key: str) -> bool:
         return complete_ledger and has_display_evidence(key)
@@ -7338,7 +8278,8 @@ def _analyze_compiled_translation_safety(
         key for key in safe
         if set(map(str, usage_by_key.get(key, ()))) & {"logic", "event_target"}
     }
-    safe_contract = safe - safe_display - safe_equivalent
+    safe_external = safe & external_safe
+    safe_contract = safe - safe_display - safe_equivalent - safe_external
     unresolved = sorted(
         {
             str(scope)
@@ -7361,8 +8302,10 @@ def _analyze_compiled_translation_safety(
             "direct_display": sorted(safe_display),
             "official_display_contract": sorted(safe_contract),
             "semantic_equivalence": sorted(safe_equivalent),
+            "external_text_flow": sorted(safe_external),
         },
         "keep_original": sorted(protected),
+        "translation_overrides": dict(sorted(external_overrides.items())),
         "unresolved_scopes": unresolved,
         "replay": {
             "iterations": iterations,
@@ -7383,12 +8326,14 @@ def _analyze_compiled_translation_safety(
             "resource_targets_equivalent": (
                 original_signature["resources"] == replay_signature["resources"]
             ),
+            "external_parser_equivalent": not bool(
+                set(external_rejected) & set(candidates)
+            ),
             "differences": replay_differences,
             "history": replay_history,
         },
         "reasons": {key: sorted(value) for key, value in sorted(reasons.items())},
     }
-
 
 def analyze_translation_safety(
     auto_dir: str | Path,

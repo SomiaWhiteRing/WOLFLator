@@ -14,6 +14,30 @@ from pathlib import Path
 EVENT_PREFIX = "WOLFLATOR_PROOFREAD_EVENT "
 _AI_PRINT_STATE = threading.local()
 _ORIGINAL_PRINT = builtins.print
+_BATCH_OUTPUT_CONTRACT = r"""
+
+## WOLFLator 批量校对协议（优先于上文的单条输出格式）
+本次输入由多条 Line 组成。只返回 JSON 列表，不要返回 Markdown 或解释：
+[
+  {
+    "line_id": 0,
+    "issues": [
+      {
+        "type": "terminology|omission|hallucination|logic_error|format_error",
+        "severity": "high|medium|low",
+        "description": "具体问题",
+        "suggestion": "具体修改说明",
+        "confidence": 0.95
+      }
+    ],
+    "corrected_translation": "已修复全部问题、可直接替换的完整译文"
+  }
+]
+凡返回 issues，必须同时返回非空且确实修复问题的 corrected_translation；即使问题为
+medium 或 low 也不能省略。WOLFLator 已核验的规则问题必须保留并修复，其中的标点、
+括号、占位符、控制字符和换行问题不受上文“忽略标点差异”限制。不得只返回修改说明或
+局部片段。line_id 必须使用输入中的 Line 编号。没有问题的行不要返回。
+"""
 
 
 def emit(event: str, **values: object) -> None:
@@ -67,7 +91,11 @@ def _serialize_ai(issue: object) -> dict[str, object]:
 def _batch_context(rows: list[dict[str, object]]) -> str:
     seen: set[tuple[str, str]] = set()
     context: list[dict[str, str]] = []
+    rule_findings: list[dict[str, object]] = []
     for row in rows:
+        findings = row.get("rule_issues", [])
+        if isinstance(findings, list) and findings:
+            rule_findings.append({"line_id": int(row["index"]), "issues": findings})
         for nearby in row.get("context", []):
             if not isinstance(nearby, dict):
                 continue
@@ -76,7 +104,10 @@ def _batch_context(rows: list[dict[str, object]]) -> str:
                 continue
             seen.add(pair)
             context.append({"原文": pair[0], "译文": pair[1]})
-    return json.dumps(context, ensure_ascii=False)
+    return json.dumps(
+        {"相邻上下文": context, "WOLFLator已核验规则问题": rule_findings},
+        ensure_ascii=False,
+    )
 
 
 def _run_ai_batch(
@@ -85,10 +116,11 @@ def _run_ai_batch(
     config: dict[str, object],
     glossary: list[dict[str, object]],
     confidence: float,
-) -> tuple[int, dict[str, dict[str, object]]]:
+) -> tuple[int, dict[str, dict[str, object]], list[str]]:
     from ModuleFolders.Service.Proofreader.AIProofreader import AIProofreader
 
     checker = AIProofreader(config)
+    checker.prompt_template = str(getattr(checker, "prompt_template", "")) + _BATCH_OUTPUT_CONTRACT
     items = [
         {
             "index": int(row["index"]),
@@ -119,9 +151,18 @@ def _run_ai_batch(
         if issues:
             output[str(row["key"])] = {
                 "issues": issues,
-                "suggested_translation": str(result.corrected_translation or row["translation"]),
+                "suggested_translation": str(result.corrected_translation or ""),
             }
-    return number, output
+    translations_by_key = {str(row["key"]): str(row["translation"]) for row in rows}
+    missing_corrections = [
+        key
+        for key, entry in output.items()
+        if not entry["suggested_translation"]
+        or entry["suggested_translation"] == translations_by_key[key]
+    ]
+    expected_rule_keys = {str(row["key"]) for row in rows if row.get("rule_issues")}
+    missing_corrections.extend(sorted(expected_rule_keys - set(output)))
+    return number, output, sorted(set(missing_corrections))
 
 
 def run(args: argparse.Namespace) -> int:
@@ -154,9 +195,14 @@ def run(args: argparse.Namespace) -> int:
     for offset, row in enumerate(rows, 1):
         issues = rule_checker.check(str(row.get("original", "")), str(row.get("translation", "")))
         if issues:
+            serialized = [_serialize_rule(issue) for issue in issues]
+            row["rule_issues"] = [
+                {"type": issue["type"], "description": issue["description"]}
+                for issue in serialized
+            ]
             entries[str(row["key"])] = {
-                "issues": [_serialize_rule(issue) for issue in issues],
-                "suggested_translation": str(row["translation"]),
+                "issues": serialized,
+                "suggested_translation": "",
             }
         if args.mode == "rules" and (offset % args.batch_size == 0 or offset == len(rows)):
             emit("progress", current=offset, total=len(rows), failed_batches=0)
@@ -182,7 +228,7 @@ def run(args: argparse.Namespace) -> int:
                 for future in as_completed(pending):
                     number, batch = pending[future]
                     try:
-                        _, ai_entries = future.result()
+                        _, ai_entries, missing_corrections = future.result()
                         for key, ai_entry in ai_entries.items():
                             target = entries.setdefault(
                                 key,
@@ -191,6 +237,14 @@ def run(args: argparse.Namespace) -> int:
                             target["issues"].extend(ai_entry["issues"])
                             if ai_entry["suggested_translation"]:
                                 target["suggested_translation"] = ai_entry["suggested_translation"]
+                        if missing_corrections:
+                            failed_batches.append(
+                                {
+                                    "batch": number,
+                                    "keys": missing_corrections,
+                                    "error": "AI 报告了问题，但未返回可直接替换的完整修订译文。",
+                                }
+                            )
                     except Exception as exc:
                         error = f"{type(exc).__name__}: {exc}"
                         if secret:

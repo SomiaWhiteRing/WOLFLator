@@ -674,7 +674,12 @@ class PipelineTests(unittest.TestCase):
             ):
                 artifacts = pipeline._import()
 
-            factory.assert_called_once_with(full_export_scope())
+            runner_scope = factory.call_args.args[0]
+            self.assertTrue(runner_scope.external)
+            self.assertTrue(runner_scope.display)
+            self.assertTrue(runner_scope.optional_name)
+            self.assertTrue(runner_scope.halfwidth)
+            self.assertTrue(runner_scope.filename)
             runner.translate.assert_called_once()
             self.assertEqual(
                 str(pipeline.work_dir / "Translated1_Chinese (Simplified)"),
@@ -848,6 +853,45 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.GLOSSARY).status)
             self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.COPY).status)
             self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.TRANSLATE).status)
+
+    def test_run_stages_executes_only_contiguous_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            executed = []
+            progress = []
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            pipeline.executed = executed
+            pipeline.progress = lambda current, total, stage: progress.append(
+                (current, total, stage)
+            )
+            stages = (Stage.UNPACK, Stage.EXTRACT, Stage.GLOSSARY)
+
+            self.assertEqual("completed", pipeline.run_stages(stages))
+            self.assertEqual(list(stages), executed)
+            self.assertEqual(
+                [
+                    (0, 3, Stage.UNPACK),
+                    (1, 3, Stage.UNPACK),
+                    (1, 3, Stage.EXTRACT),
+                    (2, 3, Stage.EXTRACT),
+                    (2, 3, Stage.GLOSSARY),
+                    (3, 3, Stage.GLOSSARY),
+                ],
+                progress,
+            )
+            current = load_manifest(manifest_path)
+            self.assertEqual(
+                [StageStatus.COMPLETED] * 3,
+                [current.version.stage(stage).status for stage in stages],
+            )
+            self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.COPY).status)
+            self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.TRANSLATE).status)
+
+            with self.assertRaisesRegex(ValueError, "相邻"):
+                pipeline.run_stages((Stage.COPY, Stage.EXTRACT))
 
     def test_rerun_stage_keeps_downstream_completed(self):
         with tempfile.TemporaryDirectory() as directory:
