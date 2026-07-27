@@ -2868,6 +2868,41 @@ class WorkbookAndFontTests(unittest.TestCase):
         condition["operator"] = "equals"
         self.assertEqual([], _external_text_observer_report([flow], [read, condition]))
 
+    def test_scoped_workbook_uses_safe_external_translation_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(HEADERS)
+            sheet.append([
+                'TXTFILE-"Data\\story.txt"',
+                "",
+                "Text File",
+                "",
+                "",
+                "@show\nold story\n@image\nface.png",
+                "",
+            ])
+            workbook.save(source)
+            items = read_translation_items(source)
+            items[0].translation = "@show\nnew story\n@image\nnew-face.png"
+            full = write_full_workbook(source, root / "full.xlsx", items)
+            scoped = write_scoped_workbook(
+                full,
+                root / "scoped.xlsx",
+                ImportScope(external=True),
+                root,
+                items,
+                translation_overrides={
+                    items[0].key: "@show\nnew story\n@image\nface.png"
+                },
+            )
+            self.assertEqual(
+                "@show\nnew story\n@image\nface.png",
+                load_workbook(scoped).active["G2"].value,
+            )
+
     def test_translation_safety_protects_cross_event_database_condition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

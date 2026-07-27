@@ -2271,6 +2271,7 @@ class MainWindow(QMainWindow):
                 f"官方显示契约 {summary.get('logic_display_contract', 0)} 组，"
                 f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
                 f"外部显示链路 {summary.get('logic_external_text_flow', 0)} 组，"
+                f"外部部分合并 {summary.get('logic_external_partial_merge', 0)} 组，"
                 f"未证明 {summary.get('logic_not_proven', 0)} 组，"
                 f"{logic_issue_label} {summary.get('logic_blocking_relevant', 0)} 组，"
                 f"已证明可翻译 {len(report.get('safe_to_translate', []))} 组，"

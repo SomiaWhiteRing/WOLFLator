@@ -20,7 +20,7 @@ from models import (
 )
 from pipeline import Pipeline, create_project, load_manifest
 from wolf_editor import EditorInfo, analyze_auto_export
-from wolf_analysis import write_program_cache
+from wolf_analysis import TRANSLATION_SAFETY_SCHEMA, write_program_cache
 from wolf_tools import (
     IMPORT_PROTECTION_SCHEMA,
     OfficialToolDialogError,
@@ -665,10 +665,24 @@ class PipelineTests(unittest.TestCase):
 
             def write_scoped(_full, _output, _scope, _game, scoped_items, **_kwargs):
                 self.assertEqual("中·文", scoped_items[0].translation)
+                self.assertEqual({"plain": "安全混合译文"}, _kwargs["translation_overrides"])
                 return scoped
+
+            safety = {
+                "schema": TRANSLATION_SAFETY_SCHEMA,
+                "safe_to_translate": ["plain"],
+                "keep_original": [],
+                "translation_overrides": {"plain": "安全混合译文"},
+                "approvals": {},
+                "unresolved_scopes": [],
+                "replay": {},
+                "reasons": {},
+            }
 
             with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
                 "pipeline.write_scoped_workbook", side_effect=write_scoped
+            ), mock.patch.object(
+                pipeline, "_translation_safety", return_value=safety
             ), mock.patch("pipeline.export_and_analyze", side_effect=verify_merged), mock.patch(
                 "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
             ):

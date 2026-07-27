@@ -8305,7 +8305,10 @@ def _finish_compiled_translation_safety(
             "external_text_flow": sorted(safe_external),
         },
         "keep_original": sorted(protected),
-        "translation_overrides": dict(sorted(external_overrides.items())),
+        "translation_overrides": {
+            key: external_overrides[key]
+            for key in sorted(external_overrides.keys() & safe)
+        },
         "unresolved_scopes": unresolved,
         "replay": {
             "iterations": iterations,

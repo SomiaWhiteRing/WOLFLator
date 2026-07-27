@@ -1456,6 +1456,7 @@ class Pipeline:
             f"官方显示契约 {summary.get('logic_display_contract', 0)} 组，"
             f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
             f"外部显示链路 {summary.get('logic_external_text_flow', 0)} 组，"
+            f"外部部分合并 {summary.get('logic_external_partial_merge', 0)} 组，"
             f"未证明 {summary.get('logic_not_proven', 0)} 组，"
             f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
             f"中点转换 {summary.get('middle_dot_normalized', 0)} 组，"

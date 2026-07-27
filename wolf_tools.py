@@ -2499,6 +2499,12 @@ def analyze_import_protection(
                 and isinstance(logic_safety.get("approvals"), dict)
                 else ()
             ),
+            "logic_external_partial_merge": len(
+                logic_safety.get("translation_overrides", {})
+                if isinstance(logic_safety, dict)
+                and isinstance(logic_safety.get("translation_overrides"), dict)
+                else {}
+            ),
             "logic_not_proven": sum(
                 entry["reason"] == "not_proven_safe" for entry in entries
             ),
