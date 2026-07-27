@@ -344,6 +344,8 @@ class PipelineTests(unittest.TestCase):
             )
             manifest = load_manifest(manifest_path)
             self.assertTrue(manifest.export_scope.external)
+            self.assertTrue(manifest.translation_scope.external)
+            self.assertTrue(manifest.import_scope.external)
             self.assertTrue(manifest.exclude_large_external_files)
             self.assertEqual(128, manifest.external_file_limit_kb)
             self.assertEqual("warn", manifest.import_protection.logic_unknown_policy)
@@ -628,7 +630,14 @@ class PipelineTests(unittest.TestCase):
             map_path.parent.mkdir(parents=True)
             map_path.write_bytes(b"map")
             (pipeline.work_dir / "Data.wolf").write_bytes(b"packed")
-            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1-0-0")]
+            items = [
+                TranslationItem(
+                    key="plain",
+                    original="甲",
+                    translation="中・文",
+                    code="COMMON-1-0-0",
+                )
+            ]
             items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
             pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
                 "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
@@ -654,8 +663,12 @@ class PipelineTests(unittest.TestCase):
                 self.assertFalse((merged / "Data.wolf").exists())
                 return post_editor
 
+            def write_scoped(_full, _output, _scope, _game, scoped_items, **_kwargs):
+                self.assertEqual("中·文", scoped_items[0].translation)
+                return scoped
+
             with mock.patch.object(pipeline, "_official_runner", return_value=runner) as factory, mock.patch(
-                "pipeline.write_scoped_workbook", return_value=scoped
+                "pipeline.write_scoped_workbook", side_effect=write_scoped
             ), mock.patch("pipeline.export_and_analyze", side_effect=verify_merged), mock.patch(
                 "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
             ):
@@ -669,6 +682,10 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertFalse(any(pipeline.artifacts_dir.glob(".import-game-*")))
             self.assertFalse(stale_diagnostics.exists())
+            protection = json.loads(
+                Path(artifacts["import_protection"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(["plain"], protection["middle_dot_normalized"])
 
     def test_import_structure_failure_keeps_previous_translated_game(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -968,7 +985,7 @@ class PipelineTests(unittest.TestCase):
                 manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
             )
             self.assertEqual("completed", first.run())
-            first.set_import_scope(ImportScope(external=True))
+            first.set_import_scope(ImportScope(external=True, optional_name=True))
             changed = load_manifest(manifest_path)
             self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.VALIDATE).status)
             for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:

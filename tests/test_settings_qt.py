@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from app import (
@@ -32,7 +33,9 @@ from models import (
     TranslationItem,
 )
 from pipeline import PipelineStateEvent, create_project, load_manifest
+from proofread import build_worker_input, load_report, make_report, proofread_paths, save_report
 from settings import SettingsStore, protect_secret, unprotect_secret
+from wolf_tools import dump_items
 
 
 class SettingsQtTests(unittest.TestCase):
@@ -120,6 +123,10 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(8, item.translation_line_limit)
             self.assertEqual(1, item.translation_retry_min_lines)
             self.assertEqual(6, item.translation_rounds)
+            self.assertEqual("rules_ai", item.proofread_mode)
+            self.assertEqual(20, item.proofread_batch_size)
+            self.assertEqual(5, item.proofread_context_lines)
+            self.assertEqual(70, item.proofread_confidence_percent)
 
     def test_dialog_loads_separate_api_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -202,19 +209,22 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertTrue(window.workflow_page.isAncestorOf(window.one_click))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.step_mode))
                 self.assertTrue(window.workflow_page.isAncestorOf(window.log_view))
-                self.assertEqual(4, window.tabs.count())
-                self.assertEqual("范围", window.tabs.tabText(2))
-                self.assertEqual("修改字体", window.tabs.tabText(3))
+                self.assertEqual(5, window.tabs.count())
+                self.assertEqual("校对", window.tabs.tabText(2))
+                self.assertEqual("范围", window.tabs.tabText(3))
+                self.assertEqual("修改字体", window.tabs.tabText(4))
                 self.assertTrue(
                     any(
                         label.text() == "原字体"
-                        for label in window.tabs.widget(3).findChildren(QLabel)
+                        for label in window.tabs.widget(4).findChildren(QLabel)
                     )
                 )
                 self.assertEqual(3, window.scope_stack.count())
-                self.assertTrue(window.tabs.widget(2).isAncestorOf(window.translation_scope_button))
-                self.assertTrue(window.tabs.widget(2).isAncestorOf(window.import_scope_button))
-                self.assertTrue(window.tabs.widget(2).isAncestorOf(window.export_scope_button))
+                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.translation_scope_button))
+                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.import_scope_button))
+                self.assertTrue(window.tabs.widget(3).isAncestorOf(window.export_scope_button))
+                self.assertTrue(window.translation_scope_checks["external"].isChecked())
+                self.assertTrue(window.import_scope_checks["external"].isChecked())
                 self.assertFalse(window.external_filter_options.isHidden())
                 self.assertTrue(window.exclude_large_external_files.isChecked())
                 self.assertEqual(128, window.external_file_limit_kb.value())
@@ -404,6 +414,7 @@ class SettingsQtTests(unittest.TestCase):
                 self.assertFalse(window.tabs.isTabEnabled(1))
                 self.assertFalse(window.tabs.isTabEnabled(2))
                 self.assertFalse(window.tabs.isTabEnabled(3))
+                self.assertFalse(window.tabs.isTabEnabled(4))
 
                 with patch.object(window, "_load_project_view") as reload_view:
                     window._stage_progress(1, 8, Stage.COPY.value)
@@ -413,6 +424,115 @@ class SettingsQtTests(unittest.TestCase):
                 )
                 self.assertEqual("已完成", window.easy_stage_status[Stage.COPY].text())
                 window._set_pipeline_ui_locked(False)
+                window.close()
+
+    def test_proofread_tab_gate_tracks_translation_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            projects = root / "projects"
+            manifest_path = create_project(projects, game)
+            items_path = dump_items(
+                root / "items-translated.json",
+                [TranslationItem(key="one", original="原文", translation="译文")],
+            )
+            manifest = load_manifest(manifest_path)
+            manifest.version.stage(Stage.TRANSLATE).artifacts["items"] = str(items_path)
+            manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+            store = SettingsStore(root / "settings.ini")
+            store.save(AppSettings(projects_root=str(projects), last_project=str(manifest_path)))
+            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
+                window = MainWindow()
+                self.assertEqual("校对", window.tabs.tabText(window.proofread_tab_index))
+                for status in (
+                    StageStatus.PENDING,
+                    StageStatus.RUNNING,
+                    StageStatus.FAILED,
+                    StageStatus.CANCELLED,
+                    StageStatus.COMPLETED,
+                ):
+                    manifest = load_manifest(manifest_path)
+                    manifest.version.stage(Stage.TRANSLATE).status = status
+                    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+                    window._load_project_view()
+                    self.assertTrue(window.tabs.isTabEnabled(window.proofread_tab_index))
+                    self.assertEqual(status is StageStatus.COMPLETED, window.proofread_content.isEnabled())
+                    self.assertEqual(status is StageStatus.COMPLETED, window.proofread_gate_label.isHidden())
+                window.close()
+
+    def test_proofread_review_saves_edits_and_individual_and_batch_decisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game"
+            (game / "Data" / "BasicData").mkdir(parents=True)
+            (game / "Game.exe").write_bytes(b"game")
+            (game / "Data" / "BasicData" / "Game.dat").write_bytes(b"data")
+            projects = root / "projects"
+            manifest_path = create_project(projects, game)
+            items_path = dump_items(
+                root / "items-translated.json",
+                [
+                    TranslationItem(key="one", code="C-1", original="原文一", translation="译文一"),
+                    TranslationItem(key="two", code="C-2", original="原文二", translation="译文二"),
+                ],
+            )
+            manifest = load_manifest(manifest_path)
+            translate = manifest.version.stage(Stage.TRANSLATE)
+            translate.status = StageStatus.COMPLETED
+            translate.artifacts["items"] = str(items_path)
+            manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+            worker_input = build_worker_input(items_path, manifest, context_lines=0)
+            issue = {
+                "source": "ai", "type": "logic_error", "severity": "medium",
+                "description": "测试问题", "suggestion": "", "confidence": 0.9,
+            }
+            report = make_report(
+                worker_input,
+                {
+                    "schema": 1,
+                    "entries": {
+                        "one": {"issues": [issue], "suggested_translation": "建议一"},
+                        "two": {"issues": [issue], "suggested_translation": "建议二"},
+                    },
+                    "failed_batches": [],
+                },
+                mode="rules_ai",
+                model="model",
+                batch_size=20,
+                context_lines=0,
+                confidence_percent=70,
+            )
+            report_path, _ = proofread_paths(manifest_path, manifest)
+            save_report(report_path, report)
+            store = SettingsStore(root / "settings.ini")
+            store.save(AppSettings(projects_root=str(projects), last_project=str(manifest_path)))
+            with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
+                window = MainWindow()
+                self.assertEqual(2, window.proofread_table.rowCount())
+                window.proofread_table.selectRow(0)
+                window.proofread_suggestion.setPlainText("人工修订")
+                self.app.processEvents()
+                window._decide_current_proofread("accept")
+                saved = load_report(report_path)
+                self.assertEqual("人工修订", saved["entries"][0]["edited_translation"])
+                self.assertEqual("accept", saved["entries"][0]["decision"])
+                for row in range(window.proofread_table.rowCount()):
+                    window.proofread_table.item(row, 0).setCheckState(Qt.Checked)
+                window._decide_selected_proofread("keep")
+                saved = load_report(report_path)
+                self.assertEqual(["keep", "keep"], [entry["decision"] for entry in saved["entries"]])
+                window.tabs.setCurrentIndex(window.proofread_tab_index)
+                window._set_proofread_ui_locked(True)
+                self.assertEqual(window.proofread_tab_index, window.tabs.currentIndex())
+                self.assertTrue(window.tabs.isTabEnabled(window.proofread_tab_index))
+                self.assertTrue(window.stop_proofread_button.isEnabled())
+                self.assertFalse(window.proofread_mode.isEnabled())
+                self.assertFalse(window.project_combo.isEnabled())
+                self.assertFalse(window.start_button.isEnabled())
+                window._set_proofread_ui_locked(False)
                 window.close()
 
 

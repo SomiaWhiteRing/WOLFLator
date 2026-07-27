@@ -25,7 +25,7 @@ from safe_io import (
     replace_with_retry,
     runtime_lock,
 )
-from wolf_tools import CancelledError, run_process, sha256_file, verified_vendor_file
+from wolf_tools import CancelledError, resource_path, run_process, sha256_file, verified_vendor_file
 
 
 AINIEE_VERSION = "V2.7.5"
@@ -987,6 +987,100 @@ def _run_translation_locked(
         if diagnostic_log:
             diagnostic_log(f"ainiee.translate.complete rows={len(data)}")
         return data
+
+
+PROOFREAD_EVENT_PREFIX = "WOLFLATOR_PROOFREAD_EVENT "
+
+
+def run_proofread(
+    runtime: str | Path,
+    input_json: str | Path,
+    output_json: str | Path,
+    rules: dict[str, object],
+    settings: AppSettings,
+    api_key: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
+    log: Callable[[str], None] | None = None,
+    diagnostic_log: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    root = validate_ainiee_source(runtime)
+    mode = settings.proofread_mode
+    if mode not in {"rules", "rules_ai"}:
+        raise ValueError(f"不支持的校对方式: {mode}")
+    payload = json.loads(Path(input_json).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("校对 worker 输入不是对象。")
+    managed_rules = _rules_with_control_protection(rules)
+    payload["config"] = _session_profile(settings, "")
+    payload["glossary"] = managed_rules.get("prompt_dictionary_data", [])
+    atomic_write_json(input_json, payload)
+    output = Path(output_json).resolve()
+    output.unlink(missing_ok=True)
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    if mode == "rules_ai":
+        child_env["WOLFLATOR_PROOFREAD_API_KEY"] = api_key
+
+    def receive_output(stream: str, line: str) -> None:
+        if stream != "stdout" or not line.startswith(PROOFREAD_EVENT_PREFIX):
+            return
+        try:
+            event = json.loads(line[len(PROOFREAD_EVENT_PREFIX) :])
+        except json.JSONDecodeError:
+            return
+        if isinstance(event, dict) and progress is not None:
+            progress(event)
+
+    command = [
+        str(locate_uv()),
+        "run",
+        "--frozen",
+        "--no-sync",
+        "python",
+        str(resource_path("ainiee_proofread_worker.py").resolve()),
+        "--runtime",
+        str(root),
+        "--input",
+        str(Path(input_json).resolve()),
+        "--output",
+        str(output),
+        "--mode",
+        mode,
+        "--batch-size",
+        str(settings.proofread_batch_size),
+        "--confidence",
+        str(settings.proofread_confidence_percent),
+        "--threads",
+        str(max(1, settings.api_threads)),
+    ]
+    # ponytail: AiNiee owns one managed runtime. Serialize proofread and translation;
+    # use separate runtime copies if simultaneous project jobs become a requirement.
+    with runtime_lock(root.parent, "proofread"):
+        run_process(
+            command,
+            cwd=root,
+            timeout=24 * 3600,
+            cancel_event=cancel_event,
+            log=log,
+            diagnostic_log=diagnostic_log,
+            env=child_env,
+            hide_window=True,
+            output_line=receive_output,
+        )
+    if not output.is_file():
+        raise RuntimeError("AiNiee 校对 worker 返回成功，但没有生成结果。")
+    result = json.loads(output.read_text(encoding="utf-8"))
+    if (
+        not isinstance(result, dict)
+        or result.get("schema") != 1
+        or not isinstance(result.get("entries"), dict)
+        or not isinstance(result.get("failed_batches"), list)
+    ):
+        raise ValueError("AiNiee 校对 worker 输出结构不匹配。")
+    return result
 
 
 class ApiError(RuntimeError):

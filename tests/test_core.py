@@ -46,6 +46,7 @@ from models import (
 )
 from wolf_tools import (
     CancelledError,
+    IMPORT_PROTECTION_SCHEMA,
     OfficialToolRunner,
     SUPPORT_DIR,
     _content_category,
@@ -67,6 +68,7 @@ from wolf_tools import (
     locate_workbook,
     merge_ainiee_output,
     name_baseline_scope,
+    normalize_import_display_middle_dots,
     parse_official_diagnostics,
     parse_official_map_failures,
     official_dialogs_indicate_legacy_game,
@@ -335,6 +337,16 @@ class WorkbookTests(unittest.TestCase):
                 _content_category(code, "", type_name),
             )
 
+        external = TranslationItem(
+            key="external",
+            original="外部テキスト",
+            code="TXTFILE-1",
+            type="Text File",
+            category=ImportCategory.EXTERNAL,
+        )
+        self.assertEqual(0, classify_optional_name_delta([external], []))
+        self.assertEqual(ImportCategory.EXTERNAL, external.category)
+
     def test_classification_stable_keys_and_controls(self):
         with tempfile.TemporaryDirectory() as directory:
             path = make_workbook(Path(directory) / "source.xlsx")
@@ -410,7 +422,7 @@ class WorkbookTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "COMMON-1.*占位序列"):
                 merge_ainiee_output(items, translated, ImportScope())
 
-    def test_middle_dot_normalization_skips_filename_and_halfwidth_usage(self):
+    def test_middle_dot_normalization_runs_only_for_imported_display_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.xlsx"
             workbook = Workbook()
@@ -433,6 +445,12 @@ class WorkbookTests(unittest.TestCase):
                 translated.append({**row, "translation": "中・文" + controls, "stage": 1})
 
             merged = merge_ainiee_output(items, translated, full_export_scope())
+            by_code = {item.code: item.translation for item in merged}
+            self.assertEqual(r"中・文\C[1]", by_code["DISPLAY-1"])
+            changed = normalize_import_display_middle_dots(
+                merged, full_export_scope()
+            )
+            self.assertEqual({items[0].key}, changed)
             by_code = {item.code: item.translation for item in merged}
             self.assertEqual(r"中·文\C[1]", by_code["DISPLAY-1"])
             self.assertEqual("中・文", by_code["DISPLAY-2"])
@@ -465,6 +483,11 @@ class WorkbookTests(unittest.TestCase):
         self.assertIn("Tool_A_Get_DB_DataName=0\r\n", baseline)
         self.assertIn("Tool_A_Get_TXT=0\r\n", baseline)
         self.assertIn("Tool_A_Get_CSV=0\r\n", baseline)
+        external_baseline = _official_config_text(
+            name_baseline_scope(ImportScope(external=True))
+        )
+        self.assertIn("Tool_A_Get_TXT=1\r\n", external_baseline)
+        self.assertIn("Tool_A_Get_CSV=1\r\n", external_baseline)
 
         with tempfile.TemporaryDirectory() as directory:
             source = make_workbook(Path(directory) / "source.xlsx")
@@ -2193,7 +2216,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analysis,
                 logic_safety=safety,
             )
-            self.assertEqual(6, protection["schema"])
+            self.assertEqual(IMPORT_PROTECTION_SCHEMA, protection["schema"])
             self.assertEqual(
                 [
                     "display",
@@ -3706,6 +3729,65 @@ class ControlTests(unittest.TestCase):
         swapped = protected.replace(chr(0xE100), "X").replace(chr(0xE101), chr(0xE100)).replace("X", chr(0xE101))
         with self.assertRaisesRegex(ValueError, "占位序列"):
             restore_control_tokens(swapped, tokens)
+
+    def test_external_script_translates_display_payload_and_preserves_structure(self):
+        original = (
+            "@背景：1\n"
+            "鷲見A普通\n"
+            "@文章：0\n"
+            "空を飛んで、落ちて、目が覚める。\n"
+            "@文章：0\n"
+            r"\c[6]次の台詞。"
+        )
+        item = TranslationItem(
+            key="script",
+            original=original,
+            code='TXTFILE-"Data\\ノベル\\シーン1.txt"',
+            type="Text File",
+            category=ImportCategory.EXTERNAL,
+            control_signature=[r"\c[6]"],
+        )
+        scope = ImportScope(external=True)
+        payload = to_paratranz([item], scope)
+        protected = str(payload[0]["original"])
+        self.assertIn("空を飛んで、落ちて、目が覚める。", protected)
+        self.assertIn("次の台詞。", protected)
+        self.assertNotIn("@文章", protected)
+        self.assertNotIn("鷲見A普通", protected)
+        self.assertNotIn(r"\c[6]", protected)
+
+        translated = protected.replace(
+            "空を飛んで、落ちて、目が覚める。", "飞过天空，坠落，然后醒来。"
+        ).replace("次の台詞。", "下一句台词。")
+        merged = merge_ainiee_output(
+            [item], [{**payload[0], "translation": translated}], scope
+        )
+        self.assertEqual(
+            original.replace(
+                "空を飛んで、落ちて、目が覚める。", "飞过天空，坠落，然后醒来。"
+            ).replace("次の台詞。", "下一句台词。"),
+            merged[0].translation,
+        )
+
+        broken = translated.replace(chr(0xE100), "", 1)
+        with self.assertRaisesRegex(ValueError, "占位序列"):
+            merge_ainiee_output([item], [{**payload[0], "translation": broken}], scope)
+
+    def test_external_script_does_not_normalize_resource_middle_dots(self):
+        original = "@立ち絵：1\n画像・通常\n@文章：0\n台詞。"
+        item = TranslationItem(
+            key="script",
+            original=original,
+            code="TXTFILE-1",
+            type="Text File",
+            category=ImportCategory.EXTERNAL,
+        )
+        scope = ImportScope(external=True)
+        payload = to_paratranz([item], scope)
+        merged = merge_ainiee_output(
+            [item], [{**payload[0], "translation": payload[0]["original"]}], scope
+        )
+        self.assertEqual(original, merged[0].translation)
 
 
 class ProcessTests(unittest.TestCase):

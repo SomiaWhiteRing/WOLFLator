@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -83,8 +84,16 @@ from models import (
     Stage,
     StageStatus,
     default_export_scope,
+    default_processing_scope,
 )
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
+from proofread import (
+    load_report,
+    proofread_paths,
+    report_is_stale,
+    run_project_proofread,
+    save_report,
+)
 from safe_io import project_lock
 from settings import SettingsStore, local_data_dir, validate_settings
 from wolf_editor import (
@@ -97,6 +106,7 @@ from wolf_tools import (
     analyze_import_protection,
     imported_display_texts,
     load_items,
+    protect_control_tokens,
     read_font_slots,
     selected_translation_requirements,
 )
@@ -303,6 +313,47 @@ class PipelineThread(QThread):
             detail = traceback.format_exc()
             self.pipeline.detail("pipeline.thread.exception\n" + detail)
             self.failed.emit(detail)
+
+
+class ProofreadThread(QThread):
+    progress_event = Signal(object)
+    log_line = Signal(str)
+    succeeded = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, manifest_path: Path, settings, api_key: str, cache_root: Path):
+        super().__init__()
+        self.manifest_path = manifest_path
+        self.settings = settings
+        self.api_key = api_key
+        self.cache_root = cache_root
+        self.cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            manifest = load_manifest(self.manifest_path)
+            path = run_project_proofread(
+                self.manifest_path,
+                manifest,
+                self.settings,
+                self.api_key,
+                self.cache_root,
+                cancel_event=self.cancel_event,
+                progress=self.progress_event.emit,
+                log=self.log_line.emit,
+            )
+            self.succeeded.emit(str(path))
+        except Exception as exc:
+            from wolf_tools import CancelledError
+
+            if isinstance(exc, CancelledError):
+                self.cancelled.emit()
+            else:
+                self.failed.emit(traceback.format_exc())
 
 
 class InstallThread(QThread):
@@ -1044,6 +1095,11 @@ class MainWindow(QMainWindow):
         self.settings = self.store.load()
         self.pipeline: Pipeline | None = None
         self.pipeline_thread: PipelineThread | None = None
+        self.proofread_thread: ProofreadThread | None = None
+        self.proofread_report: dict[str, object] | None = None
+        self.proofread_report_path: Path | None = None
+        self.proofread_run_result: tuple[str, str] | None = None
+        self._proofread_loading = False
         self.font_scan_thread: FontScanThread | None = None
         self.font_context: dict[str, object] | None = None
         self.font_apply_active = False
@@ -1096,6 +1152,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._workflow_tab(), "流程")
         self.tabs.addTab(self._glossary_tab(), "术语")
+        self.proofread_tab_index = self.tabs.addTab(self._proofread_tab(), "校对")
         self.tabs.addTab(self._scope_tab(), "范围")
         self.font_tab_index = self.tabs.addTab(self._font_tab(), "修改字体")
         self.tabs.currentChanged.connect(self._main_tab_changed)
@@ -1330,6 +1387,209 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.save_glossary_button, alignment=Qt.AlignRight)
         return page
 
+    def _proofread_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self.proofread_gate_label = QLabel("完成 AI 翻译后即可使用校对功能")
+        self.proofread_gate_label.setObjectName("secondaryText")
+        self.proofread_gate_label.setAlignment(Qt.AlignCenter)
+        self.proofread_gate_label.setMinimumHeight(34)
+        layout.addWidget(self.proofread_gate_label)
+
+        self.proofread_content = QWidget()
+        content = QVBoxLayout(self.proofread_content)
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(9)
+
+        self.proofread_options = QWidget()
+        options = QVBoxLayout(self.proofread_options)
+        options.setContentsMargins(0, 0, 0, 0)
+        options.setSpacing(6)
+        configuration = QHBoxLayout()
+        self.proofread_mode = QComboBox()
+        self.proofread_mode.addItem("规则 + AI", "rules_ai")
+        self.proofread_mode.addItem("仅规则", "rules")
+        self.proofread_model = QLabel("-")
+        self.proofread_model.setObjectName("secondaryText")
+        self.proofread_batch_size = QSpinBox()
+        self.proofread_batch_size.setRange(1, 100)
+        self.proofread_context_lines = QSpinBox()
+        self.proofread_context_lines.setRange(0, 20)
+        self.proofread_confidence = QSpinBox()
+        self.proofread_confidence.setRange(0, 100)
+        self.proofread_confidence.setSuffix("%")
+        configuration.addWidget(QLabel("检查方式"))
+        configuration.addWidget(self.proofread_mode)
+        configuration.addWidget(QLabel("模型"))
+        configuration.addWidget(self.proofread_model)
+        configuration.addStretch(1)
+        for label, control in (
+            ("每批", self.proofread_batch_size),
+            ("上下文", self.proofread_context_lines),
+            ("置信度", self.proofread_confidence),
+        ):
+            configuration.addWidget(QLabel(label))
+            configuration.addWidget(control)
+        options.addLayout(configuration)
+        self.start_proofread_button = QToolButton()
+        self.start_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_proofread_button.setToolTip("开始校对")
+        self.start_proofread_button.setObjectName("primaryButton")
+        self.start_proofread_button.clicked.connect(self._start_proofread)
+        self.stop_proofread_button = QToolButton()
+        self.stop_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_proofread_button.setToolTip("停止校对")
+        self.stop_proofread_button.setEnabled(False)
+        self.stop_proofread_button.clicked.connect(self._stop_proofread)
+        self.rerun_proofread_button = QToolButton()
+        self.rerun_proofread_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.rerun_proofread_button.setToolTip("重新校对")
+        self.rerun_proofread_button.clicked.connect(self._start_proofread)
+        for button in (
+            self.start_proofread_button,
+            self.stop_proofread_button,
+            self.rerun_proofread_button,
+        ):
+            button.setFixedSize(36, 36)
+            configuration.addWidget(button)
+        content.addWidget(self.proofread_options)
+
+        progress_row = QHBoxLayout()
+        self.proofread_progress = QProgressBar()
+        self.proofread_progress.setRange(0, 1)
+        self.proofread_progress.setValue(0)
+        self.proofread_progress.setFormat("尚未校对")
+        self.proofread_summary = QLabel("受影响 0 · 高 0 · 中 0 · 低 0 · 已采纳 0 · 失败批次 0")
+        self.proofread_summary.setObjectName("secondaryText")
+        progress_row.addWidget(self.proofread_progress, 1)
+        progress_row.addWidget(self.proofread_summary)
+        content.addLayout(progress_row)
+
+        filters = QHBoxLayout()
+        self.proofread_severity_filter = QComboBox()
+        self.proofread_severity_filter.addItem("全部严重程度", "all")
+        self.proofread_severity_filter.addItem("高风险", "high")
+        self.proofread_severity_filter.addItem("中风险", "medium")
+        self.proofread_severity_filter.addItem("低风险", "low")
+        self.proofread_type_filter = QComboBox()
+        self.proofread_type_filter.addItem("全部问题类型", "all")
+        self.proofread_decision_filter = QComboBox()
+        self.proofread_decision_filter.addItem("全部处理状态", "all")
+        self.proofread_decision_filter.addItem("待处理", "pending")
+        self.proofread_decision_filter.addItem("已采纳", "accept")
+        self.proofread_decision_filter.addItem("保留现译", "keep")
+        self.proofread_search = QLineEdit()
+        self.proofread_search.setPlaceholderText("搜索原文、译文、代码或问题")
+        for control in (
+            self.proofread_severity_filter,
+            self.proofread_type_filter,
+            self.proofread_decision_filter,
+        ):
+            control.currentIndexChanged.connect(self._filter_proofread_rows)
+            filters.addWidget(control)
+        self.proofread_search.textChanged.connect(self._filter_proofread_rows)
+        filters.addWidget(self.proofread_search, 1)
+        self.proofread_accept_selected = QPushButton("批量采纳")
+        self.proofread_accept_selected.clicked.connect(lambda: self._decide_selected_proofread("accept"))
+        self.proofread_keep_selected = QPushButton("批量保留")
+        self.proofread_keep_selected.clicked.connect(lambda: self._decide_selected_proofread("keep"))
+        filters.addWidget(self.proofread_accept_selected)
+        filters.addWidget(self.proofread_keep_selected)
+        content.addLayout(filters)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.proofread_table = QTableWidget(0, 6)
+        self.proofread_table.setHorizontalHeaderLabels(
+            ["选择", "风险", "WOLF 代码", "问题类型", "处理状态", "当前译文"]
+        )
+        _configure_table(self.proofread_table)
+        self.proofread_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.proofread_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.proofread_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.proofread_table.itemSelectionChanged.connect(self._show_proofread_entry)
+        splitter.addWidget(self.proofread_table)
+
+        review = QWidget()
+        review_layout = QVBoxLayout(review)
+        review_layout.setContentsMargins(0, 6, 0, 0)
+        texts = QHBoxLayout()
+        self.proofread_original = QPlainTextEdit()
+        self.proofread_current = QPlainTextEdit()
+        for title, editor in (("原文", self.proofread_original), ("当前译文", self.proofread_current)):
+            column = QVBoxLayout()
+            column.addWidget(QLabel(title))
+            editor.setReadOnly(True)
+            editor.setMinimumHeight(36)
+            editor.setMaximumHeight(105)
+            column.addWidget(editor)
+            texts.addLayout(column, 1)
+        review_layout.addLayout(texts)
+        details = QHBoxLayout()
+        issue_column = QVBoxLayout()
+        issue_column.addWidget(QLabel("问题说明"))
+        self.proofread_issues = QPlainTextEdit()
+        self.proofread_issues.setReadOnly(True)
+        self.proofread_issues.setMinimumHeight(40)
+        self.proofread_issues.setMaximumHeight(120)
+        issue_column.addWidget(self.proofread_issues)
+        suggestion_column = QVBoxLayout()
+        suggestion_column.addWidget(QLabel("建议译文"))
+        self.proofread_suggestion = QPlainTextEdit()
+        self.proofread_suggestion.setMinimumHeight(40)
+        self.proofread_suggestion.setMaximumHeight(120)
+        self.proofread_suggestion.textChanged.connect(self._save_proofread_draft)
+        suggestion_column.addWidget(self.proofread_suggestion)
+        details.addLayout(issue_column, 1)
+        details.addLayout(suggestion_column, 1)
+        review_layout.addLayout(details)
+        self.proofread_accept = QPushButton("采纳")
+        self.proofread_accept.clicked.connect(lambda: self._decide_current_proofread("accept"))
+        self.proofread_keep = QPushButton("保留现译")
+        self.proofread_keep.clicked.connect(lambda: self._decide_current_proofread("keep"))
+        self.proofread_reset = QPushButton("撤销决定")
+        self.proofread_reset.clicked.connect(lambda: self._decide_current_proofread("pending"))
+        splitter.addWidget(review)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([110, 190])
+        content.addWidget(splitter, 1)
+
+        bottom = QHBoxLayout()
+        self.open_proofread_report_button = QPushButton("打开报告")
+        self.open_proofread_report_button.clicked.connect(self._open_proofread_report)
+        self.open_proofread_log_button = QPushButton("打开日志")
+        self.open_proofread_log_button.clicked.connect(self._open_proofread_log)
+        self.restore_ai_translation_button = QPushButton("恢复 AI 原译")
+        self.restore_ai_translation_button.clicked.connect(self._restore_ai_translation)
+        self.apply_proofread_button = QPushButton("应用已采纳修改")
+        self.apply_proofread_button.setObjectName("primaryButton")
+        self.apply_proofread_button.clicked.connect(self._apply_proofread)
+        bottom.addWidget(self.open_proofread_report_button)
+        bottom.addWidget(self.open_proofread_log_button)
+        bottom.addWidget(self.proofread_accept)
+        bottom.addWidget(self.proofread_keep)
+        bottom.addWidget(self.proofread_reset)
+        bottom.addStretch(1)
+        bottom.addWidget(self.restore_ai_translation_button)
+        bottom.addWidget(self.apply_proofread_button)
+        content.addLayout(bottom)
+        layout.addWidget(self.proofread_content, 1)
+
+        for control in (
+            self.proofread_mode,
+            self.proofread_batch_size,
+            self.proofread_context_lines,
+            self.proofread_confidence,
+        ):
+            if isinstance(control, QComboBox):
+                control.currentIndexChanged.connect(self._save_proofread_settings)
+            else:
+                control.valueChanged.connect(self._save_proofread_settings)
+        return page
+
     def _scope_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1377,7 +1637,7 @@ class MainWindow(QMainWindow):
             "halfwidth": QCheckBox("纯半角字符串"),
             "filename": QCheckBox("文件名引用"),
         }
-        defaults = default_export_scope() if target == "export" else ImportScope()
+        defaults = default_export_scope() if target == "export" else default_processing_scope()
         for name, check in checks.items():
             check.setChecked(bool(getattr(defaults, name)))
         for key, check in checks.items():
@@ -2049,7 +2309,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法应用字体", str(exc))
 
     def _open_settings(self, _checked=False, first_run: bool = False) -> None:
-        if self.pipeline_thread and self.pipeline_thread.isRunning():
+        if (self.pipeline_thread and self.pipeline_thread.isRunning()) or (
+            self.proofread_thread and self.proofread_thread.isRunning()
+        ):
             return
         dialog = SettingsDialog(self.store, self)
         if dialog.exec() == QDialog.Accepted:
@@ -2081,7 +2343,9 @@ class MainWindow(QMainWindow):
             self.status_label.setToolTip("\n".join(invalid[:10]))
 
     def _project_changed(self, _index: int) -> None:
-        if self.pipeline_thread and self.pipeline_thread.isRunning():
+        if (self.pipeline_thread and self.pipeline_thread.isRunning()) or (
+            self.proofread_thread and self.proofread_thread.isRunning()
+        ):
             return
         value = self.project_combo.currentData()
         self.font_context = None
@@ -2122,6 +2386,9 @@ class MainWindow(QMainWindow):
         self.easy_summary.setText("选择项目后即可开始")
         self.start_button.setText("开始翻译")
         self.start_button.setEnabled(False)
+        self.proofread_gate_label.setVisible(True)
+        self.proofread_content.setEnabled(False)
+        self._clear_proofread_view()
         self._clear_font_view()
 
     def _load_project_view(self) -> None:
@@ -2252,9 +2519,466 @@ class MainWindow(QMainWindow):
         self.import_protection_table.setRowCount(0)
         self.import_protection_summary.setText("点击预览分析当前译文")
         self._load_glossary()
+        self._load_proofread_view(manifest)
         # Preload while the workflow page is visible so the first font-tab click
         # only paints already-complete choices and coverage.
         self._refresh_font_tab()
+
+    def _clear_proofread_view(self) -> None:
+        self.proofread_report = None
+        self.proofread_report_path = None
+        self.proofread_table.setRowCount(0)
+        self.proofread_original.clear()
+        self.proofread_current.clear()
+        self.proofread_issues.clear()
+        self.proofread_suggestion.clear()
+        self.proofread_progress.setRange(0, 1)
+        self.proofread_progress.setValue(0)
+        self.proofread_progress.setFormat("尚未校对")
+        self.proofread_summary.setText("受影响 0 · 高 0 · 中 0 · 低 0 · 已采纳 0 · 失败批次 0")
+
+    def _load_proofread_view(self, manifest=None) -> None:
+        self._proofread_loading = True
+        try:
+            controls = (
+                (self.proofread_mode, self.settings.proofread_mode),
+                (self.proofread_batch_size, self.settings.proofread_batch_size),
+                (self.proofread_context_lines, self.settings.proofread_context_lines),
+                (self.proofread_confidence, self.settings.proofread_confidence_percent),
+            )
+            for control, value in controls:
+                control.blockSignals(True)
+                if isinstance(control, QComboBox):
+                    control.setCurrentIndex(max(0, control.findData(value)))
+                else:
+                    control.setValue(value)
+                control.blockSignals(False)
+            self.proofread_model.setText(self.settings.api_model or "未设置")
+            if manifest is None and self.current_manifest_path:
+                manifest = load_manifest(self.current_manifest_path)
+            translated = bool(
+                manifest
+                and manifest.version.stage(Stage.TRANSLATE).status is StageStatus.COMPLETED
+            )
+            self.proofread_gate_label.setVisible(not translated)
+            self.proofread_content.setEnabled(translated)
+            if not translated or not self.current_manifest_path:
+                self._clear_proofread_view()
+                return
+            report_path, log_path = proofread_paths(self.current_manifest_path, manifest)
+            self.proofread_report_path = report_path
+            self.open_proofread_report_button.setEnabled(report_path.is_file())
+            self.open_proofread_log_button.setEnabled(log_path.is_file())
+            translate = manifest.version.stage(Stage.TRANSLATE)
+            current_value = translate.artifacts.get("items", "")
+            current = Path(current_value)
+            stale = False
+            if report_path.is_file():
+                try:
+                    self.proofread_report = load_report(report_path)
+                    stale = not current_value or not current.is_file() or report_is_stale(
+                        self.proofread_report, current
+                    )
+                except Exception as exc:
+                    self.proofread_report = None
+                    self.proofread_progress.setFormat(f"报告无效：{exc}")
+            else:
+                self.proofread_report = None
+            self._populate_proofread_table()
+            report = self.proofread_report
+            summary = report["summary"] if report else {}
+            total = int(summary.get("checked", 0))
+            self.proofread_progress.setRange(0, max(1, total))
+            self.proofread_progress.setValue(total if report else 0)
+            if stale:
+                self.proofread_progress.setFormat("报告已过期，请重新校对")
+            elif report:
+                self.proofread_progress.setFormat(
+                    "部分完成 %v/%m" if report["status"] == "partial" else "已完成 %v/%m"
+                )
+            else:
+                self.proofread_progress.setFormat("尚未校对")
+            self._update_proofread_summary()
+            self.start_proofread_button.setEnabled(report is None)
+            self.rerun_proofread_button.setEnabled(report is not None)
+            self.apply_proofread_button.setEnabled(
+                bool(report and not stale and summary.get("accepted", 0))
+            )
+            self.restore_ai_translation_button.setEnabled(
+                bool(translate.artifacts.get("items_ai_translation", ""))
+            )
+        finally:
+            self._proofread_loading = False
+
+    def _populate_proofread_table(self) -> None:
+        self.proofread_table.setRowCount(0)
+        report = self.proofread_report
+        current_type = self.proofread_type_filter.currentData()
+        self.proofread_type_filter.blockSignals(True)
+        self.proofread_type_filter.clear()
+        self.proofread_type_filter.addItem("全部问题类型", "all")
+        types = sorted(
+            {
+                issue["type"]
+                for entry in (report or {}).get("entries", [])
+                for issue in entry["issues"]
+            }
+        )
+        for issue_type in types:
+            self.proofread_type_filter.addItem(issue_type, issue_type)
+        selected_type = self.proofread_type_filter.findData(current_type)
+        self.proofread_type_filter.setCurrentIndex(max(0, selected_type))
+        self.proofread_type_filter.blockSignals(False)
+        if not report:
+            return
+        severity_labels = {"high": "高", "medium": "中", "low": "低"}
+        decision_labels = {"pending": "待处理", "accept": "已采纳", "keep": "保留现译"}
+        for index, entry in enumerate(report["entries"]):
+            row = self.proofread_table.rowCount()
+            self.proofread_table.insertRow(row)
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+            check.setCheckState(Qt.Unchecked)
+            check.setData(Qt.UserRole, index)
+            issue_types = "、".join(sorted({issue["type"] for issue in entry["issues"]}))
+            values = (
+                check,
+                QTableWidgetItem(severity_labels[entry["severity"]]),
+                QTableWidgetItem(entry["code"]),
+                QTableWidgetItem(issue_types),
+                QTableWidgetItem(decision_labels[entry["decision"]]),
+                QTableWidgetItem(entry["translation"].replace("\n", " ")),
+            )
+            for column, item in enumerate(values):
+                if column:
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.proofread_table.setItem(row, column, item)
+        self._filter_proofread_rows()
+        for row in range(self.proofread_table.rowCount()):
+            if not self.proofread_table.isRowHidden(row):
+                self.proofread_table.selectRow(row)
+                break
+
+    def _proofread_entry_at_row(self, row: int) -> dict[str, object] | None:
+        if not self.proofread_report or row < 0:
+            return None
+        item = self.proofread_table.item(row, 0)
+        index = item.data(Qt.UserRole) if item else None
+        entries = self.proofread_report["entries"]
+        return entries[index] if isinstance(index, int) and 0 <= index < len(entries) else None
+
+    def _current_proofread_entry(self) -> dict[str, object] | None:
+        return self._proofread_entry_at_row(self.proofread_table.currentRow())
+
+    def _show_proofread_entry(self) -> None:
+        entry = self._current_proofread_entry()
+        self._proofread_loading = True
+        try:
+            self.proofread_original.setPlainText(entry["original"] if entry else "")
+            self.proofread_current.setPlainText(entry["translation"] if entry else "")
+            self.proofread_suggestion.setPlainText(entry["edited_translation"] if entry else "")
+            if entry:
+                descriptions = []
+                for issue in entry["issues"]:
+                    confidence = round(float(issue["confidence"]) * 100)
+                    descriptions.append(
+                        f"[{issue['severity'].upper()} · {issue['type']} · {confidence}%] "
+                        f"{issue['description']}"
+                        + (f"\n建议：{issue['suggestion']}" if issue["suggestion"] else "")
+                    )
+                if entry["apply_error"]:
+                    descriptions.append("[不可应用] " + entry["apply_error"])
+                self.proofread_issues.setPlainText("\n\n".join(descriptions))
+            else:
+                self.proofread_issues.clear()
+        finally:
+            self._proofread_loading = False
+
+    def _filter_proofread_rows(self) -> None:
+        if not hasattr(self, "proofread_table"):
+            return
+        severity = self.proofread_severity_filter.currentData()
+        issue_type = self.proofread_type_filter.currentData()
+        decision = self.proofread_decision_filter.currentData()
+        needle = self.proofread_search.text().strip().casefold()
+        for row in range(self.proofread_table.rowCount()):
+            entry = self._proofread_entry_at_row(row)
+            types = {issue["type"] for issue in entry["issues"]} if entry else set()
+            haystack = "\n".join(
+                [
+                    entry["key"], entry["code"], entry["original"], entry["translation"],
+                    *(issue["description"] for issue in entry["issues"]),
+                ]
+            ).casefold() if entry else ""
+            hidden = bool(
+                not entry
+                or (severity != "all" and entry["severity"] != severity)
+                or (issue_type != "all" and issue_type not in types)
+                or (decision != "all" and entry["decision"] != decision)
+                or (needle and needle not in haystack)
+            )
+            self.proofread_table.setRowHidden(row, hidden)
+
+    def _update_entry_applicability(self, entry: dict[str, object]) -> None:
+        text = str(entry["edited_translation"])
+        if not text:
+            entry["applicable"] = False
+            entry["apply_error"] = "建议译文为空。"
+            return
+        _, expected = protect_control_tokens(str(entry["translation"]))
+        _, actual = protect_control_tokens(text)
+        entry["applicable"] = actual == expected
+        entry["apply_error"] = "" if actual == expected else "建议译文控制符数量或顺序不一致。"
+
+    def _save_proofread_draft(self) -> None:
+        if self._proofread_loading or not self.proofread_report or not self.proofread_report_path:
+            return
+        entry = self._current_proofread_entry()
+        if not entry:
+            return
+        entry["edited_translation"] = self.proofread_suggestion.toPlainText()
+        self._update_entry_applicability(entry)
+        save_report(self.proofread_report_path, self.proofread_report)
+
+    def _save_proofread_decisions(self) -> None:
+        if not self.proofread_report or not self.proofread_report_path:
+            return
+        save_report(self.proofread_report_path, self.proofread_report)
+        self._populate_proofread_table()
+        self._update_proofread_summary()
+
+    def _decide_current_proofread(self, decision: str) -> None:
+        entry = self._current_proofread_entry()
+        if not entry:
+            return
+        self._update_entry_applicability(entry)
+        if decision == "accept" and not entry["applicable"]:
+            QMessageBox.warning(self, "无法采纳", entry["apply_error"])
+            return
+        entry["decision"] = decision
+        self._save_proofread_decisions()
+
+    def _decide_selected_proofread(self, decision: str) -> None:
+        selected = []
+        for row in range(self.proofread_table.rowCount()):
+            item = self.proofread_table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                selected.append(self._proofread_entry_at_row(row))
+        skipped = 0
+        for entry in filter(None, selected):
+            self._update_entry_applicability(entry)
+            if decision == "accept" and not entry["applicable"]:
+                skipped += 1
+                continue
+            entry["decision"] = decision
+        if selected:
+            self._save_proofread_decisions()
+        if skipped:
+            QMessageBox.warning(self, "部分未处理", f"{skipped} 条建议因控制符不一致未被采纳。")
+
+    def _update_proofread_summary(self) -> None:
+        summary = self.proofread_report["summary"] if self.proofread_report else {}
+        self.proofread_summary.setText(
+            f"受影响 {summary.get('affected', 0)} · 高 {summary.get('high', 0)} · "
+            f"中 {summary.get('medium', 0)} · 低 {summary.get('low', 0)} · "
+            f"已采纳 {summary.get('accepted', 0)} · 失败批次 {summary.get('failed_batches', 0)}"
+        )
+        if self.proofread_report and self.current_manifest_path:
+            manifest = load_manifest(self.current_manifest_path)
+            items_value = manifest.version.stage(Stage.TRANSLATE).artifacts.get("items", "")
+            stale = not items_value or not Path(items_value).is_file() or report_is_stale(
+                self.proofread_report, items_value
+            )
+            self.apply_proofread_button.setEnabled(
+                bool(not stale and summary.get("accepted", 0))
+            )
+
+    def _save_proofread_settings(self) -> None:
+        if self._proofread_loading:
+            return
+        self.settings.proofread_mode = str(self.proofread_mode.currentData())
+        self.settings.proofread_batch_size = self.proofread_batch_size.value()
+        self.settings.proofread_context_lines = self.proofread_context_lines.value()
+        self.settings.proofread_confidence_percent = self.proofread_confidence.value()
+        self.store.save(self.settings)
+
+    def _set_proofread_ui_locked(self, locked: bool) -> None:
+        enabled = not locked
+        for control in (
+            self.settings_button, self.project_combo, self.new_project_button,
+            self.add_version_button, self.one_click, self.step_mode, self.start_button,
+            self.retry_button, self.open_release_button, self.save_glossary_button,
+        ):
+            control.setEnabled(enabled)
+        for button in (*self.step_buttons.values(), *self.step_result_buttons.values()):
+            button.setEnabled(enabled)
+        for index in range(self.tabs.count()):
+            self.tabs.setTabEnabled(index, enabled or index == self.proofread_tab_index)
+        self.proofread_options.setEnabled(True)
+        for control in (
+            self.proofread_mode,
+            self.proofread_batch_size,
+            self.proofread_context_lines,
+            self.proofread_confidence,
+        ):
+            control.setEnabled(enabled)
+        self.start_proofread_button.setEnabled(False)
+        self.rerun_proofread_button.setEnabled(False)
+        self.proofread_table.setEnabled(enabled)
+        self.proofread_suggestion.setEnabled(enabled)
+        for control in (
+            self.proofread_severity_filter, self.proofread_type_filter,
+            self.proofread_decision_filter, self.proofread_search,
+            self.proofread_accept_selected, self.proofread_keep_selected,
+            self.proofread_accept, self.proofread_keep, self.proofread_reset,
+            self.apply_proofread_button, self.restore_ai_translation_button,
+        ):
+            control.setEnabled(enabled)
+        self.stop_proofread_button.setEnabled(locked)
+
+    def _start_proofread(self) -> None:
+        if not self.current_manifest_path or (
+            self.proofread_thread and self.proofread_thread.isRunning()
+        ) or (self.pipeline_thread and self.pipeline_thread.isRunning()):
+            return
+        self._save_proofread_settings()
+        errors = []
+        if not self.settings.ainiee_source or not Path(self.settings.ainiee_source).exists():
+            errors.append("请选择或安装 AiNiee-Next。")
+        key = ""
+        if self.settings.proofread_mode == "rules_ai":
+            if not self.settings.api_base_url.strip() or not self.settings.api_model.strip():
+                errors.append("请填写 AiNiee 翻译 API 基础地址和模型。")
+            try:
+                key = self.store.api_key(self.settings)
+            except Exception:
+                key = ""
+            if not key:
+                errors.append("请填写 AiNiee 翻译 API 密钥。")
+        if errors:
+            QMessageBox.warning(self, "校对设置未完成", "\n".join(errors))
+            return
+        self.proofread_run_result = None
+        self.proofread_thread = ProofreadThread(
+            self.current_manifest_path,
+            self.settings,
+            key,
+            local_data_dir(),
+        )
+        self.proofread_thread.progress_event.connect(self._proofread_progress_event)
+        self.proofread_thread.log_line.connect(self._append_log)
+        self.proofread_thread.succeeded.connect(
+            lambda path: setattr(self, "proofread_run_result", ("success", path))
+        )
+        self.proofread_thread.cancelled.connect(
+            lambda: setattr(self, "proofread_run_result", ("cancelled", ""))
+        )
+        self.proofread_thread.failed.connect(
+            lambda detail: setattr(self, "proofread_run_result", ("failed", detail))
+        )
+        self.proofread_thread.finished.connect(self._proofread_finished)
+        self._set_proofread_ui_locked(True)
+        self.tabs.setCurrentIndex(self.proofread_tab_index)
+        self.proofread_progress.setRange(0, 0)
+        self.proofread_progress.setFormat("正在准备校对…")
+        self.status_label.setText("正在校对")
+        self.proofread_thread.start()
+
+    def _proofread_progress_event(self, event: dict[str, object]) -> None:
+        total = int(event.get("total", 0))
+        current = int(event.get("current", 0))
+        self.proofread_progress.setRange(0, max(1, total))
+        self.proofread_progress.setValue(current)
+        self.proofread_progress.setFormat("正在校对 %v/%m")
+
+    def _stop_proofread(self) -> None:
+        if self.proofread_thread and self.proofread_thread.isRunning():
+            self.proofread_thread.cancel()
+            self.stop_proofread_button.setEnabled(False)
+            self.proofread_progress.setFormat("正在停止…")
+
+    def _proofread_finished(self) -> None:
+        result = self.proofread_run_result or ("failed", "校对线程未返回结果。")
+        self.proofread_thread = None
+        self._set_proofread_ui_locked(False)
+        self._load_project_view()
+        self.tabs.setCurrentIndex(self.proofread_tab_index)
+        if result[0] == "success":
+            self.status_label.setText("校对完成")
+        elif result[0] == "cancelled":
+            self.status_label.setText("校对已停止")
+        else:
+            self.status_label.setText("校对失败")
+            detail = result[1]
+            QMessageBox.critical(
+                self,
+                "校对失败",
+                detail.splitlines()[-1] if detail.splitlines() else detail,
+            )
+
+    def _apply_proofread(self) -> None:
+        if not self.current_manifest_path or not self.proofread_report_path or not self.proofread_report:
+            return
+        if self.proofread_report["failed_batches"]:
+            answer = QMessageBox.warning(
+                self,
+                "报告仅部分完成",
+                f"有 {len(self.proofread_report['failed_batches'])} 个批次未检查。仍要应用已采纳修改吗？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            pipeline = Pipeline(
+                self.current_manifest_path,
+                self.settings,
+                "",
+                local_data_dir(),
+                glossary_api_key="",
+            )
+            output = pipeline.apply_proofread(self.proofread_report_path)
+            self.status_label.setText(f"已应用校对：{output.name}")
+            self._load_project_view()
+            self.tabs.setCurrentIndex(self.proofread_tab_index)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法应用校对", str(exc))
+
+    def _restore_ai_translation(self) -> None:
+        if not self.current_manifest_path:
+            return
+        answer = QMessageBox.question(
+            self,
+            "恢复 AI 原译",
+            "将取消当前校对版本，并把校验、导入和发布重置为待完成。继续吗？",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            pipeline = Pipeline(
+                self.current_manifest_path,
+                self.settings,
+                "",
+                local_data_dir(),
+                glossary_api_key="",
+            )
+            pipeline.restore_ai_translation()
+            self.status_label.setText("已恢复 AI 原译")
+            self._load_project_view()
+            self.tabs.setCurrentIndex(self.proofread_tab_index)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法恢复", str(exc))
+
+    def _open_proofread_report(self) -> None:
+        if self.proofread_report_path and self.proofread_report_path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.proofread_report_path)))
+
+    def _open_proofread_log(self) -> None:
+        if not self.current_manifest_path:
+            return
+        manifest = load_manifest(self.current_manifest_path)
+        _, path = proofread_paths(self.current_manifest_path, manifest)
+        if path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _new_project(self) -> None:
         if self.pipeline_thread and self.pipeline_thread.isRunning():
@@ -2474,7 +3198,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(locked)
 
     def _start(self, stage: Stage | None = None, *, switch_to_step: bool = True) -> None:
-        if not self.current_manifest_path or (self.pipeline_thread and self.pipeline_thread.isRunning()):
+        if (
+            not self.current_manifest_path
+            or (self.pipeline_thread and self.pipeline_thread.isRunning())
+            or (self.proofread_thread and self.proofread_thread.isRunning())
+        ):
             return
         errors = validate_settings(self.settings) if stage is None else []
         if stage is Stage.EXTRACT:
@@ -2696,6 +3424,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "发布目录", "当前版本尚未发布。")
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.proofread_thread and self.proofread_thread.isRunning():
+            if QMessageBox.question(self, "退出", "校对仍在运行，停止并退出？") != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.proofread_thread.cancel()
+            self.proofread_thread.wait(5000)
+            if self.proofread_thread.isRunning():
+                QMessageBox.warning(self, "仍在停止", "校对子进程尚未完全退出，请稍后再次关闭窗口。")
+                event.ignore()
+                return
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             if QMessageBox.question(self, "退出", "任务仍在运行，停止并退出？") != QMessageBox.Yes:
                 event.ignore()
@@ -2729,6 +3467,9 @@ QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTableWidget {
     selection-background-color: #dceae0; selection-color: #18211b;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus { border: 1px solid #267247; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QPlainTextEdit:disabled, QTableWidget:disabled {
+    color: #9aa49d; background: #edf0ed; border-color: #d8ddd9;
+}
 QPushButton, QToolButton {
     background: #ffffff; border: 1px solid #c5cec7; border-radius: 6px; padding: 7px 12px; min-height: 20px;
 }
@@ -2736,6 +3477,10 @@ QPushButton:hover, QToolButton:hover { background: #eef3ef; border-color: #91a39
 QPushButton:pressed, QToolButton:pressed { background: #e2eae4; }
 QPushButton:disabled, QToolButton:disabled { color: #9aa49d; background: #edf0ed; }
 QPushButton#primaryButton { background: #246b43; color: white; border-color: #246b43; font-weight: 600; }
+QToolButton#primaryButton { background: #246b43; color: white; border-color: #246b43; }
+QPushButton#primaryButton:disabled, QToolButton#primaryButton:disabled {
+    color: #9aa49d; background: #edf0ed; border-color: #c5cec7;
+}
 QPushButton#primaryButton:hover { background: #1d5b38; }
 QPushButton#segment { border-radius: 0; min-width: 48px; }
 QPushButton#segment:checked { background: #dceae0; border-color: #5d8d6f; color: #17482d; }

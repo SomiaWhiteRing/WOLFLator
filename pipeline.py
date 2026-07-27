@@ -52,6 +52,7 @@ from models import (
 )
 from safe_io import (
     atomic_output_path,
+    atomic_write_bytes,
     atomic_write_json,
     project_lock,
     read_text_with_retry,
@@ -66,6 +67,7 @@ from wolf_editor import (
     export_and_analyze,
     inspect_wolf_editor,
 )
+from proofread import accepted_translations, load_report
 from wolf_analysis import load_program_cache, write_program_cache
 from wolf_tools import (
     CancelledError,
@@ -84,6 +86,7 @@ from wolf_tools import (
     locate_workbook,
     merge_ainiee_output,
     name_baseline_scope,
+    normalize_import_display_middle_dots,
     official_dialogs_indicate_legacy_game,
     prepare_official_tool,
     prepare_uberwolf,
@@ -104,7 +107,7 @@ from wolf_tools import (
 )
 
 
-EXPORT_SCHEMA = 4
+EXPORT_SCHEMA = 5
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -509,6 +512,66 @@ class Pipeline:
                 record.error = ""
             self.save()
 
+    def apply_proofread(self, report_path: str | Path) -> Path:
+        with self._mutation("apply-proofread"):
+            translate = self.manifest.version.stage(Stage.TRANSLATE)
+            if translate.status is not StageStatus.COMPLETED:
+                raise RuntimeError("AI 翻译尚未完成，不能应用校对结果。")
+            current_value = translate.artifacts.get("items", "")
+            current = Path(current_value)
+            if not current_value or not current.is_file():
+                raise FileNotFoundError("当前翻译产物不存在。")
+            report = load_report(report_path)
+            items = load_items(current)
+            changes = accepted_translations(
+                report,
+                items,
+                source_sha256=sha256_file(current),
+            )
+            for item in items:
+                if item.key in changes:
+                    item.translation = changes[item.key]
+            output_path = self.artifacts_dir / "items-proofread.json"
+            rollback = (
+                output_path.read_bytes()
+                if output_path.is_file() and current.resolve() == output_path.resolve()
+                else None
+            )
+            try:
+                output = dump_items(output_path, items)
+                translate.artifacts.setdefault("items_ai_translation", current_value)
+                translate.artifacts["items"] = str(output)
+                translate.artifacts["items_proofread"] = str(output)
+                translate.artifacts["proofread_report"] = str(Path(report_path).resolve())
+                self._reset_after_proofread()
+                self.save()
+                return output
+            except Exception:
+                if rollback is not None:
+                    atomic_write_bytes(output_path, rollback)
+                raise
+
+    def restore_ai_translation(self) -> Path:
+        with self._mutation("restore-ai-translation"):
+            translate = self.manifest.version.stage(Stage.TRANSLATE)
+            original_value = translate.artifacts.get("items_ai_translation", "")
+            original = Path(original_value)
+            if not original_value or not original.is_file():
+                raise RuntimeError("当前使用的就是 AI 原译。")
+            translate.artifacts["items"] = original_value
+            translate.artifacts.pop("items_proofread", None)
+            translate.artifacts.pop("proofread_report", None)
+            translate.artifacts.pop("items_ai_translation", None)
+            self._reset_after_proofread()
+            self.save()
+            return original
+
+    def _reset_after_proofread(self) -> None:
+        for stage in (Stage.VALIDATE, Stage.IMPORT, Stage.RELEASE):
+            record = self.manifest.version.stage(stage)
+            record.status = StageStatus.PENDING
+            record.error = ""
+
     def _safe_remove(self, path: Path) -> None:
         resolved = path.resolve()
         if os.path.commonpath([str(self.project_dir), str(resolved)]) != str(self.project_dir):
@@ -576,6 +639,7 @@ class Pipeline:
         elif stage is Stage.IMPORT:
             extra["import_scope"] = self.manifest.import_scope.__dict__
             extra["import_protection"] = self.manifest.import_protection.__dict__
+            extra["import_protection_schema"] = IMPORT_PROTECTION_SCHEMA
         elif stage is Stage.RELEASE:
             scheme = load_font_scheme(self.project_dir)
             extra["font_scheme"] = scheme_hash(scheme)
@@ -589,6 +653,7 @@ class Pipeline:
                 ]
                 items_path = self.manifest.version.stage(Stage.VALIDATE).artifacts.get("items", "")
                 if items_path and Path(items_path).is_file():
+                    font_items = load_items(items_path)
                     protection_path = self.manifest.version.stage(
                         Stage.IMPORT
                     ).artifacts.get("import_protection", "")
@@ -601,8 +666,18 @@ class Pipeline:
                             protected_keys = set(
                                 map(str, protection.get("protected_keys", ()))
                             )
+                            normalize_import_display_middle_dots(
+                                font_items,
+                                self.manifest.import_scope,
+                                allow_copy_condition_groups=(
+                                    self.manifest.import_protection.allow_copy_condition_groups
+                                ),
+                                eligible_keys=set(
+                                    map(str, protection.get("middle_dot_normalized", ()))
+                                ),
+                            )
                     corpus = imported_display_texts(
-                        load_items(items_path),
+                        font_items,
                         self.manifest.import_scope,
                         allow_copy_condition_groups=(
                             self.manifest.import_protection.allow_copy_condition_groups
@@ -1267,6 +1342,11 @@ class Pipeline:
         full = self.manifest.version.stage(Stage.VALIDATE).artifacts["full_workbook"]
         items = load_items(self.manifest.version.stage(Stage.VALIDATE).artifacts["items"])
         rules = self.manifest.import_protection
+        normalized_candidates = normalize_import_display_middle_dots(
+            items,
+            self.manifest.import_scope,
+            allow_copy_condition_groups=rules.allow_copy_condition_groups,
+        )
         logic_analysis = self._editor_analysis(items)
         logic_safety = self._translation_safety(items)
         protection = analyze_import_protection(
@@ -1284,6 +1364,9 @@ class Pipeline:
             allow_copy_condition_groups=rules.allow_copy_condition_groups,
         )
         required = {key: value for key, value in required.items() if key not in protected_keys}
+        normalized_keys = normalized_candidates & set(required)
+        protection["middle_dot_normalized"] = sorted(normalized_keys)
+        protection["summary"]["middle_dot_normalized"] = len(normalized_keys)
         missing = [item for item in items if item.key in required and not item.translation]
         if missing:
             sample = "、".join(item.original[:30] for item in missing[:3])
@@ -1316,6 +1399,7 @@ class Pipeline:
             f"语义等价 {summary.get('logic_semantic_equivalence', 0)} 组，"
             f"未证明 {summary.get('logic_not_proven', 0)} 组，"
             f"未知逻辑语义 {summary.get('unknown_logic_semantics', 0)} 类，"
+            f"中点转换 {summary.get('middle_dot_normalized', 0)} 组，"
             f"放行 {summary['atomic_groups']} 个 COPY-FROM 条件/混合范围组。"
         )
         for entry in protection["entries"]:
@@ -1626,6 +1710,16 @@ class Pipeline:
             or dict(protection.get("structural_diff", {})).get("status") != "passed"
         ):
             raise RuntimeError("导入保护报告未通过官方 Editor 回读验证。")
+        normalize_import_display_middle_dots(
+            validated_items,
+            self.manifest.import_scope,
+            allow_copy_condition_groups=(
+                self.manifest.import_protection.allow_copy_condition_groups
+            ),
+            eligible_keys=set(
+                map(str, protection.get("middle_dot_normalized", ()))
+            ),
+        )
         required = required_characters(
             imported_display_texts(
                 validated_items,

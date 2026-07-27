@@ -181,7 +181,7 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(0, cli.main(["scope", str(manifest), "--external"]))
             loaded = cli.load_manifest(manifest)
             self.assertTrue(loaded.import_scope.external)
-            self.assertFalse(loaded.translation_scope.external)
+            self.assertTrue(loaded.translation_scope.external)
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     0,

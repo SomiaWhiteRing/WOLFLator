@@ -52,7 +52,7 @@ SUPPORT_DIR = "WOLF_Translation_Support_Tool_Data"
 WORKBOOK_NAME = "WOLF_Translation_Text.xlsx"
 GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
 ITEMS_SCHEMA = 1
-IMPORT_PROTECTION_SCHEMA = 6
+IMPORT_PROTECTION_SCHEMA = 7
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
@@ -77,7 +77,7 @@ def name_baseline_scope(scope: ImportScope | None = None) -> ImportScope:
     source = scope or full_export_scope()
     return ImportScope(
         display=source.display,
-        external=False,
+        external=source.external,
         optional_name=False,
         halfwidth=source.halfwidth,
         filename=source.filename,
@@ -619,6 +619,7 @@ def run_process(
     capture_console: bool = False,
     slow_warning_after: float | None = None,
     slow_warning: Callable[[float], None] | None = None,
+    output_line: Callable[[str, str], None] | None = None,
 ) -> ToolResult:
     if capture_console and os.name != "nt":
         raise ValueError("控制台捕获仅支持 Windows。")
@@ -765,6 +766,8 @@ def run_process(
                 finished_streams.add(name)
                 continue
             captured[name].append(line)
+            if output_line is not None:
+                output_line(name, line)
             _emit_log(detail, f"process.{name} pid={process.pid} {line}")
     finally:
         if process.poll() is None:
@@ -1172,8 +1175,8 @@ def _iter_data_rows(worksheet) -> Iterable[tuple[int, dict[str, str], int]]:
         yield row_index, values, counts[identity]
 
 
-def _scan_control_tokens(text: str) -> list[str]:
-    tokens: list[str] = []
+def _scan_control_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
     index = 0
     while index < len(text):
         if text[index] != "\\":
@@ -1182,7 +1185,7 @@ def _scan_control_tokens(text: str) -> list[str]:
         start = index
         index += 1
         if index >= len(text):
-            tokens.append("\\")
+            spans.append((start, index))
             break
         char = text[index]
         if char in SPECIAL_ESCAPES:
@@ -1207,29 +1210,101 @@ def _scan_control_tokens(text: str) -> list[str]:
         else:
             # ponytail: Unknown backslash forms protect only the slash; upgrade the scanner if WOLF documents more syntax.
             index = start + 1
-        tokens.append(text[start:index])
-    return tokens
+        spans.append((start, index))
+    return spans
 
 
-def protect_control_tokens(text: str) -> tuple[str, list[str]]:
-    tokens = _scan_control_tokens(text)
-    if not tokens:
+def _scan_control_tokens(text: str) -> list[str]:
+    return [text[start:end] for start, end in _scan_control_spans(text)]
+
+
+_EXTERNAL_DISPLAY_COMMAND_RE = re.compile(r"^[ \t]*@(?:文章|連続文章|タイトルコール)(?:[：:].*)?$")
+
+
+def _external_script_control_spans(text: str) -> list[tuple[int, int]]:
+    lines = list(re.finditer(r".*?(?:\r\n|\n|\r|$)", text))
+    if not any(
+        _EXTERNAL_DISPLAY_COMMAND_RE.match(match.group(0).rstrip("\r\n"))
+        for match in lines
+    ):
+        return []
+
+    first = next(
+        (match.group(0).rstrip("\r\n").strip() for match in lines if match.group(0).strip()),
+        "",
+    )
+    display_payload = not first.startswith(("@", "●", "-", "//"))
+    spans: list[tuple[int, int]] = []
+    for match in lines:
+        line = match.group(0)
+        if not line:
+            continue
+        content = line.rstrip("\r\n")
+        stripped = content.strip()
+        line_end = match.start() + len(content)
+        if stripped.startswith("@"):
+            spans.append((match.start(), match.end()))
+            display_payload = bool(_EXTERNAL_DISPLAY_COMMAND_RE.match(content))
+        elif stripped.startswith("●") or (stripped and set(stripped) == {"-"}):
+            spans.append((match.start(), match.end()))
+            display_payload = False
+        elif stripped.startswith("//") or not display_payload:
+            spans.append((match.start(), match.end()))
+        elif line_end < match.end():
+            spans.append((line_end, match.end()))
+
+    # ponytail: This recognizes the observed line-oriented WOLF script dialect.
+    # Register a dialect parser if an external format needs different payload rules.
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _item_control_spans(item: TranslationItem, text: str) -> list[tuple[int, int]]:
+    structural = (
+        _external_script_control_spans(text)
+        if _content_category(item.code, item.flag, item.type) is ImportCategory.EXTERNAL
+        else []
+    )
+    controls = [
+        span
+        for span in _scan_control_spans(text)
+        if not any(span[0] < end and start < span[1] for start, end in structural)
+    ]
+    return sorted((*structural, *controls))
+
+
+def _protect_spans(text: str, spans: list[tuple[int, int]]) -> tuple[str, list[str]]:
+    if not spans:
         return text, []
-    cursor = 0
     output: list[str] = []
-    for offset, token in enumerate(tokens):
+    tokens: list[str] = []
+    cursor = 0
+    for offset, (start, end) in enumerate(spans):
         codepoint = PUA_START + offset
         if codepoint > PUA_END:
             raise ValueError("单条文本的控制符数量超过占位符容量。")
-        start = text.find(token, cursor)
         output.append(text[cursor:start])
         output.append(chr(codepoint))
-        cursor = start + len(token)
+        tokens.append(text[start:end])
+        cursor = end
     output.append(text[cursor:])
     return "".join(output), tokens
 
 
-def restore_control_tokens(text: str, tokens: list[str]) -> str:
+def protect_control_tokens(text: str) -> tuple[str, list[str]]:
+    return _protect_spans(text, _scan_control_spans(text))
+
+
+def _protect_item_tokens(item: TranslationItem, text: str) -> tuple[str, list[str]]:
+    return _protect_spans(text, _item_control_spans(item, text))
+
+
+def _restore_tokens(text: str, tokens: list[str]) -> str:
     expected = [chr(PUA_START + index) for index in range(len(tokens))]
     actual = [char for char in text if PUA_START <= ord(char) <= PUA_END]
     if actual != expected:
@@ -1241,7 +1316,22 @@ def restore_control_tokens(text: str, tokens: list[str]) -> str:
     restored = text
     for placeholder, token in zip(expected, tokens):
         restored = restored.replace(placeholder, token, 1)
+    return restored
+
+
+def restore_control_tokens(text: str, tokens: list[str]) -> str:
+    restored = _restore_tokens(text, tokens)
     if _scan_control_tokens(restored) != tokens:
+        raise ValueError("译文控制符序列与原文不一致。")
+    return restored
+
+
+def _restore_item_tokens(item: TranslationItem, text: str) -> str:
+    tokens = [item.original[start:end] for start, end in _item_control_spans(item, item.original)]
+    restored = _restore_tokens(text, tokens)
+    if [restored[start:end] for start, end in _item_control_spans(item, restored)] != tokens:
+        raise ValueError("译文脚本结构与原文不一致。")
+    if _scan_control_tokens(restored) != item.control_signature:
         raise ValueError("译文控制符序列与原文不一致。")
     return restored
 
@@ -1311,6 +1401,9 @@ def classify_optional_name_delta(
     optional_count = 0
     for item, identity in zip(full_items, full_identities):
         if identity not in baseline_set:
+            category = item.copy_category if item.category is ImportCategory.COPY else item.category
+            if category is ImportCategory.EXTERNAL:
+                continue
             if item.category is ImportCategory.COPY:
                 item.copy_category = ImportCategory.OPTIONAL_NAME
             else:
@@ -1411,12 +1504,12 @@ def to_paratranz(
         scope,
         allow_copy_condition_groups=allow_copy_condition_groups,
     ):
-        protected, tokens = protect_control_tokens(item.original)
-        if tokens != item.control_signature:
+        protected, tokens = _protect_item_tokens(item, item.original)
+        if _scan_control_tokens(item.original) != item.control_signature:
             raise ValueError(f"控制符签名发生变化: {item.code}")
         translation = ""
         if item.translation:
-            protected_translation, translated_tokens = protect_control_tokens(item.translation)
+            protected_translation, translated_tokens = _protect_item_tokens(item, item.translation)
             if translated_tokens == tokens:
                 translation = protected_translation
         output.append(
@@ -1448,15 +1541,15 @@ def _validated_ainiee_translation(
     row: dict[str, object],
 ) -> str:
     if row.get("wolflator_excluded") is True:
-        protected, tokens = protect_control_tokens(item.original)
-        if str(row.get("translation", "")) != protected or tokens != item.control_signature:
+        protected, _tokens = _protect_item_tokens(item, item.original)
+        if str(row.get("translation", "")) != protected:
             raise ValueError(f"AiNiee 排除项不能安全原样回填: {item.code}")
         return item.original
     raw = str(row.get("translation", ""))
     if not raw.strip():
         raise ValueError(f"AiNiee 没有生成译文: {item.code} / {item.original[:80]}")
     try:
-        return restore_control_tokens(raw, item.control_signature)
+        return _restore_item_tokens(item, raw)
     except ValueError as exc:
         raise ValueError(f"AiNiee 译文控制符校验失败: {item.code}: {exc}") from exc
 
@@ -1515,14 +1608,49 @@ def merge_ainiee_output(
     for key, item in expected.items():
         item.translation = _validated_ainiee_translation(item, actual[key])
         item.stage = 1
-    usage_categories = selected_translation_requirements(items, full_export_scope())
-    unsafe_categories = {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}
     for item in items:
         if item.category is ImportCategory.COPY:
             item.translation = ""
-        elif item.translation and not (usage_categories.get(item.key, set()) & unsafe_categories):
-            item.translation = item.translation.replace("・", "·")
     return items
+
+
+def normalize_import_display_middle_dots(
+    items: list[TranslationItem],
+    scope: ImportScope,
+    *,
+    allow_copy_condition_groups: bool = False,
+    eligible_keys: set[str] | None = None,
+) -> set[str]:
+    requirements = selected_translation_requirements(
+        items,
+        scope,
+        allow_copy_condition_groups=allow_copy_condition_groups,
+    )
+    eligible = (
+        set(requirements)
+        if eligible_keys is None
+        else set(requirements) & eligible_keys
+    )
+    unsafe = {
+        ImportCategory.EXTERNAL,
+        ImportCategory.FILENAME,
+        ImportCategory.HALFWIDTH,
+    }
+    changed: set[str] = set()
+    for item in items:
+        categories = requirements.get(item.key, set())
+        if (
+            item.key not in eligible
+            or ImportCategory.DISPLAY not in categories
+            or categories & unsafe
+            or not item.translation
+        ):
+            continue
+        normalized = item.translation.replace("・", "·")
+        if normalized != item.translation:
+            item.translation = normalized
+            changed.add(item.key)
+    return changed
 
 
 def reconcile_incremental(

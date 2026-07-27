@@ -88,6 +88,10 @@ def default_export_scope() -> ImportScope:
     return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
 
 
+def default_processing_scope() -> ImportScope:
+    return ImportScope(display=True, external=True)
+
+
 def legacy_export_scope() -> ImportScope:
     return ImportScope(display=True, external=False, optional_name=True, halfwidth=True, filename=True)
 
@@ -123,6 +127,10 @@ class AppSettings:
     translation_line_limit: int = 8
     translation_retry_min_lines: int = 1
     translation_rounds: int = 6
+    proofread_mode: str = "rules_ai"
+    proofread_batch_size: int = 20
+    proofread_context_lines: int = 5
+    proofread_confidence_percent: int = 70
     glossary_api_base_url: str = ""
     glossary_api_model: str = ""
     glossary_api_key_blob: str = ""
@@ -225,8 +233,8 @@ class ProjectManifest:
     export_scope: ImportScope = field(default_factory=default_export_scope)
     exclude_large_external_files: bool = True
     external_file_limit_kb: int = DEFAULT_EXTERNAL_FILE_LIMIT_KB
-    translation_scope: ImportScope = field(default_factory=ImportScope)
-    import_scope: ImportScope = field(default_factory=ImportScope)
+    translation_scope: ImportScope = field(default_factory=default_processing_scope)
+    import_scope: ImportScope = field(default_factory=default_processing_scope)
     import_protection: ImportProtectionRules = field(default_factory=ImportProtectionRules)
     versions: dict[str, VersionManifest] = field(default_factory=dict)
 

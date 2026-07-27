@@ -191,6 +191,14 @@ def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
         errors.append("重试最小批次必须在 1 到每批翻译条目之间。")
     if not 1 <= item.translation_rounds <= 20:
         errors.append("翻译最大轮次必须在 1 到 20 之间。")
+    if item.proofread_mode not in {"rules", "rules_ai"}:
+        errors.append("校对方式必须是基础规则或基础规则 + AI。")
+    if not 1 <= item.proofread_batch_size <= 100:
+        errors.append("校对批次大小必须在 1 到 100 之间。")
+    if not 0 <= item.proofread_context_lines <= 20:
+        errors.append("校对上下文行数必须在 0 到 20 之间。")
+    if not 0 <= item.proofread_confidence_percent <= 100:
+        errors.append("校对置信度阈值必须在 0% 到 100% 之间。")
     if not item.license_accepted:
         errors.append("请确认 FreeGames 工具许可范围。")
     runner = Path(item.ascii_runner_dir)

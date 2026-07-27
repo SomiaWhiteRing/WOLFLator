@@ -8,6 +8,7 @@ datas = [
     (str(root / "vendor" / "manifest.json"), "vendor"),
     (str(root / "vendor" / "licenses"), "vendor/licenses"),
     (str(root / "vendor" / "fonts"), "vendor/fonts"),
+    (str(root / "ainiee_proofread_worker.py"), "."),
     (str(root / "LICENSE"), "."),
     (str(root / "THIRD_PARTY_NOTICES.md"), "."),
 ]
