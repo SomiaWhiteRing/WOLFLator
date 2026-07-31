@@ -23,6 +23,7 @@ from typing import Callable, Iterable, Iterator
 from openpyxl import load_workbook
 
 from fonts import FONT_CODES
+from formats import ARTIFACT_EPOCH, require_format
 from models import (
     MAX_EXTERNAL_FILE_LIMIT_KB,
     ImportCategory,
@@ -38,7 +39,7 @@ from safe_io import (
     read_text_with_retry,
     replace_with_retry,
 )
-from wolf_analysis import AUTO_ANALYSIS_SCHEMA, TRANSLATION_SAFETY_SCHEMA
+from wolf_analysis import ANALYSIS_ENGINE, validate_editor_analysis
 
 
 CODE_HEADER = "Code (No Change)"
@@ -51,8 +52,6 @@ EXPECTED_TARGET = "Chinese (Simplified)"
 SUPPORT_DIR = "WOLF_Translation_Support_Tool_Data"
 WORKBOOK_NAME = "WOLF_Translation_Text.xlsx"
 GAME_CONFIG_NAME = "WOLF_Translation_Game_Config.ini"
-ITEMS_SCHEMA = 1
-IMPORT_PROTECTION_SCHEMA = 8
 PUA_START = 0xE100
 PUA_END = 0xF7FF
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
@@ -1994,7 +1993,7 @@ def analyze_import_protection(
     unresolved_scope_entries: list[dict[str, object]] = []
     proven_safe: set[str] = set()
     if logic_safety is not None:
-        if logic_safety.get("schema") != TRANSLATION_SAFETY_SCHEMA:
+        if logic_safety.get("engine") != ANALYSIS_ENGINE:
             raise ValueError("WOLF 候选译文安全报告格式错误。")
         safe_values = logic_safety.get("safe_to_translate")
         if not isinstance(safe_values, list):
@@ -2120,14 +2119,7 @@ def analyze_import_protection(
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references and logic_safety is not None:
-        if (
-            not isinstance(logic_analysis, dict)
-            or logic_analysis.get("schema") != AUTO_ANALYSIS_SCHEMA
-        ):
-            raise ValueError(
-                f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} "
-                "Editor 分析报告，请重新执行导出文本。"
-            )
+        validate_editor_analysis(logic_analysis)
         keep_values = logic_safety.get("keep_original")
         safety_reasons = logic_safety.get("reasons")
         if not isinstance(keep_values, list) or not isinstance(safety_reasons, dict):
@@ -2170,14 +2162,7 @@ def analyze_import_protection(
                 "WOLF 静态安全分析需要保留风险原文，严格模式已阻止导入。"
             )
     elif rules.protect_logic_references:
-        if (
-            not isinstance(logic_analysis, dict)
-            or logic_analysis.get("schema") != AUTO_ANALYSIS_SCHEMA
-        ):
-            raise ValueError(
-                f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} "
-                "Editor 分析报告，请重新执行导出文本。"
-            )
+        validate_editor_analysis(logic_analysis)
         dependencies = logic_analysis.get("dependencies")
         blocking_issues = logic_analysis.get("blocking_issues")
         if not isinstance(dependencies, list) or not isinstance(blocking_issues, list):
@@ -2412,7 +2397,8 @@ def analyze_import_protection(
     action_order = {"keep_original": 0, "warn": 1, "atomic_translate": 2}
     entries.sort(key=lambda entry: (action_order[entry["action"]], entry["code"], entry["original"]))
     return {
-        "schema": IMPORT_PROTECTION_SCHEMA,
+        "kind": "import-protection",
+        "epoch": ARTIFACT_EPOCH,
         "protected_keys": sorted(protected),
         "safe_to_translate": sorted((set(requirements) & proven_safe) - protected),
         "keep_original": sorted(protected),
@@ -2522,42 +2508,61 @@ def analyze_import_protection(
     }
 
 
-def final_display_texts(
-    items: list[TranslationItem],
-    scope: ImportScope,
-    *,
-    allow_copy_condition_groups: bool = False,
-    protected_keys: set[str] | None = None,
-) -> list[str]:
-    requirements = selected_translation_requirements(
-        items,
-        scope,
-        allow_copy_condition_groups=allow_copy_condition_groups,
+def validate_import_protection(value: object) -> dict[str, object]:
+    report = require_format(
+        value,
+        kind="import-protection",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="导入保护报告",
     )
-    requirements = {
-        key: categories
-        for key, categories in requirements.items()
-        if key not in (protected_keys or set())
+    expected = {
+        "kind",
+        "epoch",
+        "protected_keys",
+        "safe_to_translate",
+        "keep_original",
+        "translation_overrides",
+        "approvals",
+        "unresolved_scopes",
+        "translated_replay",
+        "structural_diff",
+        "entries",
+        "summary",
+        "middle_dot_normalized",
     }
-    by_code: dict[str, list[TranslationItem]] = {}
-    for item in items:
-        by_code.setdefault(item.code, []).append(item)
-    result: list[str] = []
-    for item in items:
-        if is_font_setting(item):
-            continue
-        intrinsic = _content_category(item.code, item.flag, item.type)
-        if intrinsic in {ImportCategory.FILENAME, ImportCategory.HALFWIDTH}:
-            continue
-        if item.category is ImportCategory.COPY:
-            source = _copy_source(item, by_code)
-            text = source.translation if source.key in requirements and source.translation else item.original
-        else:
-            text = item.translation if item.key in requirements and item.translation else item.original
-        for token in _scan_control_tokens(text):
-            text = text.replace(token, "")
-        result.append(text)
-    return result
+    if set(report) != expected:
+        raise ValueError("导入保护报告字段不匹配。")
+    if not all(
+        isinstance(report[name], list)
+        for name in (
+            "protected_keys",
+            "safe_to_translate",
+            "keep_original",
+            "unresolved_scopes",
+            "entries",
+            "middle_dot_normalized",
+        )
+    ) or not all(
+        isinstance(report[name], dict)
+        for name in (
+            "translation_overrides",
+            "approvals",
+            "translated_replay",
+            "structural_diff",
+            "summary",
+        )
+    ):
+        raise ValueError("导入保护报告字段类型不匹配。")
+    return report
+
+
+def load_import_protection(path: str | Path) -> dict[str, object]:
+    try:
+        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("导入保护报告损坏。") from exc
+    return validate_import_protection(value)
 
 
 def imported_display_texts(
@@ -2700,17 +2705,26 @@ def dump_items(path: str | Path, items: list[TranslationItem]) -> Path:
     output = Path(path)
     atomic_write_json(
         output,
-        {"schema": ITEMS_SCHEMA, "items": [item.to_dict() for item in items]},
+        {
+            "kind": "translation-items",
+            "epoch": ARTIFACT_EPOCH,
+            "items": [item.to_dict() for item in items],
+        },
     )
     return output
 
 
 def load_items(path: str | Path) -> list[TranslationItem]:
     data = json.loads(read_text_with_retry(path, encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) != {"schema", "items"}:
+    if not isinstance(data, dict) or set(data) != {"kind", "epoch", "items"}:
         raise ValueError("翻译条目文件结构不匹配。")
-    if data["schema"] != ITEMS_SCHEMA:
-        raise ValueError(f"不支持的翻译条目 schema: {data['schema']}")
+    require_format(
+        data,
+        kind="translation-items",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="翻译条目文件",
+    )
     if not isinstance(data["items"], list):
         raise ValueError("翻译条目 items 不是数组。")
     return [TranslationItem.from_dict(item) for item in data["items"]]

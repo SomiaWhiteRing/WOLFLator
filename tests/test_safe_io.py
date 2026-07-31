@@ -8,8 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from models import AppSettings, RunMode
-from pipeline import Pipeline, create_project, load_manifest
+from models import AppSettings
 from safe_io import (
     ProjectBusyError,
     RuntimeBusyError,
@@ -20,13 +19,6 @@ from safe_io import (
     replace_with_retry,
     runtime_lock,
 )
-
-
-def make_game(root: Path) -> Path:
-    root.mkdir(parents=True)
-    (root / "Game.exe").write_bytes(b"game")
-    (root / "Data.wolf").write_bytes(b"data")
-    return root
 
 
 class SafeIoTests(unittest.TestCase):
@@ -125,17 +117,6 @@ class SafeIoTests(unittest.TestCase):
                 process.stdout.close()
             with project_lock(root, "after-exit"):
                 self.assertTrue(project_lock_status(root)[0])
-
-    def test_pipeline_save_ignores_and_cleans_legacy_temporary(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            legacy = manifest_path.with_name("project.json.tmp")
-            legacy.write_text('{"run_mode":"corrupt"}', encoding="utf-8")
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            pipeline.set_run_mode(RunMode.STEP)
-            self.assertFalse(legacy.exists())
-            self.assertIs(RunMode.STEP, load_manifest(manifest_path).run_mode)
 
     def test_runtime_lock_blocks_before_translation_state_is_touched(self):
         with tempfile.TemporaryDirectory() as directory:

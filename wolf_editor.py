@@ -23,6 +23,7 @@ from html.parser import HTMLParser
 from pathlib import Path, PurePath
 from typing import Callable, Iterable, Iterator
 
+from formats import ARTIFACT_EPOCH, require_format
 from models import TranslationItem
 from safe_io import (
     ResourceBusyError,
@@ -33,14 +34,12 @@ from safe_io import (
     replace_with_retry,
 )
 from wolf_command_catalog import (
-    CATALOG_SCHEMA,
     VERIFIED_EDITOR_VERSION,
     command_semantics,
 )
 from wolf_analysis import (
     ANALYSIS_ENGINE,
-    AUTO_ANALYSIS_SCHEMA,
-    TRANSLATION_SAFETY_SCHEMA,
+    validate_editor_analysis,
 )
 from wolf_tools import (
     COPY_FROM_RE,
@@ -668,7 +667,27 @@ def _validate_managed_editor(root: Path, release: EditorRelease | None = None) -
     metadata_path = root / "wolflator-package.json"
     if not metadata_path.is_file():
         raise ValueError("WOLF RPG Editor 托管包缺少安装元数据。")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = require_format(
+        json.loads(metadata_path.read_text(encoding="utf-8")),
+        kind="editor-package",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="WOLF RPG Editor 托管包元数据",
+    )
+    expected_fields = {
+        "kind",
+        "epoch",
+        "version",
+        "source_url",
+        "archive_size",
+        "archive_sha256",
+        "editor_sha256",
+        "installed_at",
+    }
+    if set(metadata) != expected_fields or not isinstance(metadata["archive_size"], int) or not isinstance(
+        metadata["installed_at"], (int, float)
+    ):
+        raise ValueError("WOLF RPG Editor 托管包元数据字段不匹配。")
     try:
         version = str(metadata["version"])
         source_url = str(metadata["source_url"])
@@ -734,6 +753,8 @@ def install_supported_editor(
             atomic_write_json(
                 staging / "wolflator-package.json",
                 {
+                    "kind": "editor-package",
+                    "epoch": ARTIFACT_EPOCH,
                     "version": release.version,
                     "source_url": release.url,
                     "archive_size": archive_size,
@@ -790,7 +811,31 @@ def _matching_editor_runtime(
     metadata_path = final / "wolflator-runtime.json"
     with package_lock(cache, "install-wolf-runtime"):
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = require_format(
+                json.loads(metadata_path.read_text(encoding="utf-8")),
+                kind="editor-runtime",
+                version_key="epoch",
+                version=ARTIFACT_EPOCH,
+                label="Editor 运行时元数据",
+            )
+            if set(metadata) != {
+                "kind",
+                "epoch",
+                "source_url",
+                "archive_size",
+                "archive_sha256",
+                "editor_version",
+                "game_sha256",
+            } or type(metadata["archive_size"]) is not int or any(
+                not isinstance(metadata[name], str)
+                for name in (
+                    "source_url",
+                    "archive_sha256",
+                    "editor_version",
+                    "game_sha256",
+                )
+            ):
+                raise ValueError("Editor 运行时元数据字段不匹配。")
             runtime = final / "Game.exe"
             runtime_sha256 = _inspect_matching_runtime(runtime, editor)
             if (
@@ -834,7 +879,8 @@ def _matching_editor_runtime(
             atomic_write_json(
                 staging / "wolflator-runtime.json",
                 {
-                    "schema": 1,
+                    "kind": "editor-runtime",
+                    "epoch": ARTIFACT_EPOCH,
                     "source_url": release.url,
                     "archive_size": archive_size,
                     "archive_sha256": archive_sha256,
@@ -1145,7 +1191,8 @@ def convert_legacy_game(
         atomic_write_json(
             report_path,
             {
-                "schema": 1,
+                "kind": "legacy-conversion-report",
+                "epoch": ARTIFACT_EPOCH,
                 "editor_version": editor.version,
                 "editor_sha256": editor.sha256,
                 "before_data_hash": before_hash,
@@ -7285,7 +7332,8 @@ def _analyze_compiled_program(
         else []
     )
     return {
-        "schema": AUTO_ANALYSIS_SCHEMA,
+        "kind": "editor-analysis",
+        "epoch": ARTIFACT_EPOCH,
         "engine": ANALYSIS_ENGINE,
         "metrics": dict(global_string_flow["metrics"]),
         "editor": {
@@ -7294,7 +7342,6 @@ def _analyze_compiled_program(
             "sha256": editor.sha256,
         },
         "command_catalog": {
-            "schema": CATALOG_SCHEMA,
             "verified_through": VERIFIED_EDITOR_VERSION,
             "newer_editor": newer_editor,
             "shape_coverage": {
@@ -7577,10 +7624,7 @@ def _analyze_compiled_translation_safety(
     """Approve only candidate strings whose Auto uses are statically proven safe."""
     if policy not in {"warn", "block"}:
         raise ValueError(f"未知 WOLF 逻辑安全策略：{policy}")
-    if analysis.get("schema") != AUTO_ANALYSIS_SCHEMA:
-        raise ValueError(
-            f"WOLF 事件逻辑保护需要 schema {AUTO_ANALYSIS_SCHEMA} Editor 分析报告，请重新执行导出文本。"
-        )
+    validate_editor_analysis(analysis)
     root = Path(auto_dir).resolve()
     if hash_directory(root) != analysis.get("output_hash"):
         raise ValueError("Editor Auto 目录已变化，请重新执行导出文本。")
@@ -8295,7 +8339,6 @@ def _finish_compiled_translation_safety(
             f"{first}（{', '.join(sorted(reasons.get(first, {'not_proven_safe'})))}）。"
         )
     return {
-        "schema": TRANSLATION_SAFETY_SCHEMA,
         "engine": ANALYSIS_ENGINE,
         "safe_to_translate": sorted(safe),
         "approvals": {

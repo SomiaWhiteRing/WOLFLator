@@ -3,7 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 
 
-CATALOG_SCHEMA = 5
 VERIFIED_EDITOR_VERSION = "3.713.2026.718"
 VERIFIED_EDITOR_SHA256 = "2ce5639f669643ded07a9390ef05054b8f95acbfa1b4dc1f4936246df5eae0c3"
 

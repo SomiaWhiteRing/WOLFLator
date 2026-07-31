@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from ainiee import run_proofread
+from formats import ARTIFACT_EPOCH, PROJECT_SCHEMA
 from models import AppSettings, ImportCategory, Stage, StageStatus, TranslationItem
 from pipeline import Pipeline, create_project, load_manifest
 from proofread import (
@@ -94,7 +95,8 @@ class ProofreadTests(unittest.TestCase):
             manifest = load_manifest(manifest_path)
             payload = build_worker_input(items_path, manifest, context_lines=1)
             result = {
-                "schema": 1,
+                "kind": "proofread-worker-output",
+                "epoch": ARTIFACT_EPOCH,
                 "entries": {
                     "display-one": {
                         "issues": [
@@ -125,7 +127,7 @@ class ProofreadTests(unittest.TestCase):
             self.assertFalse(report["entries"][0]["applicable"])
             self.assertEqual(r"\C[1]译文", report["entries"][0]["suggested_translation"])
             path = save_report(root / "report.json", report)
-            self.assertEqual(1, load_report(path)["schema"])
+            self.assertEqual(PROJECT_SCHEMA, load_report(path)["schema"])
             invalid = json.loads(path.read_text(encoding="utf-8"))
             invalid["unexpected"] = True
             path.write_text(json.dumps(invalid), encoding="utf-8")
@@ -142,7 +144,8 @@ class ProofreadTests(unittest.TestCase):
                 "description": "引号不配对", "suggestion": "修正引号", "confidence": 1.0,
             }
             result = {
-                "schema": 1,
+                "kind": "proofread-worker-output",
+                "epoch": ARTIFACT_EPOCH,
                 "entries": {
                     "display-one": {"issues": [issue], "suggested_translation": ""},
                     "display-two": {"issues": [issue], "suggested_translation": "第二译文"},
@@ -171,7 +174,8 @@ class ProofreadTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False), encoding="utf-8")
             payload = build_worker_input(items_path, manifest, context_lines=0)
             result = {
-                "schema": 1,
+                "kind": "proofread-worker-output",
+                "epoch": ARTIFACT_EPOCH,
                 "entries": {
                     "display-one": {
                         "issues": [{
@@ -292,7 +296,9 @@ class AIProofreader:
             input_path = root / "input.json"
             output_path = root / "output.json"
             payload = {
-                "schema": 1,
+                "kind": "proofread-worker-input",
+                "epoch": ARTIFACT_EPOCH,
+                "source_sha256": "hash",
                 "rows": [
                     {"index": index, "key": f"key-{index}", "original": "src", "translation": "bad", "context": []}
                     for index in range(3)
@@ -335,7 +341,17 @@ class AIProofreader:
             runtime.mkdir()
             input_path = root / "input.json"
             output_path = root / "output.json"
-            input_path.write_text(json.dumps({"schema": 1, "source_sha256": "hash", "rows": []}), encoding="utf-8")
+            input_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "proofread-worker-input",
+                        "epoch": ARTIFACT_EPOCH,
+                        "source_sha256": "hash",
+                        "rows": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             events = []
             secret = "environment-only-secret"
 
@@ -347,7 +363,14 @@ class AIProofreader:
                     'WOLFLATOR_PROOFREAD_EVENT {"event":"progress","current":1,"total":1}',
                 )
                 output_path.write_text(
-                    json.dumps({"schema": 1, "entries": {}, "failed_batches": []}),
+                    json.dumps(
+                        {
+                            "kind": "proofread-worker-output",
+                            "epoch": ARTIFACT_EPOCH,
+                            "entries": {},
+                            "failed_batches": [],
+                        }
+                    ),
                     encoding="utf-8",
                 )
 
@@ -381,7 +404,12 @@ class AIProofreader:
             worker_input = build_worker_input(items_path, manifest, context_lines=0)
             report = make_report(
                 worker_input,
-                {"schema": 1, "entries": {}, "failed_batches": []},
+                {
+                    "kind": "proofread-worker-output",
+                    "epoch": ARTIFACT_EPOCH,
+                    "entries": {},
+                    "failed_batches": [],
+                },
                 mode="rules",
                 model="",
                 batch_size=20,

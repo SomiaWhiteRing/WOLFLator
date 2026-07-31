@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from formats import PROJECT_SCHEMA, require_format
 
-MANIFEST_SCHEMA = 7
 DEFAULT_EXTERNAL_FILE_LIMIT_KB = 128
 MAX_EXTERNAL_FILE_LIMIT_KB = 1_048_576
 SUSPICIOUS_IDENTIFIER_ACTIONS = {"ignore", "warn", "protect"}
@@ -79,21 +79,12 @@ class ImportProtectionRules:
     suspicious_identifiers: str = "warn"
 
 
-def legacy_import_protection() -> ImportProtectionRules:
-    # ponytail: Old projects keep their previous AiNiee selection until the user opts in.
-    return ImportProtectionRules(allow_copy_condition_groups=False)
-
-
 def default_export_scope() -> ImportScope:
     return ImportScope(display=True, external=True, optional_name=True, halfwidth=True, filename=True)
 
 
 def default_processing_scope() -> ImportScope:
     return ImportScope(display=True, external=True)
-
-
-def legacy_export_scope() -> ImportScope:
-    return ImportScope(display=True, external=False, optional_name=True, halfwidth=True, filename=True)
 
 
 def _require_fields(data: object, expected: set[str], label: str) -> None:
@@ -225,7 +216,8 @@ class VersionManifest:
 class ProjectManifest:
     project_id: str
     name: str
-    schema: int = MANIFEST_SCHEMA
+    kind: str = "project"
+    schema: int = PROJECT_SCHEMA
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     active_version: str = ""
@@ -256,36 +248,36 @@ class ProjectManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectManifest":
-        schema = data.get("schema")
-        if type(schema) is not int or schema not in (1, 2, 3, 4, 5, 6, MANIFEST_SCHEMA):
-            raise ValueError(f"不支持的项目清单 schema: {schema}")
-        fields = {
-            "project_id",
-            "name",
-            "schema",
-            "created_at",
-            "updated_at",
-            "active_version",
-            "run_mode",
-            "translation_scope",
-            "import_scope",
-            "versions",
-        }
-        if schema >= 2:
-            fields.add("export_scope")
-        if schema >= 3:
-            fields.update({"exclude_large_external_files", "external_file_limit_kb"})
-        if schema >= 4:
-            fields.add("import_protection")
+        require_format(
+            data,
+            kind="project",
+            version_key="schema",
+            version=PROJECT_SCHEMA,
+            label="项目",
+        )
         _require_fields(
             data,
-            fields,
+            {
+                "kind",
+                "project_id",
+                "name",
+                "schema",
+                "created_at",
+                "updated_at",
+                "active_version",
+                "run_mode",
+                "export_scope",
+                "exclude_large_external_files",
+                "external_file_limit_kb",
+                "translation_scope",
+                "import_scope",
+                "import_protection",
+                "versions",
+            },
             "项目清单",
         )
         scope_fields = {"display", "external", "optional_name", "halfwidth", "filename"}
-        export_scope_data = (
-            data["export_scope"] if schema >= 2 else dataclasses.asdict(legacy_export_scope())
-        )
+        export_scope_data = data["export_scope"]
         import_scope_data = data["import_scope"]
         translation_scope_data = data["translation_scope"]
         if any(
@@ -307,10 +299,8 @@ class ProjectManifest:
             for name in ("project_id", "name", "created_at", "updated_at", "active_version")
         ):
             raise ValueError("项目清单文本字段类型不匹配。")
-        exclude_large_external_files = data.get("exclude_large_external_files", True)
-        external_file_limit_kb = data.get(
-            "external_file_limit_kb", DEFAULT_EXTERNAL_FILE_LIMIT_KB
-        )
+        exclude_large_external_files = data["exclude_large_external_files"]
+        external_file_limit_kb = data["external_file_limit_kb"]
         if type(exclude_large_external_files) is not bool:
             raise ValueError("大文件自动排除开关必须是布尔值。")
         if (
@@ -320,19 +310,7 @@ class ProjectManifest:
             raise ValueError(
                 f"外部文件大小上限必须是 1..{MAX_EXTERNAL_FILE_LIMIT_KB} KB 的整数。"
             )
-        protection_data = (
-            data["import_protection"]
-            if schema >= 4
-            else dataclasses.asdict(legacy_import_protection())
-        )
-        if schema >= 4 and isinstance(protection_data, dict):
-            protection_data = dict(protection_data)
-            # ponytail: Schema 4's standalone condition rule is subsumed by the
-            # Editor-backed logic rule and is discarded on the next save.
-            protection_data.pop("protect_standalone_conditions", None)
-            protection_data.setdefault("protect_logic_references", True)
-            if schema < 6:
-                protection_data.setdefault("logic_unknown_policy", "block")
+        protection_data = data["import_protection"]
         protection_fields = {
             "protect_external_references",
             "protect_paths_and_commands",
@@ -354,7 +332,8 @@ class ProjectManifest:
         item = cls(
             project_id=data["project_id"],
             name=data["name"],
-            schema=MANIFEST_SCHEMA,
+            kind=data["kind"],
+            schema=data["schema"],
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             active_version=data["active_version"],

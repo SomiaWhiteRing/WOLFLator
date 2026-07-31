@@ -10,6 +10,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from formats import ARTIFACT_EPOCH, require_format
+
 
 EVENT_PREFIX = "WOLFLATOR_PROOFREAD_EVENT "
 _AI_PRINT_STATE = threading.local()
@@ -170,10 +172,21 @@ def run(args: argparse.Namespace) -> int:
     os.chdir(runtime)
     sys.path.insert(0, str(runtime))
     payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    require_format(
+        payload,
+        kind="proofread-worker-input",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="校对 worker 输入",
+    )
+    if set(payload) != {"kind", "epoch", "source_sha256", "rows", "config", "glossary"} or not isinstance(
+        payload["source_sha256"], str
+    ):
+        raise ValueError("校对 worker 输入字段不匹配。")
     rows = payload.get("rows", [])
     config = payload.get("config", {})
     glossary = payload.get("glossary", [])
-    if payload.get("schema") != 1 or not isinstance(rows, list) or not isinstance(config, dict):
+    if not isinstance(rows, list) or not isinstance(config, dict):
         raise ValueError("校对 worker 输入结构不匹配。")
     if not isinstance(glossary, list):
         glossary = []
@@ -268,7 +281,12 @@ def run(args: argparse.Namespace) -> int:
 
     write_json_atomic(
         Path(args.output),
-        {"schema": 1, "entries": entries, "failed_batches": failed_batches},
+        {
+            "kind": "proofread-worker-output",
+            "epoch": ARTIFACT_EPOCH,
+            "entries": entries,
+            "failed_batches": failed_batches,
+        },
     )
     emit("finished", current=len(rows), total=len(rows), failed_batches=len(failed_batches))
     return 0

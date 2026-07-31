@@ -6,6 +6,7 @@ from unittest import mock
 
 from openpyxl import Workbook
 
+from formats import ARTIFACT_EPOCH
 from fonts import BUNDLED_FONT_FAMILY, BUNDLED_FONT_ID, default_font_scheme, load_font_scheme
 from models import (
     STAGE_ORDER,
@@ -20,9 +21,8 @@ from models import (
 )
 from pipeline import Pipeline, create_project, load_manifest
 from wolf_editor import EditorInfo, analyze_auto_export
-from wolf_analysis import TRANSLATION_SAFETY_SCHEMA, write_program_cache
+from wolf_analysis import ANALYSIS_ENGINE, write_program_cache
 from wolf_tools import (
-    IMPORT_PROTECTION_SCHEMA,
     OfficialToolDialogError,
     UberWolfRunner,
     dump_items,
@@ -42,6 +42,9 @@ def make_game(root: Path) -> Path:
 
 class FakePipeline(Pipeline):
     executed = None
+
+    def _stage_artifacts_valid(self, _stage: Stage) -> bool:
+        return True
 
     def _execute(self, stage: Stage) -> dict[str, str]:
         if self.executed is not None:
@@ -109,21 +112,21 @@ class PipelineTests(unittest.TestCase):
             )
             pipeline.work_dir.mkdir(parents=True)
             (pipeline.work_dir / "Game.exe").write_bytes(b"game")
-            legacy = pipeline.work_dir / "TrsData.bin"
-            legacy.write_bytes(b"MTool legacy")
+            mtool = pipeline.work_dir / "TrsData.bin"
+            mtool.write_bytes(b"MTool data")
             variant = pipeline.work_dir / "TrsData_ChatGPT_2023108 124849.bin"
-            variant.write_bytes(b"MTool translated legacy")
+            variant.write_bytes(b"MTool translated data")
             with mock.patch("pipeline.prepare_uberwolf", return_value=root / "UberWolfCli.exe"):
                 with mock.patch.object(UberWolfRunner, "unpack"):
                     artifacts = pipeline._unpack()
-            self.assertFalse(legacy.exists())
+            self.assertFalse(mtool.exists())
             self.assertFalse(variant.exists())
-            evidence = json.loads(Path(artifacts["excluded_legacy_files"]).read_text(encoding="utf-8"))
+            evidence = json.loads(Path(artifacts["excluded_files"]).read_text(encoding="utf-8"))
             self.assertEqual(
                 {"TrsData.bin", "TrsData_ChatGPT_2023108 124849.bin"},
                 {item["relative_path"] for item in evidence["files"]},
             )
-            self.assertEqual({12, 23}, {item["bytes"] for item in evidence["files"]})
+            self.assertEqual({10, 21}, {item["bytes"] for item in evidence["files"]})
 
     def test_uberwolf_merges_incomplete_loose_data_over_archive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,7 +267,9 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(expected, pipeline._editor_analysis(items))
 
             analyze.assert_called_once()
-            self.assertEqual(1, json.loads(cache_path.read_text(encoding="utf-8"))["schema"])
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            self.assertEqual("editor-program-cache", cache["kind"])
+            self.assertEqual(ARTIFACT_EPOCH, cache["epoch"])
 
     def _attach_import_protection(
         self, pipeline: Pipeline, protected_keys: tuple[str, ...] = ()
@@ -273,9 +278,19 @@ class PipelineTests(unittest.TestCase):
         path.write_text(
             json.dumps(
                 {
-                    "schema": IMPORT_PROTECTION_SCHEMA,
+                    "kind": "import-protection",
+                    "epoch": ARTIFACT_EPOCH,
                     "protected_keys": list(protected_keys),
+                    "safe_to_translate": [],
+                    "keep_original": [],
+                    "translation_overrides": {},
+                    "approvals": {},
+                    "unresolved_scopes": [],
+                    "translated_replay": {},
                     "structural_diff": {"status": "passed", "differences": []},
+                    "entries": [],
+                    "summary": {},
+                    "middle_dot_normalized": [],
                 }
             ),
             encoding="utf-8",
@@ -541,6 +556,8 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             result = json.loads(Path(artifacts["font_result"]).read_text(encoding="utf-8"))
+            self.assertEqual("font-result", result["kind"])
+            self.assertEqual(ARTIFACT_EPOCH, result["epoch"])
             self.assertEqual([BUNDLED_FONT_FAMILY] * 4, result["applied_slots"])
             self.assertEqual("approved_import_translations", result["coverage_scope"])
             warnings = json.loads(Path(artifacts["font_warnings"]).read_text(encoding="utf-8"))
@@ -669,7 +686,7 @@ class PipelineTests(unittest.TestCase):
                 return scoped
 
             safety = {
-                "schema": TRANSLATION_SAFETY_SCHEMA,
+                "engine": ANALYSIS_ENGINE,
                 "safe_to_translate": ["plain"],
                 "keep_original": [],
                 "translation_overrides": {"plain": "安全混合译文"},
@@ -792,8 +809,8 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual("1", artifacts["official_warning_count"])
             warnings = json.loads(Path(artifacts["official_warnings"]).read_text(encoding="utf-8"))
-            self.assertEqual(runner.diagnostics, warnings)
-            self.assertEqual("甲", warnings[0]["source"])
+            self.assertEqual(runner.diagnostics, warnings["diagnostics"])
+            self.assertEqual("甲", warnings["diagnostics"][0]["source"])
             console = Path(artifacts["official_console"]).read_text(encoding="utf-8")
             self.assertIn("earlier screen", console)
             self.assertIn("raw screen", console)
@@ -803,44 +820,26 @@ class PipelineTests(unittest.TestCase):
             root = Path(directory)
             manifest_path = create_project(root / "projects", make_game(root / "game"))
             data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-            legacy = json.loads(json.dumps(data))
             data.pop("translation_scope")
             Path(manifest_path).write_text(json.dumps(data), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "translation_scope"):
+            with self.assertRaisesRegex(ValueError, "项目格式不兼容"):
                 load_manifest(manifest_path)
-            legacy["schema"] = 1
-            legacy.pop("export_scope")
-            legacy.pop("exclude_large_external_files")
-            legacy.pop("external_file_limit_kb")
-            legacy.pop("import_protection")
-            Path(manifest_path).write_text(json.dumps(legacy), encoding="utf-8")
-            migrated = load_manifest(manifest_path)
-            self.assertEqual(7, migrated.schema)
-            self.assertFalse(migrated.export_scope.external)
 
-            schema_five = migrated.to_dict()
-            schema_five["schema"] = 5
-            schema_five["import_protection"].pop("logic_unknown_policy", None)
-            manifest_path.write_text(json.dumps(schema_five), encoding="utf-8")
-            self.assertEqual(
-                "block", load_manifest(manifest_path).import_protection.logic_unknown_policy
-            )
-            self.assertTrue(migrated.export_scope.optional_name)
-            self.assertTrue(migrated.exclude_large_external_files)
-            self.assertEqual(128, migrated.external_file_limit_kb)
-            self.assertFalse(migrated.import_protection.allow_copy_condition_groups)
+    def test_manifest_rejects_missing_kind_and_extra_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data.pop("kind")
+            manifest_path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "项目格式不兼容"):
+                load_manifest(manifest_path)
 
-            schema_two = json.loads(json.dumps(migrated.to_dict()))
-            schema_two["schema"] = 2
-            schema_two["export_scope"]["external"] = True
-            schema_two.pop("exclude_large_external_files")
-            schema_two.pop("external_file_limit_kb")
-            schema_two.pop("import_protection")
-            Path(manifest_path).write_text(json.dumps(schema_two), encoding="utf-8")
-            migrated = load_manifest(manifest_path)
-            self.assertTrue(migrated.export_scope.external)
-            self.assertTrue(migrated.exclude_large_external_files)
-            self.assertEqual(128, migrated.external_file_limit_kb)
+            data["kind"] = "project"
+            data["unexpected"] = True
+            manifest_path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "项目格式不兼容"):
+                load_manifest(manifest_path)
 
     def test_manifest_rejects_non_boolean_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -849,7 +848,7 @@ class PipelineTests(unittest.TestCase):
             data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
             data["translation_scope"]["display"] = "true"
             Path(manifest_path).write_text(json.dumps(data), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "必须是布尔值"):
+            with self.assertRaisesRegex(ValueError, "项目格式不兼容"):
                 load_manifest(manifest_path)
 
     def test_run_stage_executes_only_selected_stage(self):
@@ -935,35 +934,6 @@ class PipelineTests(unittest.TestCase):
             for stage, artifacts in downstream_artifacts.items():
                 self.assertEqual(StageStatus.COMPLETED, current.version.stage(stage).status)
                 self.assertEqual(artifacts, current.version.stage(stage).artifacts)
-
-    def test_removed_skip_marker_is_normalized_before_run(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            with pipeline._mutation("legacy-skip-test"):
-                for stage in STAGE_ORDER:
-                    pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
-                pipeline.manifest.version.stage(Stage.COPY).artifacts = {"skipped": "true"}
-                pipeline.save()
-            normalized = load_manifest(manifest_path)
-            self.assertTrue(
-                all(
-                    normalized.version.stage(stage).status is StageStatus.PENDING
-                    for stage in STAGE_ORDER
-                )
-            )
-            self.assertEqual({}, normalized.version.stage(Stage.COPY).artifacts)
-            executed = []
-            pipeline = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            pipeline.executed = executed
-            self.assertEqual("completed", pipeline.run())
-            self.assertEqual(list(Stage), executed)
-            self.assertNotIn("skipped", manifest_path.read_text(encoding="utf-8"))
 
     def test_failure_is_persisted_and_retryable(self):
         with tempfile.TemporaryDirectory() as directory:

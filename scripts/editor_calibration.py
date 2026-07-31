@@ -24,9 +24,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from safe_io import atomic_write_json, atomic_write_text  # noqa: E402
+from formats import QA_SCHEMA, require_format  # noqa: E402
 from wolf_command_catalog import (  # noqa: E402
     CALIBRATED_SHAPES,
-    CATALOG_SCHEMA,
     COMMAND_CATALOG,
     EVIDENCE_RANK,
     EXCLUDED_COMMANDS,
@@ -41,7 +41,6 @@ from wolf_editor import inspect_wolf_editor  # noqa: E402
 from wolf_tools import sha256_file  # noqa: E402
 
 
-TOOL_SCHEMA = 1
 OFFICIAL_RESOURCES = {
     "full": {
         "url": "https://www.silversecond.com/WolfRPGEditor/Data/WolfRPGEditor_3.713.zip",
@@ -411,9 +410,16 @@ def _safe_extract(archive: Path, destination: Path) -> None:
     archive_hash = sha256_file(archive)
     if destination.is_dir() and marker.is_file():
         try:
-            if json.loads(marker.read_text(encoding="utf-8")) == {
-                "archive_sha256": archive_hash
-            }:
+            cached = require_format(
+                json.loads(marker.read_text(encoding="utf-8")),
+                kind="qa-editor-resource",
+                version_key="schema",
+                version=QA_SCHEMA,
+                label="Editor 校准资源缓存",
+            )
+            if set(cached) == {"kind", "schema", "archive_sha256"} and cached[
+                "archive_sha256"
+            ] == archive_hash:
                 return
         except (OSError, ValueError):
             pass
@@ -442,7 +448,11 @@ def _safe_extract(archive: Path, destination: Path) -> None:
                         shutil.copyfileobj(source, output, 1024 * 1024)
         atomic_write_json(
             staging / ".wolflator-calibration-source.json",
-            {"archive_sha256": archive_hash},
+            {
+                "kind": "qa-editor-resource",
+                "schema": QA_SCHEMA,
+                "archive_sha256": archive_hash,
+            },
         )
         if destination.exists():
             shutil.rmtree(destination)
@@ -614,8 +624,8 @@ def _inventory(args: argparse.Namespace) -> int:
     language_dll = next(Path(resources["language"]["extracted"]).rglob("Editor.Lang.dll"), None)
     resource_strings = _resource_strings(language_dll) if language_dll else []
     report = {
-        "schema": TOOL_SCHEMA,
-        "catalog_schema": CATALOG_SCHEMA,
+        "kind": "qa-editor-inventory",
+        "schema": QA_SCHEMA,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "editor": {"path": str(editor.path), "version": editor.version, "sha256": editor.sha256},
         "official_resources": resources,
@@ -868,7 +878,13 @@ def _calibrate(args: argparse.Namespace) -> int:
     inventory_path = Path(args.inventory) if args.inventory else _qa_root() / "inventory.json"
     if not inventory_path.is_file():
         raise CalibrationError("缺少 inventory.json，请先执行 inventory。")
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    inventory = require_format(
+        json.loads(inventory_path.read_text(encoding="utf-8")),
+        kind="qa-editor-inventory",
+        version_key="schema",
+        version=QA_SCHEMA,
+        label="Editor 校准目录",
+    )
     source_root = Path(inventory["full_package_root"])
     if not (source_root / "Data" / "BasicData").is_dir():
         raise CalibrationError("官方完整包缺少最小工程 Data/BasicData。")
@@ -885,12 +901,19 @@ def _calibrate(args: argparse.Namespace) -> int:
     run_root = _qa_root() / run_id
     checkpoint = run_root / "checkpoint.json"
     if args.resume and checkpoint.is_file():
-        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        state = require_format(
+            json.loads(checkpoint.read_text(encoding="utf-8")),
+            kind="qa-editor-calibration",
+            version_key="schema",
+            version=QA_SCHEMA,
+            label="Editor 校准检查点",
+        )
         if state.get("case_hash") != case_hash or state.get("editor_sha256") != editor.sha256:
             raise CalibrationError("断点与当前 Editor、工程或案例目录不一致。")
     else:
         state = {
-            "schema": TOOL_SCHEMA,
+            "kind": "qa-editor-calibration",
+            "schema": QA_SCHEMA,
             "case_hash": case_hash,
             "editor_sha256": editor.sha256,
             "attempts": 0,
@@ -990,14 +1013,31 @@ def _verify(args: argparse.Namespace) -> int:
     errors: list[str] = []
     state: dict[str, object] = {}
     if checkpoint is not None and checkpoint.is_file():
-        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        try:
+            state = require_format(
+                json.loads(checkpoint.read_text(encoding="utf-8")),
+                kind="qa-editor-calibration",
+                version_key="schema",
+                version=QA_SCHEMA,
+                label="Editor 校准检查点",
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(str(error))
     if not inventory_path.is_file():
         errors.append(f"缺少目录：{inventory_path}")
         inventory: dict[str, object] = {}
     else:
-        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-        if inventory.get("schema") != TOOL_SCHEMA or inventory.get("catalog_schema") != CATALOG_SCHEMA:
-            errors.append("目录 schema 不匹配")
+        try:
+            inventory = require_format(
+                json.loads(inventory_path.read_text(encoding="utf-8")),
+                kind="qa-editor-inventory",
+                version_key="schema",
+                version=QA_SCHEMA,
+                label="Editor 校准目录",
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(str(error))
+            inventory = {}
         if inventory.get("editor", {}).get("sha256") != editor.sha256:
             errors.append("目录使用的 Editor 哈希不匹配")
     classifications = Counter(item[1] for item in COMMAND_CATALOG.values())

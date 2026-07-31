@@ -28,7 +28,7 @@ from models import (
 from pipeline import Pipeline, add_version, create_project, load_manifest
 from safe_io import ResourceBusyError, project_lock, project_lock_status
 from settings import SettingsStore, local_data_dir, validate_settings
-from wolf_tools import CancelledError
+from wolf_tools import CancelledError, load_import_protection
 from wolf_editor import inspect_wolf_editor, install_supported_editor
 
 
@@ -152,7 +152,7 @@ def _status(args: argparse.Namespace) -> int:
     protection_path = version.stage(Stage.IMPORT).artifacts.get("import_protection", "")
     if protection_path and Path(protection_path).is_file():
         try:
-            protection = json.loads(Path(protection_path).read_text(encoding="utf-8"))
+            protection = load_import_protection(protection_path)
             summary = protection.get("summary", {})
             safety = {
                 "safe_to_translate": len(protection.get("safe_to_translate", [])),

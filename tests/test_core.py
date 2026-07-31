@@ -20,6 +20,7 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 import ainiee
+from formats import ARTIFACT_EPOCH
 from fonts import (
     BUNDLED_FONT_FAMILY,
     BUNDLED_FONT_SHA256,
@@ -46,7 +47,6 @@ from models import (
 )
 from wolf_tools import (
     CancelledError,
-    IMPORT_PROTECTION_SCHEMA,
     OfficialToolRunner,
     SUPPORT_DIR,
     _content_category,
@@ -61,7 +61,6 @@ from wolf_tools import (
     analyze_import_protection,
     classify_optional_name_delta,
     dump_items,
-    final_display_texts,
     full_export_scope,
     imported_display_texts,
     load_items,
@@ -87,7 +86,6 @@ from wolf_tools import (
     write_scoped_workbook,
 )
 from wolf_editor import (
-    AUTO_ANALYSIS_SCHEMA,
     _AnalysisAudit,
     _AnalysisState,
     _BlockAnalyzer,
@@ -562,17 +560,6 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(["原字体0", "原字体1", "", ""], read_font_slots(items))
             self.assertEqual(["新主字体", "新副字体"], [item.translation for item in items])
 
-    def test_final_display_texts_follow_import_scope_and_strip_controls(self):
-        with tempfile.TemporaryDirectory() as directory:
-            items = read_translation_items(make_workbook(Path(directory) / "source.xlsx"))
-            items[0].translation = r"中文\C[1]"
-            items[1].translation = "主角"
-            texts = final_display_texts(items, ImportScope())
-            self.assertIn("中文", texts)
-            self.assertNotIn(r"中文\C[1]", texts)
-            self.assertIn("主人公", texts)
-            self.assertNotIn("Picture/顔.png", texts)
-
     def test_imported_display_texts_exclude_preserved_originals(self):
         source = TranslationItem(
             key="source",
@@ -624,7 +611,8 @@ class WorkbookAndFontTests(unittest.TestCase):
                 code="COMMON-1-0-0",
             )
             report = {
-                "schema": AUTO_ANALYSIS_SCHEMA,
+                "kind": "editor-analysis",
+                "epoch": ARTIFACT_EPOCH,
                 "engine": ANALYSIS_ENGINE,
                 "input_hash": "input",
                 "output_hash": "output",
@@ -649,6 +637,7 @@ class WorkbookAndFontTests(unittest.TestCase):
                 key="key",
                 original="原文",
                 translation="另一候选",
+                stage=1,
                 code="COMMON-1-0-0",
             )
             self.assertEqual(
@@ -848,31 +837,6 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "Microsoft YaHei Light",
                 load_font_scheme(root)["slots"][0]["family"],
             )
-
-    def test_copy_corpus_keeps_mixed_scope_group_atomic(self):
-        source = TranslationItem(
-            key="source",
-            original="原文",
-            translation="最终译文",
-            code="COMMON-1",
-            category=ImportCategory.DISPLAY,
-        )
-        copied = TranslationItem(
-            key="copy",
-            original="原文",
-            code="COMMON-2",
-            flag="COPY-FROM-COMMON-1",
-            category=ImportCategory.COPY,
-            copy_category=ImportCategory.OPTIONAL_NAME,
-        )
-        self.assertEqual(
-            ["原文", "原文"],
-            final_display_texts([source, copied], ImportScope()),
-        )
-        self.assertEqual(
-            ["最终译文", "最终译文"],
-            final_display_texts([source, copied], ImportScope(optional_name=True)),
-        )
 
     def test_full_baseline_delta_and_cross_category_copy_are_scope_safe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1138,9 +1102,9 @@ class WorkbookAndFontTests(unittest.TestCase):
                 elif item.code == "DISPLAY-1":
                     item.translation = "重新启动_1"
             by_code = {item.code: item for item in items}
-            with self.assertRaisesRegex(ValueError, f"schema {AUTO_ANALYSIS_SCHEMA}"):
+            with self.assertRaisesRegex(ValueError, "Editor 分析报告格式不兼容"):
                 analyze_import_protection(
-                    items, ImportScope(), game, ImportProtectionRules(), {"schema": 1}
+                    items, ImportScope(), game, ImportProtectionRules(), {}
                 )
             dependency = {
                 "auto_file": "BasicData/CommonEvent.dat.Auto.txt",
@@ -1165,7 +1129,12 @@ class WorkbookAndFontTests(unittest.TestCase):
                 "reason": "",
             }
             analysis = {
-                "schema": AUTO_ANALYSIS_SCHEMA,
+                "kind": "editor-analysis",
+                "epoch": ARTIFACT_EPOCH,
+                "engine": ANALYSIS_ENGINE,
+                "input_hash": "input",
+                "output_hash": "output",
+                "editor": {"version": "3.713", "sha256": "a" * 64},
                 "unknown_commands": [],
                 "blocking_issues": [],
                 "dependencies": [dependency],
@@ -1587,7 +1556,8 @@ class WorkbookAndFontTests(unittest.TestCase):
             editor_path.write_bytes(b"editor")
             editor = EditorInfo(editor_path, "3.713.2026.718", (3, 713, 2026, 718), "a" * 64)
             report = analyze_auto_export(auto, items, editor, input_hash="input")
-            self.assertEqual(AUTO_ANALYSIS_SCHEMA, report["schema"])
+            self.assertEqual("editor-analysis", report["kind"])
+            self.assertEqual(ARTIFACT_EPOCH, report["epoch"])
             self.assertIn("event_summaries", report)
             self.assertIn("call_graph", report)
             self.assertNotIn("translated_replay", report)
@@ -1681,7 +1651,8 @@ class WorkbookAndFontTests(unittest.TestCase):
 
             report = analyze_auto_export(root / "Auto", [], editor, input_hash="input")
 
-            self.assertEqual(AUTO_ANALYSIS_SCHEMA, report["schema"])
+            self.assertEqual("editor-analysis", report["kind"])
+            self.assertEqual(ARTIFACT_EPOCH, report["epoch"])
             self.assertFalse(
                 any("固定点超过" in issue["reason"] for issue in report["blocking_issues"])
             )
@@ -2217,7 +2188,8 @@ class WorkbookAndFontTests(unittest.TestCase):
                 analysis,
                 logic_safety=safety,
             )
-            self.assertEqual(IMPORT_PROTECTION_SCHEMA, protection["schema"])
+            self.assertEqual("import-protection", protection["kind"])
+            self.assertEqual(ARTIFACT_EPOCH, protection["epoch"])
             self.assertEqual(
                 [
                     "display",
@@ -3859,19 +3831,12 @@ class WorkbookAndFontTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "找不到唯一来源"):
                 to_paratranz(read_translation_items(path), full_export_scope())
 
-    def test_item_file_requires_versioned_schema(self):
+    def test_item_file_roundtrip_and_rejects_malformed_item(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             items = read_translation_items(make_workbook(root / "source.xlsx"))
             versioned = dump_items(root / "items.json", items)
             self.assertEqual(len(items), len(load_items(versioned)))
-            old = root / "old-items.json"
-            old.write_text(
-                json.dumps([item.to_dict() for item in items], ensure_ascii=False),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "结构不匹配"):
-                load_items(old)
             malformed = json.loads(versioned.read_text(encoding="utf-8"))
             malformed["items"][0]["stage"] = "1"
             versioned.write_text(json.dumps(malformed), encoding="utf-8")
@@ -4341,11 +4306,27 @@ class AiNieeTests(unittest.TestCase):
             owned.mkdir(parents=True)
             unrelated.mkdir()
             (owned / ".wolflator-runtime.json").write_text(
-                json.dumps({"source": str(source.resolve())}),
+                json.dumps(
+                    {
+                        "kind": "ainiee-runtime",
+                        "epoch": ARTIFACT_EPOCH,
+                        "fingerprint": "owned",
+                        "source": str(source.resolve()),
+                        "created_at": 0,
+                    }
+                ),
                 encoding="utf-8",
             )
             (unrelated / ".wolflator-runtime.json").write_text(
-                json.dumps({"source": str((root / "other").resolve())}),
+                json.dumps(
+                    {
+                        "kind": "ainiee-runtime",
+                        "epoch": ARTIFACT_EPOCH,
+                        "fingerprint": "unrelated",
+                        "source": str((root / "other").resolve()),
+                        "created_at": 0,
+                    }
+                ),
                 encoding="utf-8",
             )
             ainiee.remove_managed_ainiee(source, packages, runtimes)

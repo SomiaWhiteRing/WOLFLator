@@ -17,6 +17,7 @@ from itertools import count
 from pathlib import Path
 from typing import Callable, Iterable
 
+from formats import ARTIFACT_EPOCH, require_format
 from models import AppSettings, ImportCategory, TranslationItem
 from safe_io import (
     atomic_write_bytes,
@@ -335,7 +336,13 @@ def _validate_managed_package(path: Path) -> Path:
     metadata_path = root / "wolflator-package.json"
     if not metadata_path.is_file():
         raise ValueError("AiNiee 托管包缺少安装元数据。")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = require_format(
+        json.loads(metadata_path.read_text(encoding="utf-8")),
+        kind="ainiee-package",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="AiNiee 托管包元数据",
+    )
     expected = {
         "version": AINIEE_VERSION,
         "commit": AINIEE_COMMIT,
@@ -353,6 +360,10 @@ def _validate_managed_package(path: Path) -> Path:
     }
     if mismatched:
         raise ValueError(f"AiNiee 托管包元数据不匹配: {mismatched}")
+    if set(metadata) != {"kind", "epoch", *expected, "installed_at"} or not isinstance(
+        metadata["installed_at"], (int, float)
+    ):
+        raise ValueError("AiNiee 托管包元数据字段不匹配。")
     if not _web_dist_ready(root):
         raise ValueError("AiNiee 托管包缺少 Web 资源。")
     return root
@@ -388,7 +399,10 @@ def _install_supported_ainiee_locked(
     packages.mkdir(parents=True, exist_ok=True)
     final = packages / AINIEE_VERSION
     if final.exists() and not repair:
-        return _validate_managed_package(final)
+        try:
+            return _validate_managed_package(final)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     part = packages / f"{AINIEE_VERSION}.zip.part"
     extract_dir = packages / f".{AINIEE_VERSION}.extracting"
     if log:
@@ -417,6 +431,8 @@ def _install_supported_ainiee_locked(
             log=log,
         )
         metadata = {
+            "kind": "ainiee-package",
+            "epoch": ARTIFACT_EPOCH,
             "version": AINIEE_VERSION,
             "commit": AINIEE_COMMIT,
             "source_url": AINIEE_ARCHIVE_URL,
@@ -448,6 +464,23 @@ def _runtime_fingerprint(source: Path) -> str:
     return _source_code_hash(source)[:20]
 
 
+def _load_runtime_metadata(path: Path) -> dict[str, object]:
+    value = require_format(
+        json.loads(path.read_text(encoding="utf-8")),
+        kind="ainiee-runtime",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="AiNiee 运行时元数据",
+    )
+    if set(value) != {"kind", "epoch", "fingerprint", "source", "created_at"} or not (
+        isinstance(value["fingerprint"], str)
+        and isinstance(value["source"], str)
+        and isinstance(value["created_at"], (int, float))
+    ):
+        raise ValueError("AiNiee 运行时元数据字段不匹配。")
+    return value
+
+
 def create_managed_runtime(
     source: str | Path,
     runtime_root: str | Path,
@@ -471,7 +504,7 @@ def _create_managed_runtime_locked(
     marker = final / ".wolflator-runtime.json"
     if marker.is_file() and not refresh:
         try:
-            data = json.loads(marker.read_text(encoding="utf-8"))
+            data = _load_runtime_metadata(marker)
             if data.get("fingerprint") == fingerprint:
                 return validate_ainiee_source(final)
         except Exception:
@@ -482,7 +515,7 @@ def _create_managed_runtime_locked(
         if candidate == final or not candidate_marker.is_file():
             continue
         try:
-            data = json.loads(candidate_marker.read_text(encoding="utf-8"))
+            data = _load_runtime_metadata(candidate_marker)
             same_source = Path(str(data["source"])).resolve() == source_root
         except (KeyError, OSError, ValueError, json.JSONDecodeError):
             same_source = False
@@ -495,7 +528,13 @@ def _create_managed_runtime_locked(
     shutil.copytree(source_root, temporary, ignore=ignored)
     _atomic_json(
         temporary / ".wolflator-runtime.json",
-        {"fingerprint": fingerprint, "source": str(source_root), "created_at": time.time()},
+        {
+            "kind": "ainiee-runtime",
+            "epoch": ARTIFACT_EPOCH,
+            "fingerprint": fingerprint,
+            "source": str(source_root),
+            "created_at": time.time(),
+        },
     )
     if final.exists():
         shutil.rmtree(final)
@@ -615,7 +654,7 @@ def _remove_managed_ainiee_locked(
             if not marker.is_file():
                 continue
             try:
-                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                metadata = _load_runtime_metadata(marker)
                 same_source = Path(str(metadata["source"])).resolve() == source_root
             except (KeyError, OSError, ValueError, json.JSONDecodeError):
                 same_source = False
@@ -628,7 +667,7 @@ def require_managed_runtime(source: str | Path, runtime_root: str | Path) -> Pat
     runtime, fingerprint = _managed_runtime_path(source, runtime_root)
     try:
         validate_ainiee_source(runtime)
-        metadata = json.loads((runtime / ".wolflator-runtime.json").read_text(encoding="utf-8"))
+        metadata = _load_runtime_metadata(runtime / ".wolflator-runtime.json")
         synced_lock = (runtime / ".uv-sync").read_text(encoding="ascii", errors="ignore")
         ready = (
             metadata.get("fingerprint") == fingerprint
@@ -1010,8 +1049,17 @@ def run_proofread(
     if mode not in {"rules", "rules_ai"}:
         raise ValueError(f"不支持的校对方式: {mode}")
     payload = json.loads(Path(input_json).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("校对 worker 输入不是对象。")
+    payload = require_format(
+        payload,
+        kind="proofread-worker-input",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="AiNiee 校对 worker 输入",
+    )
+    if set(payload) != {"kind", "epoch", "source_sha256", "rows"} or not isinstance(
+        payload["source_sha256"], str
+    ) or not isinstance(payload["rows"], list):
+        raise ValueError("AiNiee 校对 worker 输入字段不匹配。")
     managed_rules = _rules_with_control_protection(rules)
     payload["config"] = _session_profile(settings, "")
     payload["glossary"] = managed_rules.get("prompt_dictionary_data", [])
@@ -1073,9 +1121,15 @@ def run_proofread(
     if not output.is_file():
         raise RuntimeError("AiNiee 校对 worker 返回成功，但没有生成结果。")
     result = json.loads(output.read_text(encoding="utf-8"))
+    require_format(
+        result,
+        kind="proofread-worker-output",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="AiNiee 校对 worker 输出",
+    )
     if (
-        not isinstance(result, dict)
-        or result.get("schema") != 1
+        set(result) != {"kind", "epoch", "entries", "failed_batches"}
         or not isinstance(result.get("entries"), dict)
         or not isinstance(result.get("failed_batches"), list)
     ):

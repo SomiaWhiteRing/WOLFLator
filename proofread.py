@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from ainiee import require_managed_runtime, run_proofread
+from formats import ARTIFACT_EPOCH, PROJECT_SCHEMA, require_format
 from models import AppSettings, ImportCategory, ProjectManifest, Stage, StageStatus, TranslationItem
 from safe_io import atomic_write_json, read_text_with_retry
 from wolf_tools import (
@@ -19,11 +20,11 @@ from wolf_tools import (
 )
 
 
-PROOFREAD_SCHEMA = 1
 PROOFREAD_MODES = {"rules", "rules_ai"}
 DECISIONS = {"pending", "accept", "keep"}
 SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 REPORT_FIELDS = {
+    "kind",
     "schema",
     "status",
     "created_at",
@@ -129,7 +130,8 @@ def build_worker_input(
             }
         )
     return {
-        "schema": PROOFREAD_SCHEMA,
+        "kind": "proofread-worker-input",
+        "epoch": ARTIFACT_EPOCH,
         "source_sha256": sha256_file(items_path),
         "rows": rows,
     }
@@ -165,6 +167,22 @@ def make_report(
 ) -> dict[str, object]:
     if mode not in PROOFREAD_MODES:
         raise ValueError(f"不支持的校对方式: {mode}")
+    require_format(
+        worker_input,
+        kind="proofread-worker-input",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="校对 worker 输入",
+    )
+    require_format(
+        worker_result,
+        kind="proofread-worker-output",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="校对 worker 输出",
+    )
+    if set(worker_result) != {"kind", "epoch", "entries", "failed_batches"}:
+        raise ValueError("校对 worker 输出字段不匹配。")
     rows = worker_input.get("rows")
     by_key = worker_result.get("entries")
     failed_batches = worker_result.get("failed_batches", [])
@@ -239,7 +257,8 @@ def make_report(
             }
         )
     report: dict[str, object] = {
-        "schema": PROOFREAD_SCHEMA,
+        "kind": "proofread-report",
+        "schema": PROJECT_SCHEMA,
         "status": "partial" if failed_batches else "completed",
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_sha256": str(worker_input.get("source_sha256", "")),
@@ -279,8 +298,13 @@ def refresh_summary(report: dict[str, object], *, checked: int | None = None) ->
 
 def validate_report(report: object) -> dict[str, object]:
     value = _exact_fields(report, REPORT_FIELDS, "校对报告")
-    if value["schema"] != PROOFREAD_SCHEMA:
-        raise ValueError(f"不支持的校对报告 schema: {value['schema']}")
+    require_format(
+        value,
+        kind="proofread-report",
+        version_key="schema",
+        version=PROJECT_SCHEMA,
+        label="校对报告",
+    )
     if value["status"] not in {"completed", "partial"} or value["mode"] not in PROOFREAD_MODES:
         raise ValueError("校对报告状态或方式无效。")
     if not all(isinstance(value[name], str) for name in ("created_at", "source_sha256", "model")):

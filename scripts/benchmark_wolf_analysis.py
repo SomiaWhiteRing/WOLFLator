@@ -16,11 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from formats import QA_SCHEMA, require_format  # noqa: E402
+from wolf_analysis import load_editor_analysis  # noqa: E402
 from wolf_editor import EditorInfo, analyze_auto_export, analyze_translation_safety  # noqa: E402
 from wolf_tools import load_items  # noqa: E402
 
 
-_IGNORED_REPORT_FIELDS = frozenset({"schema", "engine", "metrics"})
+_IGNORED_REPORT_FIELDS = frozenset({"kind", "epoch", "engine", "metrics"})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -55,7 +57,7 @@ def _normalized(value: object) -> object:
 
 
 def _single_run(args: argparse.Namespace) -> dict[str, object]:
-    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    baseline = load_editor_analysis(args.baseline)
     editor_data = baseline["editor"]
     version = str(editor_data["version"])
     editor = EditorInfo(
@@ -127,7 +129,11 @@ def _reason_distribution(safety: object) -> dict[str, int]:
 def main() -> int:
     args = _parser().parse_args()
     if args.child_result:
-        payload = _single_run(args)
+        payload = {
+            "kind": "qa-analysis-benchmark-sample",
+            "schema": QA_SCHEMA,
+            **_single_run(args),
+        }
         args.child_result.parent.mkdir(parents=True, exist_ok=True)
         args.child_result.write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -152,9 +158,17 @@ def main() -> int:
                 sys.stderr.write(completed.stdout)
                 sys.stderr.write(completed.stderr)
                 return completed.returncode
-            payloads.append(json.loads(child_output.read_text(encoding="utf-8")))
+            payloads.append(
+                require_format(
+                    json.loads(child_output.read_text(encoding="utf-8")),
+                    kind="qa-analysis-benchmark-sample",
+                    version_key="schema",
+                    version=QA_SCHEMA,
+                    label="分析基准样本",
+                )
+            )
 
-    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    baseline = load_editor_analysis(args.baseline)
     analyses = [payload["analysis"] for payload in payloads]
     safeties = [payload["safety"] for payload in payloads]
     durations = [float(payload["duration"]) for payload in payloads]
@@ -179,6 +193,8 @@ def main() -> int:
     median = statistics.median(durations)
     maximum = max(durations)
     result = {
+        "kind": "qa-analysis-benchmark",
+        "schema": QA_SCHEMA,
         "runs": durations,
         "median_seconds": median,
         "max_seconds": maximum,

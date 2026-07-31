@@ -15,13 +15,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+from formats import ARTIFACT_EPOCH, PROJECT_SCHEMA, require_format
 from safe_io import atomic_output_path, atomic_write_json, project_lock, read_text_with_retry
 
 
 FONT_CODES = ("BASICDATA-3", "BASICDATA-4", "BASICDATA-5", "BASICDATA-6")
 FONT_SLOT_NAMES = ("主字体", "副字体 1", "副字体 2", "副字体 3")
-FONT_SCHEME_SCHEMA = 1
-ORIGINAL_FONTS_SCHEMA = 1
 BUNDLED_FONT_ID = "fusion-pixel-12px-proportional-zh_hans.ttf"
 BUNDLED_FONT_FAMILY = "Fusion Pixel 12px Prop zh_hans"
 BUNDLED_FONT_SHA256 = "5b27e9eb9d9dd93cff727d8919ddd2e7a482b19314b62991cb1e7806852e8734"
@@ -120,7 +119,8 @@ def default_font_scheme() -> dict[str, object]:
         ],
     }
     return {
-        "schema": FONT_SCHEME_SCHEMA,
+        "kind": "font-scheme",
+        "schema": PROJECT_SCHEMA,
         "origin": "default",
         "slots": [dict(selection) for _ in FONT_CODES],
         "coverage_ack": None,
@@ -142,10 +142,20 @@ def original_fonts_path(project_dir: str | Path, version_id: str) -> Path:
 
 
 def _validate_original_fonts(value: object, version_id: str) -> dict[str, object]:
-    expected = {"schema", "version_id", "source_hash", "workbook_sha256", "slots"}
+    expected = {"kind", "epoch", "version_id", "source_hash", "workbook_sha256", "slots"}
     if not isinstance(value, dict) or set(value) != expected:
         raise FontError("original-fonts.json 字段不匹配")
-    if value.get("schema") != ORIGINAL_FONTS_SCHEMA or value.get("version_id") != version_id:
+    try:
+        require_format(
+            value,
+            kind="original-fonts",
+            version_key="epoch",
+            version=ARTIFACT_EPOCH,
+            label="字体原始记录",
+        )
+    except ValueError as error:
+        raise FontError(str(error)) from error
+    if value.get("version_id") != version_id:
         raise FontError("字体原始记录版本不匹配")
     source_hash = value.get("source_hash")
     workbook_hash = value.get("workbook_sha256")
@@ -172,7 +182,8 @@ def _validate_original_fonts(value: object, version_id: str) -> dict[str, object
     ):
         raise FontError("字体原始记录必须包含四个槽位且主字体不能为空")
     return {
-        "schema": ORIGINAL_FONTS_SCHEMA,
+        "kind": "original-fonts",
+        "epoch": ARTIFACT_EPOCH,
         "version_id": version_id,
         "source_hash": source_hash.lower(),
         "workbook_sha256": workbook_hash.lower(),
@@ -202,7 +213,8 @@ def record_original_fonts(
         values = list(slots)
         record = _validate_original_fonts(
             {
-                "schema": ORIGINAL_FONTS_SCHEMA,
+                "kind": "original-fonts",
+                "epoch": ARTIFACT_EPOCH,
                 "version_id": version_id,
                 "source_hash": source_hash,
                 "workbook_sha256": _sha256_file(workbook_path),
@@ -302,10 +314,24 @@ def validate_font_scheme(
     check_files: bool = True,
 ) -> dict[str, object]:
     root = Path(project_dir)
-    if not isinstance(value, dict) or set(value) != {"schema", "origin", "slots", "coverage_ack"}:
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "schema",
+        "origin",
+        "slots",
+        "coverage_ack",
+    }:
         raise FontError("font.json 字段不匹配")
-    if value.get("schema") != FONT_SCHEME_SCHEMA:
-        raise FontError(f"不支持的字体方案 schema: {value.get('schema')}")
+    try:
+        require_format(
+            value,
+            kind="font-scheme",
+            version_key="schema",
+            version=PROJECT_SCHEMA,
+            label="字体方案",
+        )
+    except ValueError as error:
+        raise FontError(str(error)) from error
     if value.get("origin") not in {"default", "user"}:
         raise FontError("字体方案 origin 无效")
     slots = value.get("slots")
@@ -358,7 +384,8 @@ def validate_font_scheme(
             raise FontError("字体覆盖确认记录无效")
         acknowledgement = dict(acknowledgement)
     return {
-        "schema": FONT_SCHEME_SCHEMA,
+        "kind": "font-scheme",
+        "schema": PROJECT_SCHEMA,
         "origin": value["origin"],
         "slots": validated_slots,
         "coverage_ack": acknowledgement,
@@ -1052,7 +1079,8 @@ def _font_environment_signature(game: Path) -> list[object]:
 def _font_candidate_cache_path(game: Path, required: set[str]) -> Path:
     payload = json.dumps(
         {
-            "schema": 2,
+            "kind": "font-candidate-key",
+            "epoch": ARTIFACT_EPOCH,
             "environment": _font_environment_signature(game),
             "required": sorted(required, key=ord),
         },
@@ -1072,8 +1100,15 @@ def _load_font_candidate_cache(
         return None
     try:
         value = json.loads(read_text_with_retry(path, encoding="utf-8"))
-        if not isinstance(value, dict) or value.get("schema") != 2:
+        if not isinstance(value, dict):
             return None
+        require_format(
+            value,
+            kind="font-candidates",
+            version_key="epoch",
+            version=ARTIFACT_EPOCH,
+            label="字体候选缓存",
+        )
         rows = value.get("candidates")
         if not isinstance(rows, list):
             return None
@@ -1141,7 +1176,8 @@ def _save_font_candidate_cache(path: Path, candidates: list[FontCandidate]) -> N
     atomic_write_json(
         path,
         {
-            "schema": 2,
+            "kind": "font-candidates",
+            "epoch": ARTIFACT_EPOCH,
             "candidates": [
                 {
                     "source": candidate.source,

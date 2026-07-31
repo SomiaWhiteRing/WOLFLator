@@ -23,18 +23,21 @@ if str(ROOT) not in sys.path:
 
 from PySide6.QtCore import QCoreApplication  # noqa: E402
 
+from formats import QA_SCHEMA, require_format  # noqa: E402
 from models import ImportCategory, ImportScope, Stage, StageStatus  # noqa: E402
 from pipeline import Pipeline, create_project, load_manifest  # noqa: E402
 from safe_io import atomic_write_json, atomic_write_text  # noqa: E402
 from settings import SettingsStore, local_data_dir  # noqa: E402
 from wolf_command_catalog import VERIFIED_EDITOR_SHA256, VERIFIED_EDITOR_VERSION  # noqa: E402
 from wolf_editor import analyze_auto_export, inspect_wolf_editor  # noqa: E402
+from wolf_analysis import load_editor_analysis  # noqa: E402
 from wolf_tools import (  # noqa: E402
     CancelledError,
     OfficialArtifactMissingError,
     OfficialToolDialogError,
     ToolProcessError,
     dump_items,
+    load_import_protection,
     load_items,
     official_dialogs_indicate_legacy_game,
     protect_control_tokens,
@@ -44,8 +47,6 @@ from wolf_tools import (  # noqa: E402
 )
 
 
-CORPUS_SCHEMA = 1
-RUN_SCHEMA = 2
 _REPARSE_POINT = 0x400
 _PSEUDO_ALPHABET = "伪译测试甲乙丙丁戊己庚辛壬癸"
 _COMPLETED = {"PASS", "OUT_OF_SCOPE", "DEFECT"}
@@ -213,7 +214,8 @@ def discover(roots: Iterable[Path], output: Path) -> dict[str, object]:
             }
         )
     manifest = {
-        "schema": CORPUS_SCHEMA,
+        "kind": "qa-corpus",
+        "schema": QA_SCHEMA,
         "created_at": _now(),
         "roots": [str(root) for root in normalized_roots],
         "scan_complete": not errors,
@@ -228,9 +230,13 @@ def discover(roots: Iterable[Path], output: Path) -> dict[str, object]:
 
 
 def select_manifest(source: Path, output: Path, kind: str) -> dict[str, object]:
-    manifest = _load_json(source)
-    if manifest.get("schema") != CORPUS_SCHEMA:
-        raise ValueError("不支持的发现清单 schema。")
+    manifest = require_format(
+        _load_json(source),
+        kind="qa-corpus",
+        version_key="schema",
+        version=QA_SCHEMA,
+        label="语料清单",
+    )
     candidates = manifest.get("candidates", [])
     if not isinstance(candidates, list):
         raise ValueError("发现清单 candidates 不是数组。")
@@ -240,7 +246,8 @@ def select_manifest(source: Path, output: Path, kind: str) -> dict[str, object]:
         if isinstance(candidate, dict) and candidate.get("kind") == kind
     ]
     scoped = {
-        "schema": CORPUS_SCHEMA,
+        "kind": "qa-corpus",
+        "schema": QA_SCHEMA,
         "created_at": _now(),
         "roots": list(manifest.get("roots", [])),
         "scan_complete": True,
@@ -474,7 +481,8 @@ def _run_candidate(
     checkpoint = checkpoint_dir / "report.json"
     started = time.monotonic()
     report: dict[str, object] = {
-        "schema": RUN_SCHEMA,
+        "kind": "qa-game-report",
+        "schema": QA_SCHEMA,
         "candidate_id": candidate_id,
         "path": str(source),
         "started_at": _now(),
@@ -504,7 +512,7 @@ def _run_candidate(
         current_stage = "analysis"
         extract = load_manifest(manifest_path).version.stage(Stage.EXTRACT).artifacts
         analysis_path = Path(extract["editor_analysis"])
-        first_analysis = _load_json(analysis_path)
+        first_analysis = load_editor_analysis(analysis_path)
         items = load_items(extract["items"])
         second_analysis = analyze_auto_export(
             extract["editor_auto_dir"],
@@ -558,7 +566,7 @@ def _run_candidate(
         pipeline.run_stage(Stage.IMPORT)
         manifest = load_manifest(manifest_path)
         import_artifacts = manifest.version.stage(Stage.IMPORT).artifacts
-        protection = _load_json(Path(import_artifacts["import_protection"]))
+        protection = load_import_protection(import_artifacts["import_protection"])
         replay = protection.get("translated_replay", {})
         structural = protection.get("structural_diff", {})
         after = game_fingerprint(source, str(candidate["kind"]))
@@ -731,7 +739,8 @@ def _aggregate(manifest: dict[str, object], reports: list[dict[str, object]]) ->
         counts[str(report.get("status", "INCOMPLETE"))] += 1
     eligible = counts["PASS"] + counts["DEFECT"]
     return {
-        "schema": RUN_SCHEMA,
+        "kind": "qa-run",
+        "schema": QA_SCHEMA,
         "updated_at": _now(),
         "scan_complete": bool(manifest.get("scan_complete")),
         "access_error_count": len(manifest.get("access_errors", [])),
@@ -771,9 +780,13 @@ def run_manifest(
 ) -> dict[str, object]:
     if not 1 <= jobs <= 16:
         raise ValueError("jobs 必须在 1..16 之间。")
-    manifest = _load_json(manifest_path)
-    if manifest.get("schema") != CORPUS_SCHEMA:
-        raise ValueError("不支持的全盘发现清单 schema。")
+    manifest = require_format(
+        _load_json(manifest_path),
+        kind="qa-corpus",
+        version_key="schema",
+        version=QA_SCHEMA,
+        label="语料清单",
+    )
     if candidate_ids:
         requested = set(candidate_ids)
         available = {
@@ -805,7 +818,8 @@ def run_manifest(
         raise FileExistsError(f"QA 运行目录已存在；请使用 --resume 或移走该目录: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema": RUN_SCHEMA,
+        "kind": "qa-environment",
+        "schema": QA_SCHEMA,
         "started_at": _now(),
         "manifest": str(manifest_path.resolve()),
         "manifest_sha256": sha256_file(manifest_path),
@@ -831,11 +845,16 @@ def run_manifest(
             raise ValueError("发现清单候选项不是对象。")
         checkpoint = run_dir / "games" / str(candidate["id"]) / "report.json"
         if resume and checkpoint.is_file():
-            previous = _load_json(checkpoint)
-            if (
-                previous.get("schema") == RUN_SCHEMA
-                and previous.get("status") in _COMPLETED
-            ):
+            previous = require_format(
+                _load_json(checkpoint),
+                kind="qa-game-report",
+                version_key="schema",
+                version=QA_SCHEMA,
+                label="单游戏 QA 检查点",
+            )
+            if previous.get("candidate_id") != candidate["id"]:
+                raise ValueError("单游戏 QA 检查点与当前候选不匹配。")
+            if previous.get("status") in _COMPLETED:
                 reports_by_id[str(candidate["id"])] = previous
                 print(f"[{index}/{len(candidates)}] {candidate['path']} -> {previous['status']} (resume)", flush=True)
                 continue
@@ -865,7 +884,8 @@ def run_manifest(
                 report = future.result()
             except Exception as error:
                 report = {
-                    "schema": RUN_SCHEMA,
+                    "kind": "qa-game-report",
+                    "schema": QA_SCHEMA,
                     "candidate_id": candidate_id,
                     "path": str(candidate["path"]),
                     "started_at": _now(),
@@ -899,8 +919,20 @@ def run_manifest(
 
 
 def verify(run_dir: Path) -> tuple[bool, list[str], dict[str, object]]:
-    aggregate = _load_json(run_dir / "run.json")
-    environment = _load_json(run_dir / "environment.json")
+    aggregate = require_format(
+        _load_json(run_dir / "run.json"),
+        kind="qa-run",
+        version_key="schema",
+        version=QA_SCHEMA,
+        label="QA 运行汇总",
+    )
+    environment = require_format(
+        _load_json(run_dir / "environment.json"),
+        kind="qa-environment",
+        version_key="schema",
+        version=QA_SCHEMA,
+        label="QA 环境记录",
+    )
     errors = []
     git = environment.get("git", {})
     if not isinstance(git, dict) or not git.get("available"):
@@ -933,7 +965,13 @@ def verify(run_dir: Path) -> tuple[bool, list[str], dict[str, object]]:
         candidate_id = str(summary.get("candidate_id", ""))
         report_path = run_dir / "games" / candidate_id / "report.json"
         try:
-            report = _load_json(report_path)
+            report = require_format(
+                _load_json(report_path),
+                kind="qa-game-report",
+                version_key="schema",
+                version=QA_SCHEMA,
+                label="单游戏 QA 报告",
+            )
         except (OSError, ValueError) as error:
             errors.append(f"{candidate_id}: 无法读取逐游戏报告: {error}")
             continue

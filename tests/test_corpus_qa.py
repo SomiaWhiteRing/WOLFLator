@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from formats import QA_SCHEMA
 from scripts.wolf_corpus_qa import (
     _aggregate,
     _official_out_of_scope,
@@ -144,6 +145,8 @@ class CorpusQaTests(unittest.TestCase):
             report_dir = run / "games" / candidate_id
             report_dir.mkdir(parents=True)
             report = {
+                "kind": "qa-game-report",
+                "schema": QA_SCHEMA,
                 "candidate_id": candidate_id,
                 "status": "PASS",
                 "coverage": _coverage(),
@@ -164,6 +167,8 @@ class CorpusQaTests(unittest.TestCase):
                 json.dumps(report), encoding="utf-8"
             )
             aggregate = {
+                "kind": "qa-run",
+                "schema": QA_SCHEMA,
                 "scan_complete": True,
                 "access_error_count": 0,
                 "candidate_total": 1,
@@ -178,6 +183,8 @@ class CorpusQaTests(unittest.TestCase):
             (run / "environment.json").write_text(
                 json.dumps(
                     {
+                        "kind": "qa-environment",
+                        "schema": QA_SCHEMA,
                         "git": {
                             "available": True,
                             "commit": "a" * 40,

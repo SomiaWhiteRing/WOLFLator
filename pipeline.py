@@ -21,6 +21,7 @@ from ainiee import (
     require_managed_runtime,
     run_translation,
 )
+from formats import ARTIFACT_EPOCH, require_format
 from fonts import (
     FONT_CODES,
     FONT_SLOT_NAMES,
@@ -59,7 +60,6 @@ from safe_io import (
     replace_with_retry,
 )
 from wolf_editor import (
-    AUTO_ANALYSIS_SCHEMA,
     analyze_auto_export,
     analyze_translation_safety,
     compare_auto_structure,
@@ -68,7 +68,7 @@ from wolf_editor import (
     inspect_wolf_editor,
 )
 from proofread import accepted_translations, load_report
-from wolf_analysis import load_program_cache, write_program_cache
+from wolf_analysis import load_editor_analysis, load_program_cache, write_program_cache
 from wolf_tools import (
     CancelledError,
     COPY_FROM_RE,
@@ -80,8 +80,8 @@ from wolf_tools import (
     dump_items,
     full_export_scope,
     hash_directory,
-    IMPORT_PROTECTION_SCHEMA,
     imported_display_texts,
+    load_import_protection,
     load_items,
     locate_workbook,
     merge_ainiee_output,
@@ -106,9 +106,6 @@ from wolf_tools import (
     WORKBOOK_NAME,
     SUPPORT_DIR,
 )
-
-
-EXPORT_SCHEMA = 5
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -161,21 +158,13 @@ def create_project(projects_root: str | Path, game_path: str | Path, name: str =
 
 
 def load_manifest(path: str | Path) -> ProjectManifest:
-    data = json.loads(read_text_with_retry(path, encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("项目清单根节点不是对象。")
-    manifest = ProjectManifest.from_dict(data)
-    reset = False
-    for stage in STAGE_ORDER:
-        record = manifest.version.stage(stage)
-        if record.artifacts.get("skipped") == "true":
-            reset = True
-            record.artifacts = {}
-        if reset:
-            record.status = StageStatus.PENDING
-            record.error = ""
-    # ponytail: removed skip markers vanish on the next ordinary manifest save.
-    return manifest
+    try:
+        data = json.loads(read_text_with_retry(path, encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("项目清单根节点不是对象。")
+        return ProjectManifest.from_dict(data)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, ValueError) as error:
+        raise ValueError("项目格式不兼容，请重新创建项目") from error
 
 
 def add_version(manifest_path: str | Path, game_path: str | Path) -> ProjectManifest:
@@ -286,12 +275,6 @@ class Pipeline:
             self.detail("manifest.save.failed\n" + traceback.format_exc())
             raise
         self.detail("manifest.save.complete")
-        legacy_temporary = self.manifest_path.with_name("project.json.tmp")
-        if legacy_temporary.is_file():
-            try:
-                legacy_temporary.unlink(missing_ok=True)
-            except OSError as error:
-                self.detail(f"manifest.legacy_tmp.cleanup_failed path={legacy_temporary} error={error}")
 
     @contextmanager
     def _mutation(self, operation: str):
@@ -637,10 +620,13 @@ class Pipeline:
 
     def _stage_input_hash(self, stage: Stage) -> str:
         if stage is Stage.COPY:
-            return hash_directory(self.manifest.version.original_path)
+            source_hash = hash_directory(self.manifest.version.original_path)
+            return hashlib.sha256(
+                f"{ARTIFACT_EPOCH}:{source_hash}".encode("ascii")
+            ).hexdigest()
         previous = STAGE_ORDER[STAGE_ORDER.index(stage) - 1]
         record = self.manifest.version.stage(previous)
-        extra: dict[str, object] = {}
+        extra: dict[str, object] = {"artifact_epoch": ARTIFACT_EPOCH}
         if stage is Stage.UNPACK:
             extra["ascii_runner_dir"] = self.settings.ascii_runner_dir
         elif stage is Stage.EXTRACT:
@@ -657,8 +643,6 @@ class Pipeline:
                 extra["wolf_editor"] = str(editor_path)
                 extra["wolf_editor_version"] = ""
                 extra["wolf_editor_sha256"] = ""
-            extra["editor_analysis_schema"] = AUTO_ANALYSIS_SCHEMA
-            extra["export_schema"] = EXPORT_SCHEMA
             extra["auto_convert_legacy_games"] = self.settings.auto_convert_legacy_games
             extra["export_scope"] = self.manifest.export_scope.__dict__
             extra["exclude_large_external_files"] = self.manifest.exclude_large_external_files
@@ -693,7 +677,6 @@ class Pipeline:
         elif stage is Stage.IMPORT:
             extra["import_scope"] = self.manifest.import_scope.__dict__
             extra["import_protection"] = self.manifest.import_protection.__dict__
-            extra["import_protection_schema"] = IMPORT_PROTECTION_SCHEMA
         elif stage is Stage.RELEASE:
             scheme = load_font_scheme(self.project_dir)
             extra["font_scheme"] = scheme_hash(scheme)
@@ -713,23 +696,18 @@ class Pipeline:
                     ).artifacts.get("import_protection", "")
                     protected_keys: set[str] = set()
                     if protection_path and Path(protection_path).is_file():
-                        protection = json.loads(
-                            Path(protection_path).read_text(encoding="utf-8")
+                        protection = load_import_protection(protection_path)
+                        protected_keys = set(map(str, protection["protected_keys"]))
+                        normalize_import_display_middle_dots(
+                            font_items,
+                            self.manifest.import_scope,
+                            allow_copy_condition_groups=(
+                                self.manifest.import_protection.allow_copy_condition_groups
+                            ),
+                            eligible_keys=set(
+                                map(str, protection["middle_dot_normalized"])
+                            ),
                         )
-                        if isinstance(protection, dict):
-                            protected_keys = set(
-                                map(str, protection.get("protected_keys", ()))
-                            )
-                            normalize_import_display_middle_dots(
-                                font_items,
-                                self.manifest.import_scope,
-                                allow_copy_condition_groups=(
-                                    self.manifest.import_protection.allow_copy_condition_groups
-                                ),
-                                eligible_keys=set(
-                                    map(str, protection.get("middle_dot_normalized", ()))
-                                ),
-                            )
                     corpus = imported_display_texts(
                         font_items,
                         self.manifest.import_scope,
@@ -748,6 +726,54 @@ class Pipeline:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _artifact_header(path: str, kind: str) -> None:
+        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
+        require_format(
+            value,
+            kind=kind,
+            version_key="epoch",
+            version=ARTIFACT_EPOCH,
+            label="派生产物",
+        )
+
+    def _stage_artifacts_valid(self, stage: Stage) -> bool:
+        artifacts = self.manifest.version.stage(stage).artifacts
+        try:
+            if stage is Stage.UNPACK:
+                self._artifact_header(artifacts["excluded_files"], "excluded-files-report")
+            elif stage is Stage.EXTRACT:
+                items = load_items(artifacts["items"])
+                load_editor_analysis(artifacts["editor_analysis"])
+                load_program_cache(
+                    artifacts["editor_program"],
+                    items=items,
+                    editor_version=artifacts.get("editor_version") or None,
+                    editor_sha256=artifacts.get("editor_sha256") or None,
+                )
+                if artifacts.get("legacy_conversion_report"):
+                    self._artifact_header(
+                        artifacts["legacy_conversion_report"], "legacy-conversion-report"
+                    )
+                if artifacts.get("incremental_conflicts"):
+                    self._artifact_header(
+                        artifacts["incremental_conflicts"], "incremental-conflicts"
+                    )
+            elif stage in {Stage.TRANSLATE, Stage.VALIDATE}:
+                load_items(artifacts["items"])
+            elif stage is Stage.IMPORT:
+                load_import_protection(artifacts["import_protection"])
+                load_editor_analysis(artifacts["post_import_editor_analysis"])
+                if artifacts.get("official_warnings"):
+                    self._artifact_header(artifacts["official_warnings"], "official-diagnostics")
+            elif stage is Stage.RELEASE and artifacts.get("font_result"):
+                self._artifact_header(artifacts["font_result"], "font-result")
+                if artifacts.get("font_warnings"):
+                    self._artifact_header(artifacts["font_warnings"], "font-warnings")
+            return True
+        except (KeyError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+
     def _invalidate_changed_inputs(self) -> None:
         invalid = False
         for stage in STAGE_ORDER[1:]:
@@ -756,7 +782,10 @@ class Pipeline:
                 record.status = StageStatus.PENDING
                 record.error = ""
                 continue
-            if record.status is StageStatus.COMPLETED and record.input_hash != self._stage_input_hash(stage):
+            if record.status is StageStatus.COMPLETED and (
+                not self._stage_artifacts_valid(stage)
+                or record.input_hash != self._stage_input_hash(stage)
+            ):
                 invalid = True
                 record.status = StageStatus.PENDING
                 record.error = ""
@@ -818,45 +847,36 @@ class Pipeline:
         if not path or not Path(path).is_file():
             return None
         program = artifacts.get("editor_program", "")
-        if program:
-            try:
+        try:
+            if program:
                 return load_program_cache(
                     program,
                     items=items,
                     editor_version=artifacts.get("editor_version") or None,
                     editor_sha256=artifacts.get("editor_sha256") or None,
                 )
-            except ValueError as exc:
-                if items is None:
-                    raise
-                self.warning(f"Editor 程序缓存失效，正在重新分析 Auto：{exc}")
-                auto_dir = artifacts.get("editor_auto_dir", "")
-                if not auto_dir or not Path(auto_dir).is_dir():
-                    raise RuntimeError("Editor 程序缓存失效且 Auto 目录缺失。") from exc
-                old_report: dict[str, object] = {}
-                try:
-                    loaded = json.loads(Path(path).read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        old_report = loaded
-                except (OSError, json.JSONDecodeError):
-                    pass
-                editor = inspect_wolf_editor(self.settings.wolf_editor_path)
-                rebuilt = analyze_auto_export(
-                    auto_dir,
-                    items,
-                    editor,
-                    input_hash=str(old_report.get("input_hash", "cache-rebuild")),
-                )
-                atomic_write_json(path, rebuilt, indent=None)
+            return load_editor_analysis(path)
+        except ValueError as exc:
+            if items is None:
+                raise
+            self.warning(f"Editor 分析缓存失效，正在重新分析 Auto：{exc}")
+            auto_dir = artifacts.get("editor_auto_dir", "")
+            if not auto_dir or not Path(auto_dir).is_dir():
+                raise RuntimeError("Editor 分析缓存失效且 Auto 目录缺失。") from exc
+            editor = inspect_wolf_editor(self.settings.wolf_editor_path)
+            rebuilt = analyze_auto_export(
+                auto_dir,
+                items,
+                editor,
+                input_hash=self.manifest.version.stage(Stage.EXTRACT).input_hash,
+            )
+            atomic_write_json(path, rebuilt, indent=None)
+            if program:
                 write_program_cache(program, path, items)
-                artifacts["editor_version"] = editor.version
-                artifacts["editor_sha256"] = editor.sha256
-                self.save()
-                return rebuilt
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("Editor 分析报告根节点不是对象。")
-        return value
+            artifacts["editor_version"] = editor.version
+            artifacts["editor_sha256"] = editor.sha256
+            self.save()
+            return rebuilt
 
     def _translation_safety(self, items) -> dict[str, object]:
         rules = self.manifest.import_protection
@@ -984,9 +1004,9 @@ class Pipeline:
     def _unpack(self) -> dict[str, str]:
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         excluded: list[dict[str, object]] = []
-        excluded_root = self.artifacts_dir / "excluded-legacy"
+        excluded_root = self.artifacts_dir / "excluded-files"
         # ponytail: UberWolf enumerates Game.exe siblings here; keep this MTool rule root-scoped.
-        legacy_files = sorted(
+        mtool_files = sorted(
             (
                 path
                 for path in self.work_dir.iterdir()
@@ -999,7 +1019,7 @@ class Pipeline:
             ),
             key=lambda path: path.name.casefold(),
         )
-        for source in legacy_files:
+        for source in mtool_files:
             digest = sha256_file(source)
             target = excluded_root / f"{digest[:16]}-{source.name}"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1011,14 +1031,21 @@ class Pipeline:
                     "bytes": target.stat().st_size,
                     "sha256": digest,
                     "stored_path": str(target),
-                    "reason": "MTool 遗留 TrsData 系列文件，固定不参与 WOLF 解包",
+                    "reason": "MTool TrsData 系列文件，固定不参与 WOLF 解包",
                 }
             )
-        excluded_artifact = self.artifacts_dir / "excluded-legacy-files.json"
-        _atomic_json(excluded_artifact, {"schema": 1, "files": excluded})
+        excluded_artifact = self.artifacts_dir / "excluded-files.json"
+        _atomic_json(
+            excluded_artifact,
+            {
+                "kind": "excluded-files-report",
+                "epoch": ARTIFACT_EPOCH,
+                "files": excluded,
+            },
+        )
         if excluded:
             self.warning(
-                f"已固定排除 {len(excluded)} 个 MTool 遗留 TrsData 系列文件；"
+                f"已固定排除 {len(excluded)} 个 MTool TrsData 系列文件；"
                 f"详情见 {excluded_artifact}。"
             )
         executable = prepare_uberwolf(self.settings.ascii_runner_dir)
@@ -1032,7 +1059,7 @@ class Pipeline:
         return {
             "data": str(self.work_dir / "Data"),
             "uberwolf": str(executable),
-            "excluded_legacy_files": str(excluded_artifact),
+            "excluded_files": str(excluded_artifact),
         }
 
     def _extract(self) -> dict[str, str]:
@@ -1091,9 +1118,7 @@ class Pipeline:
                 diagnostic_log=self.detail,
                 warning=self.warning,
             )
-            editor_analysis = json.loads(
-                editor_result.analysis_path.read_text(encoding="utf-8")
-            )
+            editor_analysis = load_editor_analysis(editor_result.analysis_path)
             editor_program = write_program_cache(
                 staging / "editor" / "editor-program.json",
                 editor_result.analysis_path,
@@ -1129,7 +1154,14 @@ class Pipeline:
             for item in items:
                 categories[item.category.value] = categories.get(item.category.value, 0) + 1
             if conflicts:
-                _atomic_json(staging / "incremental-conflicts.json", conflicts)
+                _atomic_json(
+                    staging / "incremental-conflicts.json",
+                    {
+                        "kind": "incremental-conflicts",
+                        "epoch": ARTIFACT_EPOCH,
+                        "conflicts": conflicts,
+                    },
+                )
             replace_with_retry(staging, final_dir)
 
             extracted = final_dir / "source.xlsx"
@@ -1278,7 +1310,14 @@ class Pipeline:
                     for row in retry_input
                 ]
                 _atomic_json(retry_input_path, retry_input)
-                _atomic_json(retry_reasons_path, retry_reasons)
+                _atomic_json(
+                    retry_reasons_path,
+                    {
+                        "kind": "translation-retry-reasons",
+                        "epoch": ARTIFACT_EPOCH,
+                        "errors": retry_reasons,
+                    },
+                )
                 self.log(
                     f"AiNiee 首轮有 {len(retry_input)} 条未通过 WOLFLator 校验，"
                     f"新建会话定向重跑，最多 {self.settings.translation_rounds} 轮。"
@@ -1322,6 +1361,8 @@ class Pipeline:
                 _atomic_json(
                     retry_report_path,
                     {
+                        "kind": "translation-retry-result",
+                        "epoch": ARTIFACT_EPOCH,
                         "first_pass_failed": len(retry_errors),
                         "retry_output_rows": len(retry_raw),
                         "remaining_failed": len(remaining_errors),
@@ -1635,7 +1676,14 @@ class Pipeline:
                 diagnostic["source"] = next(iter(originals))
         diagnostics_path = self.artifacts_dir / "official-diagnostics.json"
         if diagnostics:
-            _atomic_json(diagnostics_path, diagnostics)
+            _atomic_json(
+                diagnostics_path,
+                {
+                    "kind": "official-diagnostics",
+                    "epoch": ARTIFACT_EPOCH,
+                    "diagnostics": diagnostics,
+                },
+            )
             artifacts["official_warning_count"] = str(len(diagnostics))
             artifacts["official_warnings"] = str(diagnostics_path)
             self.warning(f"官方工具完成，但报告了 {len(diagnostics)} 条警告；详情已保存。")
@@ -1772,12 +1820,8 @@ class Pipeline:
         )
         if not protection_path or not Path(protection_path).is_file():
             raise RuntimeError("缺少已验证的导入保护报告，请先重新执行导入。")
-        protection = json.loads(Path(protection_path).read_text(encoding="utf-8"))
-        if (
-            not isinstance(protection, dict)
-            or protection.get("schema") != IMPORT_PROTECTION_SCHEMA
-            or dict(protection.get("structural_diff", {})).get("status") != "passed"
-        ):
+        protection = load_import_protection(protection_path)
+        if dict(protection["structural_diff"]).get("status") != "passed":
             raise RuntimeError("导入保护报告未通过官方 Editor 回读验证。")
         normalize_import_display_middle_dots(
             validated_items,
@@ -1812,6 +1856,8 @@ class Pipeline:
             _atomic_json(
                 warning_path,
                 {
+                    "kind": "font-warnings",
+                    "epoch": ARTIFACT_EPOCH,
                     "coverage_fingerprint": fingerprint,
                     "acknowledged": (
                         isinstance(scheme.get("coverage_ack"), dict)
@@ -1931,6 +1977,8 @@ class Pipeline:
         _atomic_json(
             result_path,
             {
+                "kind": "font-result",
+                "epoch": ARTIFACT_EPOCH,
                 "scheme_sha256": scheme_hash(scheme),
                 "coverage_fingerprint": fingerprint,
                 "coverage_scope": "approved_import_translations",

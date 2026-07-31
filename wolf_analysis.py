@@ -5,14 +5,41 @@ import json
 import os
 from pathlib import Path
 
+from formats import ARTIFACT_EPOCH, require_format
 from models import TranslationItem
 from safe_io import atomic_write_json
 
 
-AUTO_ANALYSIS_SCHEMA = 20
-TRANSLATION_SAFETY_SCHEMA = 6
-PROGRAM_CACHE_SCHEMA = 1
 ANALYSIS_ENGINE = "sparse-relational-v2"
+
+
+def validate_editor_analysis(report: object) -> dict[str, object]:
+    value = require_format(
+        report,
+        kind="editor-analysis",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="Editor 分析报告",
+    )
+    editor = value.get("editor")
+    if (
+        value.get("engine") != ANALYSIS_ENGINE
+        or not isinstance(editor, dict)
+        or not isinstance(editor.get("version"), str)
+        or not isinstance(editor.get("sha256"), str)
+        or not isinstance(value.get("input_hash"), str)
+        or not isinstance(value.get("output_hash"), str)
+    ):
+        raise ValueError("Editor 分析报告结构不匹配。")
+    return value
+
+
+def load_editor_analysis(path: str | Path) -> dict[str, object]:
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Editor 分析报告损坏。") from exc
+    return validate_editor_analysis(report)
 
 
 def source_structure_fingerprint(items: list[TranslationItem]) -> str:
@@ -23,7 +50,6 @@ def source_structure_fingerprint(items: list[TranslationItem]) -> str:
             item.original,
             item.code,
             item.context,
-            item.stage,
             item.flag,
             item.type,
             item.info,
@@ -57,9 +83,7 @@ def write_program_cache(
 ) -> Path:
     output = Path(path).resolve()
     report_path = Path(analysis_path).resolve()
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    if not isinstance(report, dict) or report.get("schema") != AUTO_ANALYSIS_SCHEMA:
-        raise ValueError("Editor 分析报告 schema 与程序缓存不匹配。")
+    report = load_editor_analysis(report_path)
     editor = report.get("editor")
     if not isinstance(editor, dict):
         raise ValueError("Editor 分析报告缺少 Editor 身份。")
@@ -68,8 +92,8 @@ def write_program_cache(
     except ValueError as exc:
         raise ValueError("Editor 分析报告必须位于程序缓存目录内。") from exc
     manifest = {
-        "schema": PROGRAM_CACHE_SCHEMA,
-        "analysis_schema": AUTO_ANALYSIS_SCHEMA,
+        "kind": "editor-program-cache",
+        "epoch": ARTIFACT_EPOCH,
         "engine": ANALYSIS_ENGINE,
         "input_hash": str(report.get("input_hash", "")),
         "output_hash": str(report.get("output_hash", "")),
@@ -97,17 +121,33 @@ def load_program_cache(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Editor 程序缓存损坏。") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema") != PROGRAM_CACHE_SCHEMA:
-        raise ValueError("Editor 程序缓存 schema 不匹配。")
-    if (
-        manifest.get("analysis_schema") != AUTO_ANALYSIS_SCHEMA
-        or manifest.get("engine") != ANALYSIS_ENGINE
-    ):
+    manifest = require_format(
+        manifest,
+        kind="editor-program-cache",
+        version_key="epoch",
+        version=ARTIFACT_EPOCH,
+        label="Editor 程序缓存",
+    )
+    if set(manifest) != {
+        "kind",
+        "epoch",
+        "engine",
+        "input_hash",
+        "output_hash",
+        "editor",
+        "source_fingerprint",
+        "analysis_file",
+        "analysis_sha256",
+    }:
+        raise ValueError("Editor 程序缓存字段不匹配。")
+    if manifest.get("engine") != ANALYSIS_ENGINE:
         raise ValueError("Editor 程序缓存分析引擎已过期。")
     if input_hash is not None and manifest.get("input_hash") != input_hash:
         raise ValueError("Editor 程序缓存输入哈希不匹配。")
     editor = manifest.get("editor")
-    if not isinstance(editor, dict):
+    if not isinstance(editor, dict) or set(editor) != {"version", "sha256"} or not all(
+        isinstance(editor[name], str) for name in editor
+    ):
         raise ValueError("Editor 程序缓存缺少 Editor 身份。")
     if editor_version is not None and editor.get("version") != editor_version:
         raise ValueError("Editor 程序缓存版本不匹配。")
@@ -131,17 +171,10 @@ def load_program_cache(
         "analysis_sha256"
     ):
         raise ValueError("Editor 程序缓存分析报告缺失或哈希不匹配。")
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Editor 程序缓存分析报告损坏。") from exc
-    if not isinstance(report, dict):
-        raise ValueError("Editor 程序缓存分析报告根节点不是对象。")
+    report = load_editor_analysis(report_path)
     report_editor = report.get("editor")
     if (
-        report.get("schema") != AUTO_ANALYSIS_SCHEMA
-        or report.get("engine") != ANALYSIS_ENGINE
-        or report.get("input_hash") != manifest.get("input_hash")
+        report.get("input_hash") != manifest.get("input_hash")
         or report.get("output_hash") != manifest.get("output_hash")
         or not isinstance(report_editor, dict)
         or report_editor.get("version") != editor.get("version")

@@ -100,6 +100,7 @@ from models import (
     default_export_scope,
     default_processing_scope,
 )
+from formats import PROJECT_SCHEMA
 from pipeline import Pipeline, PipelineStateEvent, add_version, create_project, load_manifest
 from proofread import (
     load_report,
@@ -119,12 +120,14 @@ from wolf_editor import (
 from wolf_tools import (
     analyze_import_protection,
     imported_display_texts,
+    load_import_protection,
     load_items,
     protect_control_tokens,
     read_font_slots,
     selected_translation_requirements,
     sha256_file,
 )
+from wolf_analysis import load_editor_analysis
 
 
 STAGE_LABELS = {
@@ -229,10 +232,7 @@ def _load_editor_analysis(manifest) -> dict[str, object] | None:
     path = manifest.version.stage(Stage.EXTRACT).artifacts.get("editor_analysis", "")
     if not path or not Path(path).is_file():
         return None
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("Editor 分析报告根节点不是对象。")
-    return value
+    return load_editor_analysis(path)
 
 
 def _translation_safety_for_manifest(
@@ -271,13 +271,9 @@ def _completed_import_protection(manifest, items_path: Path) -> dict[str, object
         or path.stat().st_mtime_ns < items_path.stat().st_mtime_ns
     ):
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    protected = value.get("protected_keys") if isinstance(value, dict) else None
-    if (
-        not isinstance(value, dict)
-        or not isinstance(protected, list)
-        or not all(isinstance(key, str) for key in protected)
-    ):
+    try:
+        value = load_import_protection(path)
+    except ValueError:
         return None
     return value
 
@@ -3000,7 +2996,8 @@ class MainWindow(QMainWindow):
                 for candidate in selections
             ]
             scheme: dict[str, object] = {
-                "schema": 1,
+                "kind": "font-scheme",
+                "schema": PROJECT_SCHEMA,
                 "origin": "user",
                 "slots": slots,
                 "coverage_ack": None,

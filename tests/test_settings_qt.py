@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QToolButton,
 )
 
+from formats import ARTIFACT_EPOCH
 from app import (
     EditorInstallThread,
     STAGE_RESULT_LABELS,
@@ -376,7 +377,23 @@ class SettingsQtTests(unittest.TestCase):
             report = root / "import-protection.json"
             items.write_text("{}", encoding="utf-8")
             report.write_text(
-                json.dumps({"schema": 2, "protected_keys": ["key"]}),
+                json.dumps(
+                    {
+                        "kind": "import-protection",
+                        "epoch": ARTIFACT_EPOCH,
+                        "protected_keys": ["key"],
+                        "safe_to_translate": [],
+                        "keep_original": [],
+                        "translation_overrides": {},
+                        "approvals": {},
+                        "unresolved_scopes": [],
+                        "translated_replay": {},
+                        "structural_diff": {},
+                        "entries": [],
+                        "summary": {},
+                        "middle_dot_normalized": [],
+                    }
+                ),
                 encoding="utf-8",
             )
             record = manifest.version.stage(Stage.IMPORT)
@@ -426,7 +443,7 @@ class SettingsQtTests(unittest.TestCase):
             with patch("app.SettingsStore", return_value=store), patch.object(MainWindow, "_open_settings"):
                 window = MainWindow()
                 self.assertIn("已拒绝 1 个不兼容的项目清单", window.status_label.text())
-                self.assertIn("schema", window.status_label.toolTip())
+                self.assertIn("项目格式不兼容", window.status_label.toolTip())
                 window.close()
 
     def test_step_mode_progress_and_running_ui_lock(self):
@@ -679,7 +696,8 @@ class SettingsQtTests(unittest.TestCase):
             report = make_report(
                 worker_input,
                 {
-                    "schema": 1,
+                    "kind": "proofread-worker-output",
+                    "epoch": ARTIFACT_EPOCH,
                     "entries": {
                         "one": {"issues": [issue], "suggested_translation": "建议一"},
                         "two": {"issues": [issue], "suggested_translation": "建议二"},
