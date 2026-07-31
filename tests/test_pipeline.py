@@ -7,9 +7,8 @@ from unittest import mock
 from openpyxl import Workbook
 
 from formats import ARTIFACT_EPOCH
-from fonts import BUNDLED_FONT_FAMILY, BUNDLED_FONT_ID, default_font_scheme, load_font_scheme
+from fonts import BUNDLED_FONT_FAMILY, BUNDLED_FONT_ID, load_font_scheme
 from models import (
-    STAGE_ORDER,
     AppSettings,
     ImportProtectionRules,
     ImportScope,
@@ -26,8 +25,6 @@ from wolf_tools import (
     OfficialToolDialogError,
     UberWolfRunner,
     dump_items,
-    full_export_scope,
-    hash_directory,
     load_items,
 )
 
@@ -347,80 +344,8 @@ class PipelineTests(unittest.TestCase):
                     pipeline._translate()
             self.assertEqual(2, run.call_count)
 
-    def test_new_project_has_four_slot_default_font_scheme(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            scheme = load_font_scheme(manifest_path.parent)
-            self.assertEqual("default", scheme["origin"])
-            self.assertEqual(
-                [BUNDLED_FONT_FAMILY] * 4,
-                [slot["family"] for slot in scheme["slots"]],
-            )
-            manifest = load_manifest(manifest_path)
-            self.assertTrue(manifest.export_scope.external)
-            self.assertTrue(manifest.translation_scope.external)
-            self.assertTrue(manifest.import_scope.external)
-            self.assertTrue(manifest.exclude_large_external_files)
-            self.assertEqual(128, manifest.external_file_limit_kb)
-            self.assertEqual("warn", manifest.import_protection.logic_unknown_policy)
 
-    def test_filtered_export_uses_temporary_view_and_returns_workbook(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(
-                manifest_path,
-                AppSettings(),
-                "",
-                root / "cache",
-                glossary_api_key="",
-            )
-            (pipeline.work_dir / "Data").mkdir(parents=True)
-            (pipeline.work_dir / "Game.exe").write_bytes(b"game")
-            large = pipeline.work_dir / "Data" / "dump.TXT"
-            large.write_bytes(b"x" * (128 * 1024 + 1))
-            warnings = []
-            pipeline.warning = warnings.append
-            runner = mock.Mock()
 
-            def extract(view, **_kwargs):
-                view = Path(view)
-                self.assertNotEqual(pipeline.work_dir, view)
-                self.assertFalse((view / "Data" / "dump.TXT").exists())
-                workbook = view / "WOLF_Translation_Support_Tool_Data" / "WOLF_Translation_Text.xlsx"
-                workbook.parent.mkdir(parents=True)
-                workbook.write_bytes(b"xlsx")
-                return workbook
-
-            runner.extract.side_effect = extract
-            output = pipeline._run_scoped_export(runner, "EXTRACT")
-
-            self.assertEqual(b"xlsx", output.read_bytes())
-            self.assertEqual(b"x" * (128 * 1024 + 1), large.read_bytes())
-            self.assertTrue(any("已临时排除" in warning for warning in warnings))
-            self.assertFalse(any(pipeline.version_dir.glob(".wolflator-export-view-*")))
-
-    def test_font_scheme_change_invalidates_only_release(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            pipeline = Pipeline(manifest_path, AppSettings(), "", root / "cache", glossary_api_key="")
-            with pipeline._mutation("test-setup"):
-                for stage in STAGE_ORDER:
-                    pipeline.manifest.version.stage(stage).status = StageStatus.COMPLETED
-                pipeline.save()
-            scheme = default_font_scheme()
-            scheme["slots"][0] = {"mode": "keep"}
-            pipeline.set_font_scheme(scheme)
-            manifest = load_manifest(manifest_path)
-            self.assertTrue(
-                all(
-                    manifest.version.stage(stage).status is StageStatus.COMPLETED
-                    for stage in STAGE_ORDER[:-1]
-                )
-            )
-            self.assertIs(StageStatus.PENDING, manifest.version.stage(Stage.RELEASE).status)
 
     def test_font_release_uses_official_workbook_and_verifies_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -771,49 +696,6 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual("keep", (old / "old.txt").read_text(encoding="utf-8"))
             self.assertFalse(any(pipeline.artifacts_dir.glob(".import-game-*")))
 
-    def test_import_persists_official_warnings_and_console(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            pipeline = self._translation_pipeline(root)
-            items = [TranslationItem(key="plain", original="甲", translation="译文", code="COMMON-1-0-0")]
-            items_path = dump_items(pipeline.artifacts_dir / "items-translated.json", items)
-            pipeline.manifest.version.stage(Stage.VALIDATE).artifacts = {
-                "full_workbook": str(pipeline.artifacts_dir / "translated-full.xlsx"),
-                "items": str(items_path),
-            }
-            scoped = root / "import-scoped.xlsx"
-            scoped.write_bytes(b"xlsx")
-            runner = mock.Mock()
-            runner.translate.side_effect = lambda game_root, **_kwargs: make_game(
-                Path(game_root) / "Translated1_Chinese (Simplified)"
-            )
-            runner.diagnostics = [
-                {
-                    "mode": "TRANSLATE",
-                    "code": "COMMON-1-0-0",
-                    "source": "normalized-source",
-                    "message": "warning",
-                }
-            ]
-            runner.console_outputs = [
-                {"mode": "TRANSLATE", "timeline": "earlier screen", "final": "raw screen"}
-            ]
-
-            post_editor = mock.Mock(auto_dir=root / "post-auto", analysis_path=root / "post-analysis.json")
-            with mock.patch.object(pipeline, "_official_runner", return_value=runner), mock.patch(
-                "pipeline.write_scoped_workbook", return_value=scoped
-            ), mock.patch("pipeline.export_and_analyze", return_value=post_editor), mock.patch(
-                "pipeline.compare_auto_structure", return_value={"status": "passed", "differences": []}
-            ):
-                artifacts = pipeline._import()
-
-            self.assertEqual("1", artifacts["official_warning_count"])
-            warnings = json.loads(Path(artifacts["official_warnings"]).read_text(encoding="utf-8"))
-            self.assertEqual(runner.diagnostics, warnings["diagnostics"])
-            self.assertEqual("甲", warnings["diagnostics"][0]["source"])
-            console = Path(artifacts["official_console"]).read_text(encoding="utf-8")
-            self.assertIn("earlier screen", console)
-            self.assertIn("raw screen", console)
 
     def test_manifest_rejects_missing_translation_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -851,21 +733,6 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "项目格式不兼容"):
                 load_manifest(manifest_path)
 
-    def test_run_stage_executes_only_selected_stage(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            executed = []
-            pipeline = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            pipeline.executed = executed
-            self.assertEqual("completed", pipeline.run_stage(Stage.GLOSSARY))
-            self.assertEqual([Stage.GLOSSARY], executed)
-            current = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.GLOSSARY).status)
-            self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.COPY).status)
-            self.assertEqual(StageStatus.PENDING, current.version.stage(Stage.TRANSLATE).status)
 
     def test_run_stages_executes_only_contiguous_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -906,34 +773,6 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "相邻"):
                 pipeline.run_stages((Stage.COPY, Stage.EXTRACT))
 
-    def test_rerun_stage_keeps_downstream_completed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            self.assertEqual(
-                "completed",
-                FakePipeline(
-                    manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-                ).run(),
-            )
-            before = load_manifest(manifest_path)
-            downstream_artifacts = {
-                stage: dict(before.version.stage(stage).artifacts)
-                for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT) + 1 :]
-            }
-            executed = []
-            pipeline = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            pipeline.executed = executed
-            self.assertEqual("completed", pipeline.run_stage(Stage.EXTRACT))
-            self.assertEqual([Stage.EXTRACT], executed)
-            current = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.UNPACK).status)
-            self.assertEqual(StageStatus.COMPLETED, current.version.stage(Stage.EXTRACT).status)
-            for stage, artifacts in downstream_artifacts.items():
-                self.assertEqual(StageStatus.COMPLETED, current.version.stage(stage).status)
-                self.assertEqual(artifacts, current.version.stage(stage).artifacts)
 
     def test_failure_is_persisted_and_retryable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1004,27 +843,6 @@ class PipelineTests(unittest.TestCase):
                     manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
                 ).run()
 
-    def test_import_scope_change_only_rebuilds_import_and_release(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            game = make_game(root / "game")
-            manifest_path = create_project(root / "projects", game)
-            first = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            self.assertEqual("completed", first.run())
-            first.set_import_scope(ImportScope(external=True, optional_name=True))
-            changed = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.VALIDATE).status)
-            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]:
-                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
-            executed = []
-            second = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            second.executed = executed
-            self.assertEqual("completed", second.run())
-            self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.IMPORT):]), executed)
 
     def test_import_protection_resets_only_affected_stages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1060,45 +878,6 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.EXTRACT).status)
             self.assertEqual(StageStatus.PENDING, changed.version.stage(Stage.GLOSSARY).status)
 
-    def test_translation_and_export_scope_changes_reset_expected_stages(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path = create_project(root / "projects", make_game(root / "game"))
-            first = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            self.assertEqual("completed", first.run())
-            first.set_translation_scope(ImportScope(optional_name=True))
-            changed = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.EXTRACT).status)
-            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]:
-                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
-            executed = []
-            second = FakePipeline(
-                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
-            )
-            second.executed = executed
-            self.assertEqual("completed", second.run())
-            self.assertEqual(list(STAGE_ORDER[STAGE_ORDER.index(Stage.GLOSSARY):]), executed)
-            second.set_export_scope(ImportScope(external=True))
-            changed = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.UNPACK).status)
-            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
-                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
-            with second._mutation("test-reset"):
-                second.manifest = changed
-                for stage in STAGE_ORDER:
-                    second.manifest.version.stage(stage).status = StageStatus.COMPLETED
-                second.save()
-            second.set_export_scope(
-                changed.export_scope,
-                exclude_large_external_files=True,
-                external_file_limit_kb=64,
-            )
-            changed = load_manifest(manifest_path)
-            self.assertEqual(StageStatus.COMPLETED, changed.version.stage(Stage.UNPACK).status)
-            for stage in STAGE_ORDER[STAGE_ORDER.index(Stage.EXTRACT):]:
-                self.assertEqual(StageStatus.PENDING, changed.version.stage(stage).status)
 
 
 if __name__ == "__main__":

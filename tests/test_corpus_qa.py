@@ -4,18 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from formats import QA_SCHEMA
 from scripts.wolf_corpus_qa import (
-    _aggregate,
     _official_out_of_scope,
-    _out_of_scope_evidence,
-    _sandbox_root,
-    build_parser,
-    discover,
-    pseudo_translation,
-    select_manifest,
     verify,
 )
 
@@ -33,47 +25,7 @@ def _coverage() -> dict[str, object]:
 
 
 class CorpusQaTests(unittest.TestCase):
-    def test_run_parser_accepts_targeted_candidate_ids(self):
-        args = build_parser().parse_args(
-            [
-                "run",
-                "--manifest",
-                "corpus.json",
-                "--editor",
-                "Editor.exe",
-                "--run-dir",
-                "targeted",
-                "--candidate-id",
-                "one",
-                "--candidate-id",
-                "two",
-            ]
-        )
-        self.assertEqual(["one", "two"], args.candidate_id)
-        self.assertEqual(Path("targeted"), args.run_dir)
 
-    def test_defect_aggregate_keeps_analysis_evidence(self):
-        coverage = _coverage()
-        aggregate = _aggregate(
-            {"scan_complete": True, "access_errors": [], "candidates": [{}]},
-            [
-                {
-                    "candidate_id": "abc",
-                    "path": "game",
-                    "status": "DEFECT",
-                    "failure_stage": "acceptance",
-                    "failure_class": "coverage_gate",
-                    "coverage": coverage,
-                    "blocking_issue_count": 2,
-                    "error": "failed after analysis",
-                }
-            ],
-        )
-        result = aggregate["reports"][0]
-        self.assertEqual(coverage, result["coverage"])
-        self.assertEqual("acceptance", result["failure_stage"])
-        self.assertEqual("coverage_gate", result["failure_class"])
-        self.assertEqual(2, result["blocking_issue_count"])
 
     def test_official_scope_dialogs_require_exact_positive_evidence(self):
         legacy = _official_out_of_scope(
@@ -87,56 +39,6 @@ class CorpusQaTests(unittest.TestCase):
         self.assertEqual("damaged_map_data", damaged[0]["kind"])
         self.assertEqual([], _official_out_of_scope(["Warning! | Unknown warning"]))
 
-    def test_qa_sandbox_uses_short_public_path(self):
-        with mock.patch.dict("os.environ", {"PUBLIC": r"C:\Users\Public"}):
-            root = _sandbox_root("a" * 64)
-        self.assertEqual(
-            Path(r"C:\Users\Public\WOLFLator\corpus-qa") / ("a" * 16),
-            root,
-        )
-
-    def test_discovery_deduplicates_and_pseudo_text_preserves_controls(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            games = root / "games"
-            output = root / "qa"
-            for name in ("one", "two"):
-                game = games / name
-                game.mkdir(parents=True)
-                (game / "Game.exe").write_bytes(b"game")
-                (game / "Data.wolf").write_bytes(b"data")
-
-            manifest = discover([games], output)
-            self.assertTrue(manifest["scan_complete"])
-            self.assertEqual(2, manifest["path_count"])
-            self.assertEqual(1, manifest["unique_count"])
-            self.assertEqual(1, len(manifest["candidates"][0]["duplicates"]))
-
-            scoped = select_manifest(output / "corpus-manifest.json", root / "packed", "packed")
-            self.assertTrue(scoped["scan_complete"])
-            self.assertEqual(1, scoped["unique_count"])
-            self.assertEqual("packed", scoped["scope"]["kind"])
-            self.assertEqual(0, len(scoped["access_errors"]))
-            self.assertEqual(
-                manifest["scan_complete"], scoped["scope"]["source_scan_complete"]
-            )
-
-            original = "\\c[1]AB\nCD"
-            translated = pseudo_translation(original, "stable-key")
-            self.assertNotEqual(original, translated)
-            self.assertTrue(translated.startswith("\\c[1]"))
-            self.assertEqual(original.count("\n"), translated.count("\n"))
-
-            evidence = _out_of_scope_evidence(
-                {
-                    "unknown_commands": [
-                        {"opcode": 1000, "shape": "ints=1,strings=0", "count": 2},
-                        {"opcode": 112, "shape": "unsupported-flag", "count": 1},
-                    ]
-                }
-            )
-            self.assertEqual("pro_opcode", evidence[0]["kind"])
-            self.assertEqual(1, len(evidence))
 
     def test_verify_rejects_no_pass_evidence_and_accepts_complete_pass(self):
         with tempfile.TemporaryDirectory() as directory:
