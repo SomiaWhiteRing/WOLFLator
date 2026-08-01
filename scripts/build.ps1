@@ -39,7 +39,7 @@ $hashLines = Get-ChildItem -LiteralPath $dist -Recurse -File |
     Where-Object { $_.Extension -in @(".exe", ".dll", ".pyd", ".ttf") } |
     Sort-Object FullName |
     ForEach-Object {
-        $relative = [IO.Path]::GetRelativePath($dist, $_.FullName).Replace("\", "/")
+        $relative = $_.FullName.Substring($dist.Length).TrimStart("\").Replace("\", "/")
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
         "$hash *$relative"
     }
