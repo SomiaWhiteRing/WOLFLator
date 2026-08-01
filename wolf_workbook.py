@@ -184,7 +184,7 @@ def _external_script_control_spans(text: str) -> list[tuple[int, int]]:
         _EXTERNAL_DISPLAY_COMMAND_RE.match(match.group(0).rstrip("\r\n"))
         for match in lines
     ):
-        # ponytail: AiNiee cannot split one Paratranz row; preserve line structure as control tokens.
+        # ponytail: AiNiee validates one logical row at a time; keep physical newlines as transport tokens.
         return [match.span() for match in re.finditer(r"\r\n|\n|\r", text)]
 
     first = next(
@@ -201,13 +201,16 @@ def _external_script_control_spans(text: str) -> list[tuple[int, int]]:
         stripped = content.strip()
         line_end = match.start() + len(content)
         if stripped.startswith("@"):
-            spans.append((match.start(), match.end()))
+            if line_end > match.start():
+                spans.append((match.start(), match.end()))
             display_payload = bool(_EXTERNAL_DISPLAY_COMMAND_RE.match(content))
         elif stripped.startswith("●") or (stripped and set(stripped) == {"-"}):
-            spans.append((match.start(), match.end()))
+            if line_end > match.start():
+                spans.append((match.start(), match.end()))
             display_payload = False
         elif stripped.startswith("//") or not display_payload:
-            spans.append((match.start(), match.end()))
+            if line_end > match.start():
+                spans.append((match.start(), match.end()))
         elif line_end < match.end():
             spans.append((line_end, match.end()))
 
@@ -285,6 +288,26 @@ def _restore_item_tokens(item: TranslationItem, text: str) -> str:
     if _scan_control_tokens(restored) != item.control_signature:
         raise ValueError("译文控制符序列与原文不一致。")
     return restored
+
+
+def _line_structure(text: str) -> tuple[list[str], list[tuple[int, str]]]:
+    endings = [match.group(0) for match in re.finditer(r"\r\n|\n|\r", text)]
+    lines = re.split(r"\r\n|\n|\r", text)
+    blank_lines = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if not line.strip()
+    ]
+    return endings, blank_lines
+
+
+def _validate_line_structure(original: str, translated: str) -> None:
+    expected_endings, expected_blank_lines = _line_structure(original)
+    actual_endings, actual_blank_lines = _line_structure(translated)
+    if actual_endings != expected_endings:
+        raise ValueError("译文换行序列与原文不一致。")
+    if actual_blank_lines != expected_blank_lines:
+        raise ValueError("译文空行结构与原文不一致。")
 
 def read_translation_items(workbook_path: str | Path) -> list[TranslationItem]:
     # Normal mode releases the underlying ZIP deterministically on Windows;
@@ -454,7 +477,12 @@ def to_paratranz(
         if item.translation:
             protected_translation, translated_tokens = _protect_item_tokens(item, item.translation)
             if translated_tokens == tokens:
-                translation = protected_translation
+                try:
+                    _validate_line_structure(item.original, item.translation)
+                except ValueError:
+                    pass
+                else:
+                    translation = protected_translation
         output.append(
             {
                 "key": item.key,
@@ -490,9 +518,11 @@ def _validated_ainiee_translation(
     if not raw.strip():
         raise ValueError(f"AiNiee 没有生成译文: {item.code} / {item.original[:80]}")
     try:
-        return _restore_item_tokens(item, raw)
+        restored = _restore_item_tokens(item, raw)
+        _validate_line_structure(item.original, restored)
+        return restored
     except ValueError as exc:
-        raise ValueError(f"AiNiee 译文控制符校验失败: {item.code}: {exc}") from exc
+        raise ValueError(f"AiNiee 译文结构校验失败: {item.code}: {exc}") from exc
 
 def retryable_translation_errors(
     items: list[TranslationItem],

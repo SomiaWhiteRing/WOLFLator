@@ -774,7 +774,7 @@ class Pipeline:
         except (KeyError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return False
 
-    def _invalidate_changed_inputs(self) -> None:
+    def _invalidate_invalid_artifacts(self) -> None:
         invalid = False
         for stage in STAGE_ORDER[1:]:
             record = self.manifest.version.stage(stage)
@@ -782,15 +782,14 @@ class Pipeline:
                 record.status = StageStatus.PENDING
                 record.error = ""
                 continue
-            if record.status is StageStatus.COMPLETED and (
-                not self._stage_artifacts_valid(stage)
-                or record.input_hash != self._stage_input_hash(stage)
-            ):
+            # ponytail: completed artifacts are snapshots; project mutators own
+            # invalidation. Direct manifest edits need persisted semantic hashes.
+            if record.status is StageStatus.COMPLETED and not self._stage_artifacts_valid(stage):
                 invalid = True
                 record.status = StageStatus.PENDING
                 record.error = ""
         if invalid:
-            self.log("检测到工具、API、术语或范围变化，已重置受影响的下游阶段。")
+            self.log("检测到阶段产物缺失或格式不兼容，已重置受影响的下游阶段。")
             self.save()
 
     def _check_source_unchanged(self) -> None:
@@ -2070,7 +2069,7 @@ class Pipeline:
         copy_record = self.manifest.version.stage(Stage.COPY)
         if copy_record.status is StageStatus.COMPLETED:
             self._check_source_unchanged()
-            self._invalidate_changed_inputs()
+            self._invalidate_invalid_artifacts()
         for index, stage in enumerate(STAGE_ORDER, start=1):
             record = self.manifest.version.stage(stage)
             self.progress(index - 1, len(STAGE_ORDER), stage)

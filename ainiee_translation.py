@@ -170,6 +170,7 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "auto_set_output_path": False,
         "response_conversion_toggle": False,
         "auto_process_text_code_segment": True,
+        "response_check_switch": {"newline_character_count_check": False},
         "tokens_limit_switch": settings.translation_chunk_mode == "token",
         "tokens_limit": settings.translation_token_limit,
         "lines_limit": settings.translation_line_limit,

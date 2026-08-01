@@ -843,6 +843,37 @@ class PipelineTests(unittest.TestCase):
                     manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
                 ).run()
 
+    def test_global_settings_change_preserves_completed_artifacts_for_font_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            settings = AppSettings()
+            pipeline = FakePipeline(
+                manifest_path, settings, "", root / "cache", glossary_api_key=""
+            )
+            self.assertEqual("completed", pipeline.run())
+
+            settings.wolf_tool_path = "new-tool.exe"
+            settings.wolf_editor_path = "new-editor.exe"
+            settings.ascii_runner_dir = "new-runner"
+            settings.api_base_url = "https://new-translate.example/v1"
+            settings.glossary_api_base_url = "https://new-glossary.example/v1"
+            pipeline = FakePipeline(
+                manifest_path, settings, "", root / "cache", glossary_api_key=""
+            )
+            pipeline.set_font_scheme(load_font_scheme(manifest_path.parent))
+            executed: list[Stage] = []
+            pipeline.executed = executed
+
+            self.assertEqual("completed", pipeline.run())
+            self.assertEqual([Stage.RELEASE], executed)
+            current = load_manifest(manifest_path)
+            self.assertTrue(
+                all(
+                    current.version.stage(stage).status is StageStatus.COMPLETED
+                    for stage in Stage
+                )
+            )
 
     def test_import_protection_resets_only_affected_stages(self):
         with tempfile.TemporaryDirectory() as directory:

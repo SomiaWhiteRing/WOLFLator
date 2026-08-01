@@ -3673,6 +3673,7 @@ class ControlTests(unittest.TestCase):
         self.assertNotIn("@文章", protected)
         self.assertNotIn("鷲見A普通", protected)
         self.assertNotIn(r"\c[6]", protected)
+        self.assertEqual(0, protected.count("\n"))
 
         translated = protected.replace(
             "空を飛んで、落ちて、目が覚める。", "飞过天空，坠落，然后醒来。"
@@ -3704,7 +3705,8 @@ class ControlTests(unittest.TestCase):
         payload = to_paratranz([item], scope)
         protected = str(payload[0]["original"])
 
-        self.assertNotRegex(protected, r"[\r\n]")
+        self.assertNotEqual(original, protected)
+        self.assertEqual(0, protected.count("\n"))
         self.assertEqual(3, sum("\ue100" <= char <= "\uf7ff" for char in protected))
         translated = (
             protected.replace("一行。", "第一行。")
@@ -3716,9 +3718,26 @@ class ControlTests(unittest.TestCase):
         )
         self.assertEqual("第一行。\r\n\r\n第二行。\n第三行。", merged[0].translation)
 
-        broken = translated.replace(chr(0xE101), "", 1)
+        broken = translated.replace(chr(0xE100), "", 1)
         with self.assertRaisesRegex(ValueError, "占位序列"):
             merge_ainiee_output([item], [{**payload[0], "translation": broken}], scope)
+
+        changed_line_ending = translated.replace(chr(0xE100), chr(0xE101), 1)
+        with self.assertRaisesRegex(ValueError, "占位序列"):
+            merge_ainiee_output(
+                [item], [{**payload[0], "translation": changed_line_ending}], scope
+            )
+
+        moved_blank_line = translated.replace("第二行。", "第二行。\n", 1)
+        with self.assertRaisesRegex(ValueError, "译文脚本结构"):
+            merge_ainiee_output(
+                [item], [{**payload[0], "translation": moved_blank_line}], scope
+            )
+
+        item.translation = moved_blank_line
+        cached = to_paratranz([item], scope)[0]
+        self.assertEqual("", cached["translation"])
+        self.assertEqual(0, cached["stage"])
 
     def test_external_script_does_not_normalize_resource_middle_dots(self):
         original = "@立ち絵：1\n画像・通常\n@文章：0\n台詞。"
@@ -4094,6 +4113,9 @@ class AiNieeTests(unittest.TestCase):
                 self.assertEqual(256, profile["tokens_limit"])
                 self.assertEqual(6, profile["round_limit"])
                 self.assertFalse(profile["enable_smart_round_limit"])
+                self.assertFalse(
+                    profile["response_check_switch"]["newline_character_count_check"]
+                )
                 self.assertEqual([], rules["prompt_dictionary_data"])
                 self.assertTrue(rules["prompt_dictionary_switch"])
                 self.assertTrue(rules["exclusion_list_switch"])
