@@ -40,9 +40,6 @@ def make_game(root: Path) -> Path:
 class FakePipeline(Pipeline):
     executed = None
 
-    def _stage_artifacts_valid(self, _stage: Stage) -> bool:
-        return True
-
     def _execute(self, stage: Stage) -> dict[str, str]:
         if self.executed is not None:
             self.executed.append(stage)
@@ -867,6 +864,28 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual("completed", pipeline.run())
             self.assertEqual([Stage.RELEASE], executed)
+            current = load_manifest(manifest_path)
+            self.assertTrue(
+                all(
+                    current.version.stage(stage).status is StageStatus.COMPLETED
+                    for stage in Stage
+                )
+            )
+
+    def test_one_click_does_not_revalidate_or_reset_completed_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = FakePipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            self.assertEqual("completed", pipeline.run())
+
+            executed: list[Stage] = []
+            pipeline.executed = executed
+            self.assertEqual("completed", pipeline.run())
+
+            self.assertEqual([], executed)
             current = load_manifest(manifest_path)
             self.assertTrue(
                 all(

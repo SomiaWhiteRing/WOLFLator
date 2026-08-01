@@ -21,7 +21,7 @@ from ainiee import (
     require_managed_runtime,
     run_translation,
 )
-from formats import ARTIFACT_EPOCH, require_format
+from formats import ARTIFACT_EPOCH
 from fonts import (
     FONT_CODES,
     FONT_SLOT_NAMES,
@@ -725,72 +725,6 @@ class Pipeline:
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _artifact_header(path: str, kind: str) -> None:
-        value = json.loads(read_text_with_retry(path, encoding="utf-8"))
-        require_format(
-            value,
-            kind=kind,
-            version_key="epoch",
-            version=ARTIFACT_EPOCH,
-            label="派生产物",
-        )
-
-    def _stage_artifacts_valid(self, stage: Stage) -> bool:
-        artifacts = self.manifest.version.stage(stage).artifacts
-        try:
-            if stage is Stage.UNPACK:
-                self._artifact_header(artifacts["excluded_files"], "excluded-files-report")
-            elif stage is Stage.EXTRACT:
-                items = load_items(artifacts["items"])
-                load_editor_analysis(artifacts["editor_analysis"])
-                load_program_cache(
-                    artifacts["editor_program"],
-                    items=items,
-                    editor_version=artifacts.get("editor_version") or None,
-                    editor_sha256=artifacts.get("editor_sha256") or None,
-                )
-                if artifacts.get("legacy_conversion_report"):
-                    self._artifact_header(
-                        artifacts["legacy_conversion_report"], "legacy-conversion-report"
-                    )
-                if artifacts.get("incremental_conflicts"):
-                    self._artifact_header(
-                        artifacts["incremental_conflicts"], "incremental-conflicts"
-                    )
-            elif stage in {Stage.TRANSLATE, Stage.VALIDATE}:
-                load_items(artifacts["items"])
-            elif stage is Stage.IMPORT:
-                load_import_protection(artifacts["import_protection"])
-                load_editor_analysis(artifacts["post_import_editor_analysis"])
-                if artifacts.get("official_warnings"):
-                    self._artifact_header(artifacts["official_warnings"], "official-diagnostics")
-            elif stage is Stage.RELEASE and artifacts.get("font_result"):
-                self._artifact_header(artifacts["font_result"], "font-result")
-                if artifacts.get("font_warnings"):
-                    self._artifact_header(artifacts["font_warnings"], "font-warnings")
-            return True
-        except (KeyError, OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-            return False
-
-    def _invalidate_invalid_artifacts(self) -> None:
-        invalid = False
-        for stage in STAGE_ORDER[1:]:
-            record = self.manifest.version.stage(stage)
-            if invalid:
-                record.status = StageStatus.PENDING
-                record.error = ""
-                continue
-            # ponytail: completed artifacts are snapshots; project mutators own
-            # invalidation. Direct manifest edits need persisted semantic hashes.
-            if record.status is StageStatus.COMPLETED and not self._stage_artifacts_valid(stage):
-                invalid = True
-                record.status = StageStatus.PENDING
-                record.error = ""
-        if invalid:
-            self.log("检测到阶段产物缺失或格式不兼容，已重置受影响的下游阶段。")
-            self.save()
 
     def _check_source_unchanged(self) -> None:
         version = self.manifest.version
@@ -2069,7 +2003,6 @@ class Pipeline:
         copy_record = self.manifest.version.stage(Stage.COPY)
         if copy_record.status is StageStatus.COMPLETED:
             self._check_source_unchanged()
-            self._invalidate_invalid_artifacts()
         for index, stage in enumerate(STAGE_ORDER, start=1):
             record = self.manifest.version.stage(stage)
             self.progress(index - 1, len(STAGE_ORDER), stage)
