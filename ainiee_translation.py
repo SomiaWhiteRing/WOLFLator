@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import threading
-import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
@@ -189,29 +188,25 @@ def _active_session_profile(
 
 def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
     base_url = settings.api_base_url.rstrip("/")
-    host = (urllib.parse.urlsplit(base_url).hostname or "").lower()
-    is_deepseek = host == "api.deepseek.com" or settings.api_model.lower().startswith("deepseek-")
-    platform_tag = "deepseek" if is_deepseek else "custom_openai"
-    is_tokenflux = host == "tokenflux.dev" or host.endswith(".tokenflux.dev")
-    # TokenFlux ignores thinking=disabled for deepseek-v4; explicit low effort bounds hidden generation.
-    low_reasoning = is_tokenflux and settings.api_model.lower().startswith("deepseek-v4-")
+    # ponytail: Keep one fixed AiNiee-compatible profile; provider detection is intentionally removed.
+    platform_tag = "deepseek"
     platform = {
         "tag": platform_tag,
-        "group": "online" if is_deepseek else "custom",
-        "name": "DeepSeek" if is_deepseek else "WOLFLator OpenAI Compatible",
+        "group": "online",
+        "name": "DeepSeek",
         "api_url": base_url,
         "api_key": api_key,
         "api_format": "OpenAI",
-        "icon": "deepseek" if is_deepseek else "custom",
+        "icon": "deepseek",
         "rpm_limit": max(1, settings.api_rpm),
         "tpm_limit": max(1, settings.api_tpm),
         "model": settings.api_model,
         "model_datas": [settings.api_model],
         "top_p": 1.0,
-        "temperature": 1.3 if is_deepseek else 0.2,
+        "temperature": 1.3,
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
-        "think_switch": low_reasoning,
+        "think_switch": True,
         "think_depth": "low",
         "structured_output_mode": 0,
         "auto_complete": False,

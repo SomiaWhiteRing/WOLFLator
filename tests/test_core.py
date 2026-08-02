@@ -3970,6 +3970,27 @@ class AiNieeTests(unittest.TestCase):
         self.assertNotIn("secret", joined)
 
 
+    def test_api_request_always_disables_thinking(self):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            }
+        ).encode("utf-8")
+        response.status = 200
+        response.__enter__.return_value = response
+        client = ainiee.OpenAICompatibleClient(
+            "https://gateway.example/v1/chat/completions",
+            "secret",
+            "qwen3",
+        )
+        with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            self.assertEqual("ok", client.chat("hello"))
+        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual({"type": "disabled"}, body["thinking"])
+
+
     def test_api_timeout_covers_the_complete_response(self):
         body = json.dumps(
             {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}

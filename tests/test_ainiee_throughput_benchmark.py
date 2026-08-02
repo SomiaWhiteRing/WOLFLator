@@ -43,22 +43,25 @@ class FragmentInputTests(unittest.TestCase):
         self.assertEqual({"parent": ["parent::fragment:2"]}, missing)
         self.assertEqual("T1\uE100beta", merged[0]["translation"])
 
-    def test_deepseek_v4_uses_explicit_low_reasoning(self) -> None:
-        profile = _session_profile(
-            AppSettings(api_base_url="https://tokenflux.dev/v1", api_model="deepseek-v4-flash"),
-            "secret",
-        )
-        platform = profile["platforms"][profile["target_platform"]]
+    def test_session_profile_always_uses_fixed_compatibility_fields(self) -> None:
+        for base_url, model in (
+            ("https://gateway.example/v1", "deepseek-v4-flash"),
+            ("https://example.com/v1", "deepseek-v4-flash"),
+            ("https://example.com/v1", "qwen3"),
+        ):
+            profile = _session_profile(
+                AppSettings(api_base_url=base_url, api_model=model),
+                "secret",
+            )
+            platform = profile["platforms"][profile["target_platform"]]
 
-        self.assertTrue(platform["think_switch"])
-        self.assertEqual("low", platform["think_depth"])
-
-        other = _session_profile(
-            AppSettings(api_base_url="https://example.com/v1", api_model="deepseek-v4-flash"),
-            "secret",
-        )
-        other_platform = other["platforms"][other["target_platform"]]
-        self.assertFalse(other_platform["think_switch"])
+            self.assertEqual("deepseek", profile["target_platform"])
+            self.assertEqual("online", platform["group"])
+            self.assertEqual("DeepSeek", platform["name"])
+            self.assertEqual("deepseek", platform["icon"])
+            self.assertEqual(1.3, platform["temperature"])
+            self.assertTrue(platform["think_switch"])
+            self.assertEqual("low", platform["think_depth"])
 
 
 if __name__ == "__main__":

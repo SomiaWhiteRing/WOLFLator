@@ -104,8 +104,7 @@ class OpenAICompatibleClient:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
-        if "deepseek" in self.model.lower() or "deepseek" in self.url.lower():
-            body["thinking"] = {"type": "disabled"}
+        body["thinking"] = {"type": "disabled"}
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self.url,
