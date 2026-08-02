@@ -184,7 +184,7 @@ def _qt_preview_font(
 
 
 STAGE_DESCRIPTIONS = {
-    Stage.COPY: "建立源副本与工作副本",
+    Stage.COPY: "建立经过哈希校验的工作副本",
     Stage.UNPACK: "使用 UberWolf 准备松散 Data",
     Stage.EXTRACT: "导出 XLSX 并分析全部事件",
     Stage.GLOSSARY: "从完整语料生成角色与术语",
@@ -1237,6 +1237,8 @@ class MainWindow(QMainWindow):
             game_root = version_dir / "work"
             if not game_root.is_dir():
                 game_root = version_dir / "source"
+            if not game_root.is_dir():
+                game_root = Path(manifest.version.original_path)
             report = analyze_import_protection(
                 (items := load_items(items_path)),
                 manifest.import_scope,
@@ -3127,6 +3129,7 @@ class MainWindow(QMainWindow):
             self.pipeline_thread = PipelineThread(self.pipeline, stage, stages)
             self.pipeline_thread.log_line.connect(self._append_log)
             self.pipeline_thread.stage_progress.connect(self._stage_progress)
+            self.pipeline_thread.translation_progress.connect(self._translation_progress)
             self.pipeline_thread.stage_state.connect(self._stage_state)
             self.pipeline_thread.result_ready.connect(self._pipeline_result)
             self.pipeline_thread.failed.connect(self._pipeline_failed)
@@ -3235,6 +3238,19 @@ class MainWindow(QMainWindow):
         else:
             self.progress.setRange(0, total)
             self.progress.setValue(current)
+
+    def _translation_progress(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        current = max(0, int(event.get("current", 0)))
+        total = max(current, int(event.get("total", 0)))
+        if total <= 0:
+            self.progress.setRange(0, 0)
+            self.status_label.setText("AI 翻译：AiNiee 正在处理")
+            return
+        self.progress.setRange(0, total)
+        self.progress.setValue(min(current, total))
+        self.status_label.setText(f"AI 翻译：{current}/{total}")
 
     def _stage_state(self, event: object) -> None:
         if not isinstance(event, PipelineStateEvent):

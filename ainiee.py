@@ -79,6 +79,7 @@ def run_translation(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
     diagnostic_log: Callable[[str], None] | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> list[dict[str, object]]:
     return _run_translation_impl(
         runtime,
@@ -91,6 +92,7 @@ def run_translation(
         cancel_event=cancel_event,
         log=log,
         diagnostic_log=diagnostic_log,
+        progress=progress,
         validate_source=validate_ainiee_source,
         uv_locator=locate_uv,
         process_runner=run_process,
@@ -109,6 +111,7 @@ def _run_translation_locked(
     cancel_event: threading.Event | None,
     log: Callable[[str], None] | None,
     diagnostic_log: Callable[[str], None] | None,
+    progress: Callable[[dict[str, object]], None] | None,
 ) -> list[dict[str, object]]:
     return _run_translation_locked_impl(
         runtime,
@@ -121,6 +124,7 @@ def _run_translation_locked(
         cancel_event=cancel_event,
         log=log,
         diagnostic_log=diagnostic_log,
+        progress=progress,
         validate_source=validate_ainiee_source,
         uv_locator=locate_uv,
         process_runner=run_process,

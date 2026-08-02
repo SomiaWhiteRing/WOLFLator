@@ -237,6 +237,7 @@ class Pipeline:
         }
         self.log_path: Path | None = None
         self.progress = progress or (lambda _current, _total, _stage: None)
+        self.translation_progress = lambda _event: None
         self.state = state or (lambda _event: None)
         self.cancel_event = threading.Event()
         self._project_lock_depth = 0
@@ -618,6 +619,79 @@ class Pipeline:
         elif resolved.exists():
             resolved.unlink()
 
+    def _cleanup_legacy_source_copy(self, *, source_verified: bool = False) -> None:
+        """Remove the obsolete source snapshot after the working tree is usable."""
+        copy_record = self.manifest.version.stage(Stage.COPY)
+        if not self.source_dir.is_dir():
+            if copy_record.artifacts.pop("source", None) is not None:
+                self.save()
+            return
+        if not self.work_dir.is_dir():
+            return
+        if not source_verified:
+            try:
+                self._check_source_unchanged()
+            except (OSError, RuntimeError):
+                return
+        self._safe_remove(self.source_dir)
+        copy_record.artifacts.pop("source", None)
+        self.save()
+        self.detail(f"copy.legacy_source_removed path={self.source_dir}")
+
+    def _manifest_artifact_paths(self) -> set[Path]:
+        paths: set[Path] = set()
+
+        def visit(value: object) -> None:
+            if isinstance(value, str) and Path(value).is_absolute():
+                paths.add(Path(value).resolve())
+            elif isinstance(value, dict):
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    visit(child)
+
+        visit(self.manifest.to_dict())
+        return paths
+
+    def _prune_unreferenced_stage_artifacts(self) -> None:
+        artifact_root = self.artifacts_dir.resolve()
+        if not artifact_root.is_dir():
+            return
+        referenced = self._manifest_artifact_paths()
+        prunable_names = (
+            ".extract-",
+            ".import-game-",
+            ".import-merged-",
+            "extract-",
+            "import-scoped-",
+            "import-protection-",
+            "post-import-editor-",
+        )
+        prunable_fixed = {
+            "ainiee-output",
+            "ainiee-retry-output",
+        }
+        removed: list[str] = []
+        for candidate in artifact_root.iterdir():
+            if not (
+                candidate.name.startswith(prunable_names)
+                or candidate.name in prunable_fixed
+            ):
+                continue
+            resolved = candidate.resolve()
+            if resolved in referenced or any(
+                path != resolved and path.is_relative_to(resolved) for path in referenced
+            ):
+                continue
+            self._safe_remove(candidate)
+            removed.append(candidate.name)
+        if removed:
+            self.detail(
+                "artifacts.pruned "
+                + json.dumps(sorted(removed), ensure_ascii=False)
+            )
+
     def _stage_input_hash(self, stage: Stage) -> str:
         if stage is Stage.COPY:
             source_hash = hash_directory(self.manifest.version.original_path)
@@ -755,6 +829,10 @@ class Pipeline:
             + json.dumps(artifacts, ensure_ascii=False, sort_keys=True)
         )
         self.save()
+        try:
+            self._prune_unreferenced_stage_artifacts()
+        except (OSError, ValueError) as error:
+            self.warning(f"阶段旧产物清理失败，已保留未引用文件：{error}")
 
     def _mark_failed(self, stage: Stage, error: Exception) -> None:
         record = self.manifest.version.stage(stage)
@@ -925,14 +1003,13 @@ class Pipeline:
             if path.exists():
                 self._safe_remove(path)
         self.log("正在复制原始游戏到版本工作区...")
-        shutil.copytree(original, self.source_dir)
-        shutil.copytree(self.source_dir, self.work_dir)
+        shutil.copytree(original, self.work_dir)
         source_hash = hash_directory(original)
-        if hash_directory(self.source_dir) != source_hash:
-            raise RuntimeError("原始游戏副本哈希校验失败。")
+        if hash_directory(self.work_dir) != source_hash:
+            raise RuntimeError("原始游戏工作副本哈希校验失败。")
         self.manifest.version.source_hash = source_hash
-        self.detail(f"copy.complete source={original} source_hash={source_hash}")
-        return {"source": str(self.source_dir), "work": str(self.work_dir)}
+        self.detail(f"copy.complete work={self.work_dir} source_hash={source_hash}")
+        return {"work": str(self.work_dir)}
 
     def _unpack(self) -> dict[str, str]:
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -1208,6 +1285,7 @@ class Pipeline:
                 cancel_event=self.cancel_event,
                 log=self.log,
                 diagnostic_log=self.detail,
+                progress=self.translation_progress,
             )
             retry_errors = retryable_translation_errors(
                 items,
@@ -1270,6 +1348,7 @@ class Pipeline:
                     cancel_event=self.cancel_event,
                     log=self.log,
                     diagnostic_log=self.detail,
+                    progress=self.translation_progress,
                 )
                 _atomic_json(retry_output_path, retry_raw)
                 retry_items = [selected_by_key[str(row["key"])] for row in retry_input]
@@ -1490,26 +1569,30 @@ class Pipeline:
             merged_translated = self.artifacts_dir / f".import-merged-{token}"
             if merged_translated.exists():
                 self._safe_remove(merged_translated)
-            shutil.copytree(
-                self.work_dir,
-                merged_translated,
-                ignore=lambda _path, names: [
-                    name
-                    for name in names
-                    if (
-                        name.startswith("Translated")
-                        and "Chinese (Simplified)" in name
+            replace_with_retry(staged_translated, merged_translated)
+            # ponytail: the official tool output is the authoritative tree; only
+            # backfill omitted files, avoiding a second full work-tree copy.
+            for source in self.work_dir.rglob("*"):
+                relative = source.relative_to(self.work_dir)
+                if (
+                    relative.parts
+                    and (
+                        relative.parts[0] == SUPPORT_DIR
+                        or relative.parts[0] == ".wolflator-translated-previous"
+                        or (
+                            relative.parts[0].startswith("Translated")
+                            and "Chinese (Simplified)" in relative.parts[0]
+                        )
+                        or relative.parts[0] == "Data.wolf"
                     )
-                    or name == SUPPORT_DIR
-                    or name == ".wolflator-translated-previous"
-                ],
-            )
-            shutil.copytree(
-                staged_translated,
-                merged_translated,
-                dirs_exist_ok=True,
-                copy_function=shutil.copy2,
-            )
+                ):
+                    continue
+                target = merged_translated / relative
+                if source.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
             support = merged_translated / SUPPORT_DIR
             if support.exists():
                 self._safe_remove(support)
@@ -1941,6 +2024,34 @@ class Pipeline:
             artifacts["official_font_console"] = str(console_path)
         return artifacts
 
+    def _preserve_release_state(self, destination: Path) -> list[str]:
+        if not self.release_dir.is_dir():
+            return []
+        preserved: list[str] = []
+        for directory_name in ("Save", "ScreenShot"):
+            source = self.release_dir / directory_name
+            target = destination / directory_name
+            if not source.is_dir():
+                continue
+            if target.exists():
+                self._safe_remove(target)
+            shutil.copytree(source, target)
+            preserved.append(directory_name)
+        game_ini = self.release_dir / "Game.ini"
+        if game_ini.is_file():
+            shutil.copy2(game_ini, destination / game_ini.name)
+            preserved.append(game_ini.name)
+        for save_file in self.release_dir.glob("*.sav"):
+            if save_file.is_file():
+                shutil.copy2(save_file, destination / save_file.name)
+                preserved.append(save_file.name)
+        if preserved:
+            self.detail(
+                "release.state_preserved "
+                + json.dumps(sorted(preserved, key=str.casefold), ensure_ascii=False)
+            )
+        return preserved
+
     def _release(self) -> dict[str, str]:
         translated = Path(self.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"])
         if not (translated / "Game.exe").is_file() or not (translated / "Data").is_dir():
@@ -1958,6 +2069,7 @@ class Pipeline:
         )
         if scheme is None:
             shutil.copytree(translated, temporary)
+        preserved_state = self._preserve_release_state(temporary)
         try:
             if self.release_dir.exists():
                 replace_with_retry(self.release_dir, previous)
@@ -1978,7 +2090,11 @@ class Pipeline:
             raise
         self._check_source_unchanged()
         self.detail(f"release.complete path={self.release_dir}")
-        return {"release": str(self.release_dir), **font_artifacts}
+        return {
+            "release": str(self.release_dir),
+            "preserved_state": ",".join(sorted(preserved_state, key=str.casefold)),
+            **font_artifacts,
+        }
 
     def _execute(self, stage: Stage) -> dict[str, str]:
         functions = {
@@ -2003,6 +2119,11 @@ class Pipeline:
         copy_record = self.manifest.version.stage(Stage.COPY)
         if copy_record.status is StageStatus.COMPLETED:
             self._check_source_unchanged()
+            self._cleanup_legacy_source_copy(source_verified=True)
+            try:
+                self._prune_unreferenced_stage_artifacts()
+            except (OSError, ValueError) as error:
+                self.warning(f"阶段旧产物清理失败，已保留未引用文件：{error}")
         for index, stage in enumerate(STAGE_ORDER, start=1):
             record = self.manifest.version.stage(stage)
             self.progress(index - 1, len(STAGE_ORDER), stage)
@@ -2071,6 +2192,12 @@ class Pipeline:
         if initialize:
             self.cancel_event.clear()
             self._start_run_log(stage.value)
+        copy_record = self.manifest.version.stage(Stage.COPY)
+        if stage is not Stage.COPY and copy_record.status is StageStatus.COMPLETED and (
+            self.source_dir.is_dir() or "source" in copy_record.artifacts
+        ):
+            self._check_source_unchanged()
+            self._cleanup_legacy_source_copy(source_verified=True)
         input_hash = self._stage_input_hash(stage)
         self._mark_running(stage, input_hash)
         self._emit_state(stage, StageStatus.RUNNING, current, total, "正在执行")

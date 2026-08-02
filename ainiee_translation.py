@@ -283,6 +283,7 @@ def run_translation(
     cancel_event: threading.Event | None = None,
     log: Callable[[str], None] | None = None,
     diagnostic_log: Callable[[str], None] | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
     validate_source: Callable[[str | Path], Path] = validate_ainiee_source,
     uv_locator: Callable[[], Path] = locate_uv,
     process_runner: Callable[..., object] = run_process,
@@ -301,6 +302,7 @@ def run_translation(
             cancel_event=cancel_event,
             log=log,
             diagnostic_log=diagnostic_log,
+            progress=progress,
             validate_source=validate_source,
             uv_locator=uv_locator,
             process_runner=process_runner,
@@ -319,6 +321,7 @@ def _run_translation_locked(
     cancel_event: threading.Event | None,
     log: Callable[[str], None] | None,
     diagnostic_log: Callable[[str], None] | None,
+    progress: Callable[[dict[str, object]], None] | None,
     validate_source: Callable[[str | Path], Path] = validate_ainiee_source,
     uv_locator: Callable[[], Path] = locate_uv,
     process_runner: Callable[..., object] = run_process,
@@ -360,6 +363,7 @@ def _run_translation_locked(
                 "Chinese",
                 "--type",
                 "Paratranz",
+                "--web-mode",
                 "--rounds",
                 str(settings.translation_rounds),
                 "--yes",
@@ -368,6 +372,32 @@ def _run_translation_locked(
                 command.extend(["--tokens", str(settings.translation_token_limit)])
             else:
                 command.extend(["--lines", str(settings.translation_line_limit)])
+
+            def receive_output(stream: str, line: str) -> None:
+                if stream != "stdout" or progress is None:
+                    return
+                match = re.search(r"Progress:\s*(\d+)\s*/\s*(\d+)", line)
+                if match:
+                    progress(
+                        {
+                            "phase": "translate",
+                            "status": "running",
+                            "current": int(match.group(1)),
+                            "total": int(match.group(2)),
+                        }
+                    )
+
+            if progress is not None:
+                progress(
+                    {
+                        "phase": "translate",
+                        "status": "running",
+                        "current": 0,
+                        "total": len(
+                            json.loads(Path(input_json).read_text(encoding="utf-8-sig"))
+                        ),
+                    }
+                )
             process_runner(
                 command,
                 cwd=root,
@@ -376,6 +406,7 @@ def _run_translation_locked(
                 log=log,
                 diagnostic_log=diagnostic_log,
                 env=child_env,
+                output_line=receive_output,
             )
         except Exception:
             _report_ainiee_logs(output, diagnostic_log, include_tail=True)

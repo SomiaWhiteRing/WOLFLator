@@ -4090,6 +4090,7 @@ class AiNieeTests(unittest.TestCase):
                 api_base_url="https://api.deepseek.com/v1",
                 api_model="deepseek-v4-flash",
             )
+            progress = []
 
             def fake_process(command, *, cwd, **_kwargs):
                 self.assertNotIn("-p", command)
@@ -4097,8 +4098,13 @@ class AiNieeTests(unittest.TestCase):
                 self.assertEqual("6", command[command.index("--rounds") + 1])
                 self.assertEqual("256", command[command.index("--tokens") + 1])
                 self.assertNotIn("--lines", command)
+                self.assertIn("--web-mode", command)
                 self.assertEqual("1", _kwargs["env"]["PYTHONUTF8"])
                 self.assertEqual("utf-8", _kwargs["env"]["PYTHONIOENCODING"])
+                _kwargs["output_line"](
+                    "stdout",
+                    "[STATS] RPM: 1.00 | Progress: 1/4 | Tokens: 10",
+                )
                 active = json.loads(config_path.read_text(encoding="utf-8"))
                 self.assertEqual("WOLFLator_session", active["active_profile"])
                 self.assertEqual("WOLFLator_project", active["active_rules_profile"])
@@ -4136,8 +4142,11 @@ class AiNieeTests(unittest.TestCase):
                     "project",
                     settings,
                     "secret",
+                    progress=progress.append,
                 )
             self.assertEqual("译文", translated[0]["translation"])
+            self.assertEqual(1, progress[-1]["current"])
+            self.assertEqual(4, progress[-1]["total"])
             self.assertEqual(original_config, config_path.read_bytes())
             self.assertFalse((runtime / "Resource" / "profiles" / "WOLFLator_session.json").exists())
 

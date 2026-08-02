@@ -219,6 +219,10 @@ class SettingsQtTests(unittest.TestCase):
                 with patch.object(window, "_load_project_view") as reload_view:
                     window._stage_progress(1, 8, Stage.COPY.value)
                     reload_view.assert_not_called()
+                window._translation_progress({"current": 12, "total": 100})
+                self.assertEqual(100, window.progress.maximum())
+                self.assertEqual(12, window.progress.value())
+                self.assertEqual("AI 翻译：12/100", window.status_label.text())
                 window._stage_state(
                     PipelineStateEvent(Stage.COPY, StageStatus.COMPLETED, 1, 8, "已完成")
                 )

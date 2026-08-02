@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+import shutil
 from pathlib import Path
 from unittest import mock
 
@@ -60,6 +61,76 @@ class PipelineTests(unittest.TestCase):
         "Warning! | The process completed, but the Editor.exe version used "
         "to create the game data seems to be old!"
     )
+
+    def test_copy_keeps_only_the_verified_working_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = make_game(root / "game")
+            manifest_path = create_project(root / "projects", game)
+            pipeline = Pipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            pipeline.source_dir.mkdir(parents=True)
+            (pipeline.source_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+            artifacts = pipeline._copy()
+
+            self.assertEqual({"work": str(pipeline.work_dir)}, artifacts)
+            self.assertFalse(pipeline.source_dir.exists())
+            self.assertEqual(b"game", (pipeline.work_dir / "Game.exe").read_bytes())
+            self.assertTrue(pipeline.manifest.version.source_hash)
+
+    def test_completed_legacy_source_copy_is_removed_and_unregistered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = make_game(root / "game")
+            manifest_path = create_project(root / "projects", game)
+            pipeline = Pipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            with pipeline._mutation("test-legacy-source-cleanup"):
+                artifacts = pipeline._copy()
+                shutil.copytree(game, pipeline.source_dir)
+                record = pipeline.manifest.version.stage(Stage.COPY)
+                record.status = StageStatus.COMPLETED
+                record.artifacts = {"source": str(pipeline.source_dir), **artifacts}
+                pipeline.save()
+                pipeline._cleanup_legacy_source_copy()
+
+            self.assertFalse(pipeline.source_dir.exists())
+            current = load_manifest(manifest_path).version.stage(Stage.COPY)
+            self.assertNotIn("source", current.artifacts)
+            self.assertEqual(str(pipeline.work_dir), current.artifacts["work"])
+
+    def test_completed_stage_prunes_only_unreferenced_owned_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = Pipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            current = pipeline.artifacts_dir / "post-import-editor-current" / "editor-auto"
+            current.mkdir(parents=True)
+            (current / "Auto.txt").write_text("current", encoding="utf-8")
+            stale = pipeline.artifacts_dir / "post-import-editor-stale"
+            stale.mkdir(parents=True)
+            (stale / "Auto.txt").write_text("stale", encoding="utf-8")
+            runtime_output = pipeline.artifacts_dir / "ainiee-output"
+            runtime_output.mkdir()
+            (runtime_output / "temporary.json").write_text("{}", encoding="utf-8")
+            manual = pipeline.artifacts_dir / "ainiee-short-benchmark-manual"
+            manual.mkdir()
+
+            with pipeline._mutation("test-artifact-prune"):
+                pipeline._mark_done(
+                    Stage.IMPORT,
+                    {"post_import_editor_auto": str(current)},
+                )
+
+            self.assertTrue(current.is_dir())
+            self.assertFalse(stale.exists())
+            self.assertFalse(runtime_output.exists())
+            self.assertTrue(manual.is_dir())
 
     def test_legacy_export_respects_auto_conversion_setting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -299,10 +370,15 @@ class PipelineTests(unittest.TestCase):
             root = Path(directory)
             pipeline = self._translation_pipeline(root)
             calls = []
+            progress = []
+            pipeline.translation_progress = progress.append
 
             def fake_translation(_runtime, input_json, output_dir, *_args, **_kwargs):
                 rows = json.loads(Path(input_json).read_text(encoding="utf-8"))
                 calls.append((rows, Path(output_dir)))
+                _kwargs["progress"](
+                    {"phase": "translate", "status": "running", "current": 1, "total": len(rows)}
+                )
                 if len(calls) == 1:
                     return [{**rows[0], "translation": "译文甲", "stage": 1}]
                 self.assertEqual(["control"], [row["key"] for row in rows])
@@ -320,6 +396,8 @@ class PipelineTests(unittest.TestCase):
                 artifacts = pipeline._translate()
 
             self.assertEqual(2, len(calls))
+            self.assertEqual(2, len(progress))
+            self.assertEqual(1, progress[0]["current"])
             self.assertEqual("ainiee-output", calls[0][1].name)
             self.assertEqual("ainiee-retry-output", calls[1][1].name)
             merged = load_items(artifacts["items"])
@@ -561,6 +639,78 @@ class PipelineTests(unittest.TestCase):
                     pipeline._release()
             self.assertEqual("keep", (pipeline.release_dir / "old.txt").read_text(encoding="utf-8"))
 
+    def test_release_preserves_saves_and_runtime_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = Pipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            translated = make_game(root / "translated")
+            (translated / "Game.ini").write_text("new defaults", encoding="utf-8")
+            pipeline.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"] = str(
+                translated
+            )
+            pipeline.release_dir.mkdir(parents=True)
+            (pipeline.release_dir / "Save").mkdir()
+            (pipeline.release_dir / "Save" / "SaveData01.sav").write_bytes(b"save-data")
+            (pipeline.release_dir / "Game.ini").write_text("user settings", encoding="utf-8")
+            (pipeline.release_dir / "CommonSave.sav").write_bytes(b"common-save")
+            (pipeline.release_dir / "ScreenShot").mkdir()
+            (pipeline.release_dir / "ScreenShot" / "capture.png").write_bytes(b"image")
+            (pipeline.release_dir / "obsolete-resource.txt").write_text(
+                "do not preserve", encoding="utf-8"
+            )
+
+            with mock.patch("pipeline.load_font_scheme", return_value=None):
+                artifacts = pipeline._release()
+
+            self.assertEqual(
+                b"save-data",
+                (pipeline.release_dir / "Save" / "SaveData01.sav").read_bytes(),
+            )
+            self.assertEqual(
+                "user settings",
+                (pipeline.release_dir / "Game.ini").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                b"common-save", (pipeline.release_dir / "CommonSave.sav").read_bytes()
+            )
+            self.assertEqual(
+                b"image", (pipeline.release_dir / "ScreenShot" / "capture.png").read_bytes()
+            )
+            self.assertFalse((pipeline.release_dir / "obsolete-resource.txt").exists())
+            self.assertEqual(
+                "CommonSave.sav,Game.ini,Save,ScreenShot",
+                artifacts["preserved_state"],
+            )
+
+    def test_release_state_copy_failure_keeps_previous_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = create_project(root / "projects", make_game(root / "game"))
+            pipeline = Pipeline(
+                manifest_path, AppSettings(), "", root / "cache", glossary_api_key=""
+            )
+            translated = make_game(root / "translated")
+            pipeline.manifest.version.stage(Stage.IMPORT).artifacts["translated_game"] = str(
+                translated
+            )
+            pipeline.release_dir.mkdir(parents=True)
+            save = pipeline.release_dir / "Save"
+            save.mkdir()
+            (save / "SaveData01.sav").write_bytes(b"save-data")
+
+            with mock.patch("pipeline.load_font_scheme", return_value=None), mock.patch(
+                "pipeline.shutil.copytree",
+                side_effect=[None, OSError("save copy failed")],
+            ):
+                with self.assertRaisesRegex(OSError, "save copy failed"):
+                    pipeline._release()
+
+            self.assertEqual(b"save-data", (save / "SaveData01.sav").read_bytes())
+            self.assertFalse((pipeline.release_dir / "Game.exe").exists())
+
     def test_import_uses_the_same_full_structure_as_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -569,6 +719,12 @@ class PipelineTests(unittest.TestCase):
             map_path.parent.mkdir(parents=True)
             map_path.write_bytes(b"map")
             (pipeline.work_dir / "Data.wolf").write_bytes(b"packed")
+            (pipeline.work_dir / "missing-from-official.txt").write_text(
+                "preserved", encoding="utf-8"
+            )
+            (pipeline.work_dir / "official-wins.txt").write_text(
+                "original", encoding="utf-8"
+            )
             items = [
                 TranslationItem(
                     key="plain",
@@ -585,9 +741,13 @@ class PipelineTests(unittest.TestCase):
             scoped = root / "import-scoped.xlsx"
             scoped.write_bytes(b"xlsx")
             runner = mock.Mock()
-            runner.translate.side_effect = lambda game_root, **_kwargs: make_game(
-                Path(game_root) / "Translated1_Chinese (Simplified)"
-            )
+
+            def translate(game_root, **_kwargs):
+                output = make_game(Path(game_root) / "Translated1_Chinese (Simplified)")
+                (output / "official-wins.txt").write_text("translated", encoding="utf-8")
+                return output
+
+            runner.translate.side_effect = translate
             runner.diagnostics = []
             runner.console_outputs = []
             stale_diagnostics = pipeline.artifacts_dir / "official-diagnostics.json"
@@ -600,6 +760,14 @@ class PipelineTests(unittest.TestCase):
                 merged = Path(game_root)
                 self.assertTrue((merged / "Data" / "MapData" / "Map0EX.mps").is_file())
                 self.assertFalse((merged / "Data.wolf").exists())
+                self.assertEqual(
+                    "preserved",
+                    (merged / "missing-from-official.txt").read_text(encoding="utf-8"),
+                )
+                self.assertEqual(
+                    "translated",
+                    (merged / "official-wins.txt").read_text(encoding="utf-8"),
+                )
                 return post_editor
 
             def write_scoped(_full, _output, _scope, _game, scoped_items, **_kwargs):
@@ -639,6 +807,7 @@ class PipelineTests(unittest.TestCase):
                 artifacts["translated_game"],
             )
             self.assertFalse(any(pipeline.artifacts_dir.glob(".import-game-*")))
+            self.assertFalse(any(pipeline.artifacts_dir.glob(".import-merged-*")))
             self.assertFalse(stale_diagnostics.exists())
             protection = json.loads(
                 Path(artifacts["import_protection"]).read_text(encoding="utf-8")

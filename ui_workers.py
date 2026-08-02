@@ -98,6 +98,7 @@ def _font_required_characters(
 class PipelineThread(QThread):
     log_line = Signal(str)
     stage_progress = Signal(int, int, str)
+    translation_progress = Signal(object)
     stage_state = Signal(object)
     result_ready = Signal(str)
     failed = Signal(str)
@@ -116,6 +117,7 @@ class PipelineThread(QThread):
         self.stages = stages
         self.pipeline.set_log_sink(self.log_line.emit)
         self.pipeline.progress = lambda current, total, stage: self.stage_progress.emit(current, total, stage.value)
+        self.pipeline.translation_progress = self.translation_progress.emit
         self.pipeline.state = self.stage_state.emit
 
     def run(self) -> None:
