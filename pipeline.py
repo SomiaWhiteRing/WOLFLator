@@ -17,7 +17,9 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from ainiee import (
+    fragment_translation_rows,
     generate_glossary,
+    merge_fragmented_rows,
     require_managed_runtime,
     run_translation,
 )
@@ -1296,6 +1298,8 @@ class Pipeline:
             if retry_errors:
                 first_output_path = self.artifacts_dir / "ainiee-output-pass1.json"
                 retry_input_path = self.artifacts_dir / "ainiee-retry-input.json"
+                retry_fragment_input_path = self.artifacts_dir / "ainiee-retry-fragments.json"
+                retry_fragment_ledger_path = self.artifacts_dir / "ainiee-retry-fragment-ledger.json"
                 retry_reasons_path = self.artifacts_dir / "ainiee-retry-reasons.json"
                 retry_output_path = self.artifacts_dir / "ainiee-retry-output.json"
                 retry_report_path = self.artifacts_dir / "ainiee-retry-result.json"
@@ -1321,6 +1325,9 @@ class Pipeline:
                     for row in retry_input
                 ]
                 _atomic_json(retry_input_path, retry_input)
+                retry_fragments, retry_fragment_ledger = fragment_translation_rows(retry_input)
+                _atomic_json(retry_fragment_input_path, retry_fragments)
+                _atomic_json(retry_fragment_ledger_path, retry_fragment_ledger)
                 _atomic_json(
                     retry_reasons_path,
                     {
@@ -1331,15 +1338,17 @@ class Pipeline:
                 )
                 self.log(
                     f"AiNiee 首轮有 {len(retry_input)} 条未通过 WOLFLator 校验，"
-                    f"新建会话定向重跑，最多 {self.settings.translation_rounds} 轮。"
+                    f"拆成 {len(retry_fragments)} 个纯文本片段定向重跑，"
+                    f"最多 {self.settings.translation_rounds} 轮。"
                 )
                 self.detail(
-                    f"translate.retry.start rows={len(retry_input)} input={retry_input_path} "
+                    f"translate.retry.start rows={len(retry_input)} fragments={len(retry_fragments)} "
+                    f"input={retry_fragment_input_path} ledger={retry_fragment_ledger_path} "
                     f"reasons={retry_reasons_path}"
                 )
-                retry_raw = run_translation(
+                retry_fragment_raw = run_translation(
                     runtime,
-                    retry_input_path,
+                    retry_fragment_input_path,
                     self.artifacts_dir / "ainiee-retry-output",
                     glossary,
                     f"{self.manifest.project_id}-retry",
@@ -1350,6 +1359,11 @@ class Pipeline:
                     diagnostic_log=self.detail,
                     progress=self.translation_progress,
                 )
+                retry_raw, missing_fragments = merge_fragmented_rows(
+                    retry_input,
+                    retry_fragment_raw,
+                    retry_fragment_ledger,
+                )
                 _atomic_json(retry_output_path, retry_raw)
                 retry_items = [selected_by_key[str(row["key"])] for row in retry_input]
                 remaining_errors = retryable_translation_errors(
@@ -1358,6 +1372,8 @@ class Pipeline:
                     self.manifest.translation_scope,
                     allow_copy_condition_groups=allow_copy_conditions,
                 )
+                for key, child_keys in missing_fragments.items():
+                    remaining_errors[key] = f"AiNiee 分片重跑缺少 {len(child_keys)} 个语义片段。"
                 retry_by_key = {str(row["key"]): row for row in retry_raw}
                 combined_by_key = {
                     str(row["key"]): row
@@ -1377,6 +1393,8 @@ class Pipeline:
                         "epoch": ARTIFACT_EPOCH,
                         "first_pass_failed": len(retry_errors),
                         "retry_output_rows": len(retry_raw),
+                        "retry_fragment_rows": len(retry_fragments),
+                        "missing_fragment_parents": len(missing_fragments),
                         "remaining_failed": len(remaining_errors),
                         "remaining_errors": remaining_errors,
                     },
@@ -1385,9 +1403,13 @@ class Pipeline:
                     f"translate.retry.complete output_rows={len(retry_raw)} "
                     f"remaining={len(remaining_errors)} output={retry_output_path}"
                 )
+                if remaining_errors:
+                    raise ValueError(f"AiNiee 分片重跑仍有失败: missing={len(remaining_errors)}")
                 retry_artifacts = {
                     "ainiee_first_output": str(first_output_path),
                     "ainiee_retry_input": str(retry_input_path),
+                    "ainiee_retry_fragments": str(retry_fragment_input_path),
+                    "ainiee_retry_fragment_ledger": str(retry_fragment_ledger_path),
                     "ainiee_retry_reasons": str(retry_reasons_path),
                     "ainiee_retry_output": str(retry_output_path),
                     "ainiee_retry_result": str(retry_report_path),

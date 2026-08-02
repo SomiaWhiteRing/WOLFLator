@@ -48,7 +48,8 @@ from ainiee_translation import (
     SESSION_PROFILE, _active_session_profile, _report_ainiee_logs,
     _restore_excluded_rows, _rules_name, _rules_with_control_protection,
     _run_translation_locked as _run_translation_locked_impl, _session_profile,
-    cleanup_session_profiles, run_proofread as _run_proofread_impl,
+    cleanup_session_profiles, fragment_translation_rows, merge_fragmented_rows,
+    run_proofread as _run_proofread_impl,
     run_translation as _run_translation_impl,
 )
 

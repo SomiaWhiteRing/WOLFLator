@@ -381,11 +381,11 @@ class PipelineTests(unittest.TestCase):
                 )
                 if len(calls) == 1:
                     return [{**rows[0], "translation": "译文甲", "stage": 1}]
-                self.assertEqual(["control"], [row["key"] for row in rows])
+                self.assertEqual(["control::fragment:1"], [row["key"] for row in rows])
                 return [
                     {
                         **rows[0],
-                        "translation": chr(0xE100) + "译文乙",
+                        "translation": "译文乙",
                         "stage": 1,
                     }
                 ]
@@ -404,8 +404,11 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(["译文甲", r"\C[1]译文乙"], [item.translation for item in merged])
             retry_input = json.loads(Path(artifacts["ainiee_retry_input"]).read_text(encoding="utf-8"))
             self.assertEqual(["control"], [row["key"] for row in retry_input])
+            retry_fragments = json.loads(Path(artifacts["ainiee_retry_fragments"]).read_text(encoding="utf-8"))
+            self.assertEqual(["control::fragment:1"], [row["key"] for row in retry_fragments])
             report = json.loads(Path(artifacts["ainiee_retry_result"]).read_text(encoding="utf-8"))
             self.assertEqual(1, report["first_pass_failed"])
+            self.assertEqual(1, report["retry_fragment_rows"])
             self.assertEqual(0, report["remaining_failed"])
 
     def test_translation_stops_after_one_failed_only_retry(self):

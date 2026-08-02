@@ -24,6 +24,8 @@ COMMON_PROMPT_ID = 100
 
 
 CONTROL_PLACEHOLDER_REGEX = r"[\uE100-\uF7FF]"
+_STRUCTURAL_FRAGMENT_TRIGGER_RE = re.compile(r"[\uE100-\uF7FF]|\r\n|\r|\n")
+_STRUCTURAL_FRAGMENT_PART_RE = re.compile(r"([\uE100-\uF7FF]|\r\n|\r|\n|[ \t]+)")
 
 
 RULE_DEFAULTS = {
@@ -46,6 +48,71 @@ RULE_DEFAULTS = {
     "writing_style_switch": False,
     "translation_example_switch": False,
 }
+
+
+def fragment_translation_rows(
+    input_rows: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, list[dict[str, str]]]]:
+    fragments: list[dict[str, object]] = []
+    ledger: dict[str, list[dict[str, str]]] = {}
+    for row in input_rows:
+        parent_key = str(row["key"])
+        original = str(row.get("original", ""))
+        values = (
+            _STRUCTURAL_FRAGMENT_PART_RE.split(original)
+            if _STRUCTURAL_FRAGMENT_TRIGGER_RE.search(original)
+            else [original]
+        )
+        parts: list[dict[str, str]] = []
+        child_index = 0
+        for value in values:
+            if not value:
+                continue
+            if _STRUCTURAL_FRAGMENT_PART_RE.fullmatch(value):
+                parts.append({"literal": value})
+                continue
+            child_index += 1
+            child_key = f"{parent_key}::fragment:{child_index}"
+            parts.append({"child_key": child_key, "source": value})
+            fragments.append(
+                {
+                    "key": child_key,
+                    "original": value,
+                    "translation": "",
+                    "context": f"{row.get('context', '')} | Fragment {child_index}",
+                    "stage": 0,
+                }
+            )
+        ledger[parent_key] = parts
+    return fragments, ledger
+
+
+def merge_fragmented_rows(
+    input_rows: list[dict[str, object]],
+    translated: list[dict[str, object]],
+    ledger: dict[str, list[dict[str, str]]],
+) -> tuple[list[dict[str, object]], dict[str, list[str]]]:
+    translated_by_key = {str(row.get("key", "")): row for row in translated}
+    merged: list[dict[str, object]] = []
+    missing: dict[str, list[str]] = {}
+    for parent in input_rows:
+        parent_key = str(parent["key"])
+        pieces: list[str] = []
+        for part in ledger[parent_key]:
+            if "literal" in part:
+                pieces.append(part["literal"])
+                continue
+            child_key = part["child_key"]
+            child = translated_by_key.get(child_key)
+            value = str(child.get("translation", "")) if child else ""
+            if not value:
+                missing.setdefault(parent_key, []).append(child_key)
+                value = part["source"]
+            pieces.append(value)
+        row = dict(parent)
+        row["translation"] = "".join(pieces)
+        merged.append(row)
+    return merged, missing
 
 
 def _rules_name(project_id: str) -> str:
@@ -125,6 +192,9 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
     host = (urllib.parse.urlsplit(base_url).hostname or "").lower()
     is_deepseek = host == "api.deepseek.com" or settings.api_model.lower().startswith("deepseek-")
     platform_tag = "deepseek" if is_deepseek else "custom_openai"
+    is_tokenflux = host == "tokenflux.dev" or host.endswith(".tokenflux.dev")
+    # TokenFlux ignores thinking=disabled for deepseek-v4; explicit low effort bounds hidden generation.
+    low_reasoning = is_tokenflux and settings.api_model.lower().startswith("deepseek-v4-")
     platform = {
         "tag": platform_tag,
         "group": "online" if is_deepseek else "custom",
@@ -141,7 +211,7 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "temperature": 1.3 if is_deepseek else 0.2,
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
-        "think_switch": False,
+        "think_switch": low_reasoning,
         "think_depth": "low",
         "structured_output_mode": 0,
         "auto_complete": False,
