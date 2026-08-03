@@ -188,6 +188,9 @@ def _active_session_profile(
 
 def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
     base_url = settings.api_base_url.rstrip("/")
+    think_depth: str | int = settings.api_think_depth.strip()
+    if think_depth.isdigit():
+        think_depth = int(think_depth)
     # ponytail: Keep one fixed AiNiee-compatible profile; provider detection is intentionally removed.
     platform_tag = "deepseek"
     platform = {
@@ -202,15 +205,27 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "tpm_limit": max(1, settings.api_tpm),
         "model": settings.api_model,
         "model_datas": [settings.api_model],
-        "top_p": 1.0,
-        "temperature": 1.3,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "think_switch": True,
-        "think_depth": "low",
+        "top_p": settings.api_top_p,
+        "temperature": settings.api_temperature,
+        "presence_penalty": settings.api_presence_penalty,
+        "frequency_penalty": settings.api_frequency_penalty,
+        "think_switch": settings.api_think_switch,
+        "think_depth": think_depth,
         "structured_output_mode": 0,
         "auto_complete": False,
-        "key_in_settings": ["api_url", "api_key", "model", "rpm_limit", "tpm_limit"],
+        "key_in_settings": [
+            "api_url",
+            "api_key",
+            "model",
+            "rpm_limit",
+            "tpm_limit",
+            "top_p",
+            "temperature",
+            "presence_penalty",
+            "frequency_penalty",
+            "think_switch",
+            "think_depth",
+        ],
     }
     return {
         "interface_language": "zh_CN",
@@ -226,6 +241,8 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "interactive_mode": False,
         "user_thread_counts": max(1, settings.api_threads),
         "request_timeout": max(10, settings.api_timeout),
+        "think_switch": settings.api_think_switch,
+        "think_depth": think_depth,
         "enable_api_failover": False,
         "enable_session_logging": True,
         "show_detailed_logs": True,
@@ -240,8 +257,13 @@ def _session_profile(settings: AppSettings, api_key: str) -> dict[str, object]:
         "tokens_limit": settings.translation_token_limit,
         "lines_limit": settings.translation_line_limit,
         "retry_split_min_lines": settings.translation_retry_min_lines,
+        "retry_count": settings.translation_retry_count,
+        "pre_line_counts": settings.translation_pre_line_counts,
         "round_limit": settings.translation_rounds,
-        "enable_smart_round_limit": False,
+        "enable_smart_round_limit": settings.translation_enable_smart_round_limit,
+        "smart_round_limit_multiplier": settings.translation_smart_round_limit_multiplier,
+        "enable_retry_backoff": settings.translation_enable_retry_backoff,
+        # ponytail: WOLF safety rules and prompt data stay outside this generic profile projection.
     }
 
 

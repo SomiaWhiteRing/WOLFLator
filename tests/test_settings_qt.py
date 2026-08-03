@@ -28,7 +28,7 @@ from models import (
 )
 from pipeline import PipelineStateEvent, create_project, load_manifest
 from proofread import build_worker_input, load_report, make_report, proofread_paths, save_report
-from settings import SettingsStore, protect_secret, unprotect_secret
+from settings import SettingsStore, protect_secret, unprotect_secret, validate_settings
 from wolf_tools import dump_items
 
 
@@ -42,6 +42,29 @@ class SettingsQtTests(unittest.TestCase):
         self.assertNotIn("test-secret", encrypted)
         self.assertEqual("test-secret", unprotect_secret(encrypted))
 
+    def test_profile_controls_are_validated(self):
+        errors = validate_settings(
+            AppSettings(
+                api_top_p=1.1,
+                api_temperature=-0.1,
+                api_presence_penalty=3,
+                api_frequency_penalty=-3,
+                api_think_depth="unsupported",
+                translation_retry_count=11,
+                translation_pre_line_counts=11,
+                translation_smart_round_limit_multiplier=0,
+            ),
+            require_api=False,
+        )
+        self.assertIn("Top P 必须在 0 到 1 之间。", errors)
+        self.assertIn("温度必须在 0 到 2 之间。", errors)
+        self.assertIn("存在惩罚必须在 -2 到 2 之间。", errors)
+        self.assertIn("频率惩罚必须在 -2 到 2 之间。", errors)
+        self.assertIn("推理深度必须是 AiNiee 支持的名称或 0 到 10000 的数字。", errors)
+        self.assertIn("翻译失败重试次数必须在 0 到 10 之间。", errors)
+        self.assertIn("翻译上文行数必须在 0 到 10 之间。", errors)
+        self.assertIn("智能轮次倍数必须在 1 到 10 之间。", errors)
+
 
     def test_dialog_loads_separate_api_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -50,6 +73,17 @@ class SettingsQtTests(unittest.TestCase):
                 api_base_url="https://translate.example/v1",
                 api_model="translate-model",
                 api_threads=12,
+                api_top_p=0.75,
+                api_temperature=0.65,
+                api_presence_penalty=-0.25,
+                api_frequency_penalty=0.4,
+                api_think_switch=False,
+                api_think_depth="xhigh",
+                translation_retry_count=0,
+                translation_pre_line_counts=0,
+                translation_enable_smart_round_limit=True,
+                translation_smart_round_limit_multiplier=4,
+                translation_enable_retry_backoff=False,
                 glossary_api_base_url="https://glossary.example/v1",
                 glossary_api_model="glossary-model",
                 glossary_api_threads=2,
@@ -76,11 +110,22 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual("https://translate.example/v1", dialog.api_url.text())
             self.assertEqual("https://glossary.example/v1", dialog.glossary_api_url.text())
             self.assertEqual(12, dialog.api_threads.value())
+            self.assertAlmostEqual(0.75, dialog.api_top_p.value())
+            self.assertAlmostEqual(0.65, dialog.api_temperature.value())
+            self.assertAlmostEqual(-0.25, dialog.api_presence_penalty.value())
+            self.assertAlmostEqual(0.4, dialog.api_frequency_penalty.value())
+            self.assertFalse(dialog.api_think_switch.isChecked())
+            self.assertEqual("xhigh", dialog.api_think_depth.currentText())
             self.assertTrue(dialog.translation_token_mode.isChecked())
             self.assertEqual(256, dialog.translation_token_limit.value())
             self.assertEqual(8, dialog.translation_line_limit.value())
             self.assertEqual(1, dialog.translation_retry_min_lines.value())
             self.assertEqual(6, dialog.translation_rounds.value())
+            self.assertEqual(0, dialog.translation_retry_count.value())
+            self.assertEqual(0, dialog.translation_pre_line_counts.value())
+            self.assertTrue(dialog.translation_enable_smart_round_limit.isChecked())
+            self.assertEqual(4, dialog.translation_smart_round_limit_multiplier.value())
+            self.assertFalse(dialog.translation_enable_retry_backoff.isChecked())
             self.assertEqual("", dialog.translation_token_limit.suffix())
             self.assertEqual("", dialog.translation_line_limit.suffix())
             self.assertEqual("", dialog.translation_retry_min_lines.suffix())
@@ -99,6 +144,11 @@ class SettingsQtTests(unittest.TestCase):
             self.assertEqual(2, dialog.glossary_api_threads.value())
             self.assertEqual(456_789, dialog.glossary_chunk_chars.value())
             self.assertEqual(65_535, dialog.glossary_api_max_tokens.value())
+            current = dialog._current_settings()
+            self.assertEqual(0, current.translation_retry_count)
+            self.assertEqual(0, current.translation_pre_line_counts)
+            self.assertAlmostEqual(0.75, current.api_top_p)
+            self.assertFalse(current.api_think_switch)
             dialog.close()
 
 

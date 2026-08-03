@@ -122,7 +122,9 @@ class SettingsStore:
             if isinstance(default, bool):
                 raw = str(raw).lower() in {"1", "true", "yes"}
             elif isinstance(default, int):
-                raw = int(raw or default)
+                raw = int(default if raw in (None, "") else raw)
+            elif isinstance(default, float):
+                raw = float(default if raw in (None, "") else raw)
             else:
                 raw = str(raw or "")
             values[name] = raw
@@ -189,8 +191,27 @@ def validate_settings(item: AppSettings, require_api: bool = True) -> list[str]:
         errors.append("每批翻译条目必须在 1 到 100 之间。")
     if not 1 <= item.translation_retry_min_lines <= item.translation_line_limit:
         errors.append("重试最小批次必须在 1 到每批翻译条目之间。")
+    if not 0 <= item.api_top_p <= 1:
+        errors.append("Top P 必须在 0 到 1 之间。")
+    if not 0 <= item.api_temperature <= 2:
+        errors.append("温度必须在 0 到 2 之间。")
+    if not -2 <= item.api_presence_penalty <= 2:
+        errors.append("存在惩罚必须在 -2 到 2 之间。")
+    if not -2 <= item.api_frequency_penalty <= 2:
+        errors.append("频率惩罚必须在 -2 到 2 之间。")
+    think_depth = item.api_think_depth.strip().casefold()
+    if think_depth not in {"minimal", "low", "medium", "high", "xhigh", "max"} and not (
+        think_depth.isdigit() and int(think_depth) <= 10_000
+    ):
+        errors.append("推理深度必须是 AiNiee 支持的名称或 0 到 10000 的数字。")
+    if not 0 <= item.translation_retry_count <= 10:
+        errors.append("翻译失败重试次数必须在 0 到 10 之间。")
+    if not 0 <= item.translation_pre_line_counts <= 10:
+        errors.append("翻译上文行数必须在 0 到 10 之间。")
     if not 1 <= item.translation_rounds <= 20:
         errors.append("翻译最大轮次必须在 1 到 20 之间。")
+    if not 1 <= item.translation_smart_round_limit_multiplier <= 10:
+        errors.append("智能轮次倍数必须在 1 到 10 之间。")
     if item.proofread_mode not in {"rules", "rules_ai"}:
         errors.append("校对方式必须是基础规则或基础规则 + AI。")
     if not 1 <= item.proofread_batch_size <= 100:

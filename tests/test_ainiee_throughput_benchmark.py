@@ -63,6 +63,49 @@ class FragmentInputTests(unittest.TestCase):
             self.assertTrue(platform["think_switch"])
             self.assertEqual("low", platform["think_depth"])
 
+    def test_session_profile_projects_ainiee_controls(self) -> None:
+        settings = AppSettings(
+            api_base_url="https://example.com/v1",
+            api_model="model",
+            api_top_p=0.75,
+            api_temperature=0.65,
+            api_presence_penalty=-0.25,
+            api_frequency_penalty=0.4,
+            api_think_switch=False,
+            api_think_depth="xhigh",
+            translation_retry_count=0,
+            translation_pre_line_counts=0,
+            translation_enable_smart_round_limit=True,
+            translation_smart_round_limit_multiplier=4,
+            translation_enable_retry_backoff=False,
+        )
+        profile = _session_profile(settings, "secret")
+        platform = profile["platforms"][profile["target_platform"]]
+
+        self.assertEqual(0.75, platform["top_p"])
+        self.assertEqual(0.65, platform["temperature"])
+        self.assertEqual(-0.25, platform["presence_penalty"])
+        self.assertEqual(0.4, platform["frequency_penalty"])
+        self.assertFalse(platform["think_switch"])
+        self.assertEqual("xhigh", platform["think_depth"])
+        self.assertFalse(profile["think_switch"])
+        self.assertEqual("xhigh", profile["think_depth"])
+        self.assertEqual(0, profile["retry_count"])
+        self.assertEqual(0, profile["pre_line_counts"])
+        self.assertTrue(profile["enable_smart_round_limit"])
+        self.assertEqual(4, profile["smart_round_limit_multiplier"])
+        self.assertFalse(profile["enable_retry_backoff"])
+
+        numeric = _session_profile(
+            AppSettings(
+                api_base_url="https://example.com/v1",
+                api_model="model",
+                api_think_depth="256",
+            ),
+            "secret",
+        )
+        self.assertEqual(256, numeric["think_depth"])
+
 
 if __name__ == "__main__":
     unittest.main()

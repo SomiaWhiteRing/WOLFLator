@@ -6,10 +6,10 @@ from pathlib import Path
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
-    QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTabWidget, QTableWidget,
-    QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QStackedWidget,
+    QTabWidget, QTableWidget, QVBoxLayout, QWidget,
 )
 
 from ainiee import AINIEE_VERSION, locate_ainiee_source, remove_managed_ainiee
@@ -234,6 +234,62 @@ class SettingsDialog(QDialog):
         quotas_layout.addStretch(1)
         translation_form.addRow("请求限制", quotas)
 
+        sampling = QWidget()
+        sampling_layout = QHBoxLayout(sampling)
+        sampling_layout.setContentsMargins(0, 0, 0, 0)
+        self.api_top_p = QDoubleSpinBox()
+        self.api_top_p.setRange(0, 1)
+        self.api_top_p.setDecimals(2)
+        self.api_top_p.setSingleStep(0.05)
+        self.api_top_p.setFixedWidth(82)
+        self.api_top_p.setValue(self.settings.api_top_p)
+        self.api_temperature = QDoubleSpinBox()
+        self.api_temperature.setRange(0, 2)
+        self.api_temperature.setDecimals(2)
+        self.api_temperature.setSingleStep(0.05)
+        self.api_temperature.setFixedWidth(82)
+        self.api_temperature.setValue(self.settings.api_temperature)
+        self.api_presence_penalty = QDoubleSpinBox()
+        self.api_presence_penalty.setRange(-2, 2)
+        self.api_presence_penalty.setDecimals(2)
+        self.api_presence_penalty.setSingleStep(0.1)
+        self.api_presence_penalty.setFixedWidth(82)
+        self.api_presence_penalty.setValue(self.settings.api_presence_penalty)
+        self.api_frequency_penalty = QDoubleSpinBox()
+        self.api_frequency_penalty.setRange(-2, 2)
+        self.api_frequency_penalty.setDecimals(2)
+        self.api_frequency_penalty.setSingleStep(0.1)
+        self.api_frequency_penalty.setFixedWidth(82)
+        self.api_frequency_penalty.setValue(self.settings.api_frequency_penalty)
+        for label, widget in (
+            ("Top P", self.api_top_p),
+            ("温度", self.api_temperature),
+            ("存在惩罚", self.api_presence_penalty),
+            ("频率惩罚", self.api_frequency_penalty),
+        ):
+            sampling_layout.addWidget(QLabel(label))
+            sampling_layout.addWidget(widget)
+        sampling_layout.addStretch(1)
+        translation_form.addRow("采样参数", sampling)
+
+        reasoning = QWidget()
+        reasoning_layout = QHBoxLayout(reasoning)
+        reasoning_layout.setContentsMargins(0, 0, 0, 0)
+        self.api_think_switch = QCheckBox("启用思考")
+        self.api_think_switch.setChecked(self.settings.api_think_switch)
+        self.api_think_depth = QComboBox()
+        self.api_think_depth.setEditable(True)
+        self.api_think_depth.addItems(["minimal", "low", "medium", "high", "xhigh", "max"])
+        self.api_think_depth.setCurrentText(self.settings.api_think_depth)
+        self.api_think_depth.setFixedWidth(130)
+        self.api_think_depth.setEnabled(self.settings.api_think_switch)
+        self.api_think_switch.toggled.connect(self.api_think_depth.setEnabled)
+        reasoning_layout.addWidget(self.api_think_switch)
+        reasoning_layout.addWidget(QLabel("深度"))
+        reasoning_layout.addWidget(self.api_think_depth)
+        reasoning_layout.addStretch(1)
+        translation_form.addRow("推理", reasoning)
+
         chunking = QWidget()
         chunking.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         chunking_layout = QHBoxLayout(chunking)
@@ -307,6 +363,48 @@ class SettingsDialog(QDialog):
         rounds_layout.addWidget(self.translation_rounds_unit)
         rounds_layout.addStretch(1)
         translation_form.addRow("单次最大轮次", rounds)
+
+        translation_controls = QWidget()
+        translation_controls_layout = QHBoxLayout(translation_controls)
+        translation_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.translation_retry_count = QSpinBox()
+        self.translation_retry_count.setRange(0, 10)
+        self.translation_retry_count.setFixedWidth(82)
+        self.translation_retry_count.setValue(self.settings.translation_retry_count)
+        self.translation_pre_line_counts = QSpinBox()
+        self.translation_pre_line_counts.setRange(0, 10)
+        self.translation_pre_line_counts.setFixedWidth(82)
+        self.translation_pre_line_counts.setValue(self.settings.translation_pre_line_counts)
+        self.translation_enable_smart_round_limit = QCheckBox("智能轮次")
+        self.translation_enable_smart_round_limit.setChecked(
+            self.settings.translation_enable_smart_round_limit
+        )
+        self.translation_smart_round_limit_multiplier = QSpinBox()
+        self.translation_smart_round_limit_multiplier.setRange(1, 10)
+        self.translation_smart_round_limit_multiplier.setFixedWidth(68)
+        self.translation_smart_round_limit_multiplier.setValue(
+            self.settings.translation_smart_round_limit_multiplier
+        )
+        self.translation_smart_round_limit_multiplier.setEnabled(
+            self.settings.translation_enable_smart_round_limit
+        )
+        self.translation_enable_smart_round_limit.toggled.connect(
+            self.translation_smart_round_limit_multiplier.setEnabled
+        )
+        self.translation_enable_retry_backoff = QCheckBox("退避重试")
+        self.translation_enable_retry_backoff.setChecked(
+            self.settings.translation_enable_retry_backoff
+        )
+        translation_controls_layout.addWidget(QLabel("失败重试"))
+        translation_controls_layout.addWidget(self.translation_retry_count)
+        translation_controls_layout.addWidget(QLabel("上文行数"))
+        translation_controls_layout.addWidget(self.translation_pre_line_counts)
+        translation_controls_layout.addWidget(self.translation_enable_smart_round_limit)
+        translation_controls_layout.addWidget(QLabel("倍数"))
+        translation_controls_layout.addWidget(self.translation_smart_round_limit_multiplier)
+        translation_controls_layout.addWidget(self.translation_enable_retry_backoff)
+        translation_controls_layout.addStretch(1)
+        translation_form.addRow("翻译策略", translation_controls)
         self.settings_tabs.addTab(translation_page, "AiNiee 翻译 API")
         layout.addWidget(self.settings_tabs)
 
@@ -490,11 +588,26 @@ class SettingsDialog(QDialog):
         item.api_timeout = self.api_timeout.value()
         item.api_rpm = self.api_rpm.value()
         item.api_tpm = self.api_tpm.value()
+        item.api_top_p = self.api_top_p.value()
+        item.api_temperature = self.api_temperature.value()
+        item.api_presence_penalty = self.api_presence_penalty.value()
+        item.api_frequency_penalty = self.api_frequency_penalty.value()
+        item.api_think_switch = self.api_think_switch.isChecked()
+        item.api_think_depth = self.api_think_depth.currentText().strip()
         item.translation_chunk_mode = "token" if self.translation_token_mode.isChecked() else "line"
         item.translation_token_limit = self.translation_token_limit.value()
         item.translation_line_limit = self.translation_line_limit.value()
         item.translation_retry_min_lines = self.translation_retry_min_lines.value()
+        item.translation_retry_count = self.translation_retry_count.value()
+        item.translation_pre_line_counts = self.translation_pre_line_counts.value()
         item.translation_rounds = self.translation_rounds.value()
+        item.translation_enable_smart_round_limit = (
+            self.translation_enable_smart_round_limit.isChecked()
+        )
+        item.translation_smart_round_limit_multiplier = (
+            self.translation_smart_round_limit_multiplier.value()
+        )
+        item.translation_enable_retry_backoff = self.translation_enable_retry_backoff.isChecked()
         item.glossary_api_base_url = self.glossary_api_url.text().strip().rstrip("/")
         item.glossary_api_model = self.glossary_api_model.text().strip()
         item.glossary_api_threads = self.glossary_api_threads.value()
