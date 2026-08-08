@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from ainiee_translation import _session_profile, fragment_translation_rows, merge_fragmented_rows
+from ainiee_translation import (
+    _rules_with_control_protection,
+    _session_profile,
+    fragment_translation_rows,
+    merge_fragmented_rows,
+)
 from models import AppSettings
 
 
@@ -33,6 +38,20 @@ class FragmentInputTests(unittest.TestCase):
         fragments, _ledger = fragment_translation_rows(rows)
 
         self.assertEqual(["alpha beta"], [row["original"] for row in fragments])
+
+    def test_ruby_anchor_stays_with_visible_text_during_fragment_retry(self) -> None:
+        anchor = "天翔[[WOLFLATOR_RUBY_0]]ツバサです。"
+        rows = [{"key": "ruby", "original": f"\uE100{anchor}\uE101", "context": "case"}]
+
+        fragments, _ledger = fragment_translation_rows(rows)
+
+        self.assertEqual([anchor], [row["original"] for row in fragments])
+
+    def test_ruby_anchor_is_excluded_from_translation(self) -> None:
+        rules = _rules_with_control_protection({})
+        regexes = {item["regex"] for item in rules["exclusion_list_data"]}
+
+        self.assertIn(r"\[\[WOLFLATOR_RUBY_[0-9]+\]\]", regexes)
 
     def test_missing_fragment_is_reported_by_parent(self) -> None:
         rows = [{"key": "parent", "original": "alpha\uE100beta", "context": "case"}]

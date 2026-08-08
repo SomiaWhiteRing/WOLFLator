@@ -241,7 +241,9 @@ def analyze_import_protection(
         return list(selected.values())
     if rules.protect_paths_and_commands:
         for item in source_items:
-            if _looks_like_path_or_command(item):
+            # A program proof outranks this regex fallback; explicit safety
+            # rejections below can still protect the item.
+            if item.key not in proven_safe and _looks_like_path_or_command(item):
                 add(item, "keep_original", "path_or_command")
 
     if rules.protect_logic_references and logic_safety is not None:

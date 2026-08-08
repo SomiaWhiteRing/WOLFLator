@@ -14,6 +14,7 @@ from formats import ARTIFACT_EPOCH, require_format
 from models import AppSettings
 from process_tools import resource_path, run_process
 from safe_io import atomic_write_json, runtime_lock
+from wolf_workbook import RUBY_ANCHOR_REGEX
 
 
 SESSION_PROFILE = "WOLFLator_session"
@@ -137,6 +138,14 @@ def _rules_with_control_protection(rules: dict[str, object]) -> dict[str, object
                 "markers": "",
                 "info": "WOLFLator control placeholder",
                 "regex": CONTROL_PLACEHOLDER_REGEX,
+            }
+        )
+    if not any(item.get("regex") == RUBY_ANCHOR_REGEX for item in exclusions):
+        exclusions.append(
+            {
+                "markers": "",
+                "info": "WOLFLator ruby anchor",
+                "regex": RUBY_ANCHOR_REGEX,
             }
         )
     # AiNiee uses this as the master switch for every rules-profile feature.

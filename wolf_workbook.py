@@ -40,6 +40,10 @@ PUA_START = 0xE100
 
 PUA_END = 0xF7FF
 
+RUBY_ANCHOR_REGEX = r"\[\[WOLFLATOR_RUBY_[0-9]+\]\]"
+
+_RUBY_ANCHOR_RE = re.compile(RUBY_ANCHOR_REGEX)
+
 SPECIAL_ESCAPES = set("!.|^<>${}\\")
 
 COPY_FROM_RE = re.compile(r"(?:^|\r?\n)COPY-FROM-([^\r\n]+)", re.IGNORECASE)
@@ -176,6 +180,15 @@ def _scan_control_spans(text: str) -> list[tuple[int, int]]:
 def _scan_control_tokens(text: str) -> list[str]:
     return [text[start:end] for start, end in _scan_control_spans(text)]
 
+
+def _parse_ruby_control(token: str) -> tuple[str, str] | None:
+    if not token.startswith(r"\r[") or not token.endswith("]"):
+        return None
+    base, separator, reading = token[3:-1].partition(",")
+    if not separator or not base or not reading:
+        return None
+    return base, reading
+
 _EXTERNAL_DISPLAY_COMMAND_RE = re.compile(r"^[ \t]*@(?:文章|連続文章|タイトルコール)(?:[：:].*)?$")
 
 def _external_script_control_spans(text: str) -> list[tuple[int, int]]:
@@ -237,6 +250,33 @@ def _item_control_spans(item: TranslationItem, text: str) -> list[tuple[int, int
     ]
     return sorted((*structural, *controls))
 
+
+def _item_ruby_groups(
+    item: TranslationItem,
+    text: str,
+) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    structural = (
+        _external_script_control_spans(text)
+        if _content_category(item.code, item.flag, item.type) is ImportCategory.EXTERNAL
+        else []
+    )
+    ruby: list[tuple[int, int, str, str]] = []
+    for start, end in _scan_control_spans(text):
+        if any(start < structural_end and structural_start < end for structural_start, structural_end in structural):
+            continue
+        parsed = _parse_ruby_control(text[start:end])
+        if parsed is not None:
+            ruby.append((start, end, *parsed))
+
+    groups: list[tuple[int, int, list[tuple[str, str]]]] = []
+    for start, end, base, reading in ruby:
+        if groups and groups[-1][1] == start:
+            group_start, _group_end, tokens = groups[-1]
+            groups[-1] = (group_start, end, [*tokens, (base, reading)])
+        else:
+            groups.append((start, end, [(base, reading)]))
+    return groups
+
 def _protect_spans(text: str, spans: list[tuple[int, int]]) -> tuple[str, list[str]]:
     if not spans:
         return text, []
@@ -258,7 +298,58 @@ def protect_control_tokens(text: str) -> tuple[str, list[str]]:
     return _protect_spans(text, _scan_control_spans(text))
 
 def _protect_item_tokens(item: TranslationItem, text: str) -> tuple[str, list[str]]:
-    return _protect_spans(text, _item_control_spans(item, text))
+    protected, signature, _generic_tokens, _ruby = _protect_item_text(item, text)
+    return protected, signature
+
+
+def _protect_item_text(
+    item: TranslationItem,
+    text: str,
+) -> tuple[str, list[str], list[str], list[tuple[str, list[tuple[str, str]]]]]:
+    if _RUBY_ANCHOR_RE.search(text):
+        raise ValueError("文本包含 WOLFLator 保留的 ruby 锚点。")
+
+    ruby_groups = _item_ruby_groups(item, text)
+    generic_spans = [
+        (start, end)
+        for start, end in _item_control_spans(item, text)
+        if not any(start < ruby_end and ruby_start < end for ruby_start, ruby_end, _tokens in ruby_groups)
+    ]
+    entries = [
+        (start, end, "generic", "")
+        for start, end in generic_spans
+    ] + [
+        (start, end, "ruby", tokens)
+        for start, end, tokens in ruby_groups
+    ]
+    entries.sort()
+
+    output: list[str] = []
+    signature: list[str] = []
+    generic_tokens: list[str] = []
+    ruby: list[tuple[str, list[tuple[str, str]]]] = []
+    cursor = 0
+    for start, end, kind, ruby_tokens in entries:
+        if start < cursor:
+            raise ValueError("控制符与 ruby 保护范围发生重叠。")
+        output.append(text[cursor:start])
+        raw = text[start:end]
+        if kind == "ruby":
+            marker = f"[[WOLFLATOR_RUBY_{len(ruby)}]]"
+            visible = "".join(base for base, _reading in ruby_tokens)
+            signature.append("\0ruby:" + "".join(reading for _base, reading in ruby_tokens))
+            output.append(visible + marker)
+            ruby.append((marker, ruby_tokens))
+        else:
+            signature.append(raw)
+            codepoint = PUA_START + len(generic_tokens)
+            if codepoint > PUA_END:
+                raise ValueError("单条文本的控制符数量超过占位符容量。")
+            output.append(chr(codepoint))
+            generic_tokens.append(raw)
+        cursor = end
+    output.append(text[cursor:])
+    return "".join(output), signature, generic_tokens, ruby
 
 def _restore_tokens(text: str, tokens: list[str]) -> str:
     expected = [chr(PUA_START + index) for index in range(len(tokens))]
@@ -281,12 +372,57 @@ def restore_control_tokens(text: str, tokens: list[str]) -> str:
     return restored
 
 def _restore_item_tokens(item: TranslationItem, text: str) -> str:
-    tokens = [item.original[start:end] for start, end in _item_control_spans(item, item.original)]
-    restored = _restore_tokens(text, tokens)
-    if [restored[start:end] for start, end in _item_control_spans(item, restored)] != tokens:
+    _protected, signature, generic_tokens, ruby = _protect_item_text(item, item.original)
+    if _scan_control_tokens(item.original) != item.control_signature:
+        raise ValueError("原文控制符签名发生变化。")
+    if _scan_control_tokens(text):
+        raise ValueError("AiNiee 译文包含未保护的控制符。")
+
+    expected_markers = [marker for marker, _tokens in ruby]
+    actual_markers = [match.group(0) for match in _RUBY_ANCHOR_RE.finditer(text)]
+    if actual_markers != expected_markers:
+        raise ValueError(
+            f"ruby 锚点序列不一致: expected={expected_markers}, actual={actual_markers}"
+        )
+
+    restored = _restore_tokens(text, generic_tokens)
+    for marker, tokens in ruby:
+        end = restored.index(marker)
+        original_width = sum(len(base) for base, _reading in tokens)
+        start = end - original_width
+        if start < 0:
+            raise ValueError("ruby 锚点前缺少标注正文。")
+        translated_base = restored[start:end]
+        # ponytail: WOLF ruby bases are short CJK spans whose translated width normally stays fixed.
+        # A non-repeating length change needs term-level alignment instead of a wider heuristic.
+        if original_width == 1:
+            while start > 0 and restored[start - 1] == translated_base[0]:
+                start -= 1
+            translated_base = restored[start:end]
+        if translated_base != translated_base.strip() or any(
+            char in "\\[],\r\n" or PUA_START <= ord(char) <= PUA_END
+            for char in translated_base
+        ):
+            raise ValueError(f"ruby 标注正文包含非法字符: {translated_base!r}")
+
+        if len(translated_base) == original_width:
+            offset = 0
+            parts: list[str] = []
+            for base, reading in tokens:
+                translated_part = translated_base[offset:offset + len(base)]
+                parts.append(rf"\r[{translated_part},{reading}]")
+                offset += len(base)
+            replacement = "".join(parts)
+        else:
+            # ponytail: Length-changing translations cannot preserve per-token alignment;
+            # collapse the group and upgrade to linguistic alignment only if a real corpus needs it.
+            reading = "".join(reading for _base, reading in tokens)
+            replacement = rf"\r[{translated_base},{reading}]"
+        restored = restored[:start] + replacement + restored[end + len(marker):]
+
+    _roundtrip, restored_signature = _protect_item_tokens(item, restored)
+    if restored_signature != signature:
         raise ValueError("译文脚本结构与原文不一致。")
-    if _scan_control_tokens(restored) != item.control_signature:
-        raise ValueError("译文控制符序列与原文不一致。")
     return restored
 
 

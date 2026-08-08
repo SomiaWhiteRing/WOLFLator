@@ -2562,6 +2562,16 @@ class WorkbookAndFontTests(unittest.TestCase):
             )
             self.assertEqual([item.key], safe["approvals"]["external_text_flow"])
             self.assertEqual({}, safe["translation_overrides"])
+            protection = analyze_import_protection(
+                [item],
+                ImportScope(external=True),
+                root,
+                ImportProtectionRules(),
+                analysis,
+                logic_safety=safe,
+            )
+            self.assertEqual([item.key], protection["safe_to_translate"])
+            self.assertNotIn(item.key, protection["protected_keys"])
 
             mixed = analyze_translation_safety(
                 root / "Auto",
@@ -3647,6 +3657,114 @@ class ControlTests(unittest.TestCase):
         swapped = protected.replace(chr(0xE100), "X").replace(chr(0xE101), chr(0xE100)).replace("X", chr(0xE101))
         with self.assertRaisesRegex(ValueError, "占位序列"):
             restore_control_tokens(swapped, tokens)
+
+    def test_ruby_transport_keeps_base_visible_and_restores_chinese_order(self):
+        cases = (
+            (
+                r"\r[鷲見,すみ]です。",
+                [r"\r[鷲見,すみ]"],
+                "鷲見[[WOLFLATOR_RUBY_0]]です。",
+                "我是鹫见[[WOLFLATOR_RUBY_0]]。",
+                r"我是\r[鹫见,すみ]。",
+            ),
+            (
+                r"\r[風,ふう]\r[紀,き]\r[院,いん]家の朝は早い。",
+                [r"\r[風,ふう]", r"\r[紀,き]", r"\r[院,いん]"],
+                "風紀院[[WOLFLATOR_RUBY_0]]家の朝は早い。",
+                "风纪院[[WOLFLATOR_RUBY_0]]家的清晨总是很早。",
+                r"\r[风,ふう]\r[纪,き]\r[院,いん]家的清晨总是很早。",
+            ),
+            (
+                r"生徒会長の\r[雄,ゆう]\r[弁,べん]\r[寺,じ]　\r[言,こと]\r[継,つぐ]です。",
+                [
+                    r"\r[雄,ゆう]",
+                    r"\r[弁,べん]",
+                    r"\r[寺,じ]",
+                    r"\r[言,こと]",
+                    r"\r[継,つぐ]",
+                ],
+                "生徒会長の雄弁寺[[WOLFLATOR_RUBY_0]]　言継[[WOLFLATOR_RUBY_1]]です。",
+                "我是学生会长雄辩寺[[WOLFLATOR_RUBY_0]]　言继[[WOLFLATOR_RUBY_1]]。",
+                r"我是学生会长\r[雄,ゆう]\r[辩,べん]\r[寺,じ]　\r[言,こと]\r[继,つぐ]。",
+            ),
+            (
+                r"\r[天,あま]\r[翔,かける]ツバサです。",
+                [r"\r[天,あま]", r"\r[翔,かける]"],
+                "天翔[[WOLFLATOR_RUBY_0]]ツバサです。",
+                "我是天翔[[WOLFLATOR_RUBY_0]]翼。",
+                r"我是\r[天,あま]\r[翔,かける]翼。",
+            ),
+            (
+                r"夜空の\r[星,ほし]を見上げた。",
+                [r"\r[星,ほし]"],
+                "夜空の星[[WOLFLATOR_RUBY_0]]を見上げた。",
+                "我仰望了夜空中的星星[[WOLFLATOR_RUBY_0]]。",
+                r"我仰望了夜空中的\r[星星,ほし]。",
+            ),
+            (
+                r"\r[東,ひがし]の門から\r[西,にし]の塔へ向かう。",
+                [r"\r[東,ひがし]", r"\r[西,にし]"],
+                "東[[WOLFLATOR_RUBY_0]]の門から西[[WOLFLATOR_RUBY_1]]の塔へ向かう。",
+                "从东[[WOLFLATOR_RUBY_0]]门向西[[WOLFLATOR_RUBY_1]]塔前进。",
+                r"从\r[东,ひがし]门向\r[西,にし]塔前进。",
+            ),
+        )
+        scope = ImportScope(external=True)
+        for index, (original, signature, transport, translated, expected) in enumerate(cases):
+            with self.subTest(original=original):
+                item = TranslationItem(
+                    key=f"ruby-{index}",
+                    original=original,
+                    code=f'SEGMENT_{index}-TXTFILE-"Data\\ノベル\\シーン1.txt"',
+                    type="Text File",
+                    category=ImportCategory.EXTERNAL,
+                    control_signature=signature,
+                )
+                row = to_paratranz([item], scope)[0]
+                self.assertEqual(transport, row["original"])
+                self.assertNotIn("すみ", transport)
+                self.assertNotIn("ふう", transport)
+                self.assertNotIn("あま", transport)
+                merged = merge_ainiee_output(
+                    [item], [{**row, "translation": translated, "stage": 1}], scope
+                )
+                self.assertEqual(expected, merged[0].translation)
+
+    def test_ruby_transport_rejects_missing_or_invalid_anchor(self):
+        original = r"\r[天,あま]\r[翔,かける]ツバサです。"
+        item = TranslationItem(
+            key="ruby",
+            original=original,
+            code='SEGMENT_37-TXTFILE-"Data\\ノベル\\シーン1.txt"',
+            type="Text File",
+            category=ImportCategory.EXTERNAL,
+            control_signature=[r"\r[天,あま]", r"\r[翔,かける]"],
+        )
+        scope = ImportScope(external=True)
+        row = to_paratranz([item], scope)[0]
+        translated = "我是天翔[[WOLFLATOR_RUBY_0]]翼。"
+
+        with self.assertRaisesRegex(ValueError, "ruby 锚点序列"):
+            merge_ainiee_output(
+                [item], [{**row, "translation": translated.replace("[[WOLFLATOR_RUBY_0]]", "")}], scope
+            )
+        with self.assertRaisesRegex(ValueError, "ruby 标注正文包含非法字符"):
+            merge_ainiee_output(
+                [item], [{**row, "translation": "我 [[WOLFLATOR_RUBY_0]]翼。"}], scope
+            )
+
+    def test_empty_ruby_definition_remains_a_generic_control(self):
+        item = TranslationItem(
+            key="ruby-color",
+            original=r"[Sys]\r[]ルビ用文字色",
+            code="NAME-D-SDB-12-13",
+            type="SDB info",
+            category=ImportCategory.DISPLAY,
+            control_signature=[r"\r[]"],
+        )
+        row = to_paratranz([item], ImportScope(display=True))[0]
+        self.assertIn(chr(0xE100), row["original"])
+        self.assertNotIn("WOLFLATOR_RUBY", row["original"])
 
     def test_external_script_translates_display_payload_and_preserves_structure(self):
         original = (
